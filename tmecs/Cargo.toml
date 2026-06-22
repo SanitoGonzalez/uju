@@ -1,0 +1,6 @@
+[package]
+name = "tmecs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
