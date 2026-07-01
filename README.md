@@ -41,3 +41,11 @@ This project designs an ECS interaction as a parallelized transaction, keeping c
 - [ ] HyPer MVCC (Neumann et al., SIGMOD 2015) : delta storage over a column store.
 - [ ] Silo (Tu et al., SOSP 2013) : epoch-based concurrency, no global clock. timing model
 - [ ] Hekaton (Larson et al., VLDB 2011) :  lock-free in-memory MVCC, logical indexing
+
+# X. Idea Notes
+
+- [spatial network](https://en.wikipedia.org/wiki/Spatial_network):
+    - shard worlds of ECS, letting each thread run the shard
+    - use position as a shard criteria
+    - migrate entities on shard criteria
+    - migrate entities if cross-shard interaction exceeds the threshold
