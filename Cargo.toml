@@ -1,7 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
-    "mvecs"
+    "uju-demo",
+    "uju-ecs",
+    "uju-io",
+    "uju-mesh",
 ]
 
 [workspace.package]

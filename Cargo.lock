@@ -3,5 +3,17 @@
 version = 4
 
 [[package]]
-name = "mvecs"
+name = "uju-demo"
+version = "0.1.0"
+
+[[package]]
+name = "uju-ecs"
+version = "0.1.0"
+
+[[package]]
+name = "uju-io"
+version = "0.1.0"
+
+[[package]]
+name = "uju-mesh"
 version = "0.1.0"

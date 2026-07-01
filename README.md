@@ -1,4 +1,12 @@
-# Multiversion Entity Component System
+# 우주 / Uju
+
+Experimental ideas for seamless MMO server
+
+# 1. RUDP
+
+RUDP is not a brand new idea, but would be essential for realtime actions which require low latency.
+
+# 2. Multiversion Entity Component System
 
 ## Why?
 
