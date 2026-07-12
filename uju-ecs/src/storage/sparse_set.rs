@@ -97,7 +97,10 @@ impl<T> SparseSet<T> {
 
     /// Iterate `(entity, &mut component)` pairs in dense order.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut T)> {
-        self.entities.iter().copied().zip(self.components.iter_mut())
+        self.entities
+            .iter()
+            .copied()
+            .zip(self.components.iter_mut())
     }
 
     /// The contiguous component array — cache-friendly for systems that don't

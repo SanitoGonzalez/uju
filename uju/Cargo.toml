@@ -1,0 +1,15 @@
+[package]
+name = "uju"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["io", "ecs", "mesh"]
+io = ["dep:uju-io"]
+ecs = ["dep:uju-ecs"]
+mesh = ["dep:uju-mesh"]
+
+[dependencies]
+uju-io = { path = "../uju-io", version = "0.1.0", optional = true }
+uju-ecs = { path = "../uju-ecs", version = "0.1.0", optional = true }
+uju-mesh = { path = "../uju-mesh", version = "0.1.0", optional = true }

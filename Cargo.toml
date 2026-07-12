@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "uju",
     "uju-demo",
     "uju-ecs",
     "uju-io",
@@ -12,3 +13,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+compio = { version = "0.19", features = ["net"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["sync"] }
+tracing = "0.1"
