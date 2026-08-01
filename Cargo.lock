@@ -879,6 +879,7 @@ dependencies = [
  "compio",
  "crossfire",
  "futures-util",
+ "nix",
  "thiserror",
  "tracing",
 ]

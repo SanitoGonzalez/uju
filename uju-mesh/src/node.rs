@@ -36,8 +36,19 @@ impl Builder {
     }
 
     async fn run_inner(self) -> std::io::Result<()> {
-        // todo: support NUMA
-        let shards_total = std::thread::available_parallelism()?.get();
+        use nix::{
+            sched::{CpuSet, sched_getaffinity, sched_setaffinity},
+            unistd::Pid,
+        };
+
+        let mut allowed_cpus: Vec<usize> = {
+            let mask = sched_getaffinity(Pid::from_raw(0))?;
+            (0..CpuSet::count())
+                .filter(|&cpu| mask.is_set(cpu).unwrap_or(false))
+                .collect()
+        };
+
+        let shards_total = allowed_cpus.len();
         let mut handles: Vec<JoinHandle<std::io::Result<()>>> = Vec::with_capacity(shards_total);
 
         let mut senders = Vec::with_capacity(shards_total);
@@ -50,21 +61,29 @@ impl Builder {
 
         let (stop_tx, stop_rx) = crossfire::mpmc::Null::new().new_async();
 
-        for id in 0..shards_total {
+        for (id, cpu) in allowed_cpus.drain(..).enumerate() {
             let shard_builder = self.shard_builder.clone();
             let senders = senders.clone();
             let receiver = receivers[id].take().unwrap();
             let stop_rx = stop_rx.clone();
 
+            // todo: support Count, Range, NUMA
+            let mut cpuset = CpuSet::new();
+            cpuset.set(cpu)?;
+
             let handle = std::thread::Builder::new()
                 .name(format!("shard-{id}"))
                 .spawn(move || {
+                    sched_setaffinity(Pid::from_raw(0), &cpuset)?;
+                    info!("[shard-{id}] thread pinned on cpu {cpu}");
+
                     shard_builder.run(id as u16, senders, receiver, stop_rx)?;
                     Ok(())
                 })
                 .unwrap_or_else(|e| panic!("failed to spawn thread for shard-{id}: {e}"));
             handles.push(handle);
         }
+        drop(allowed_cpus);
 
         drop(senders);
         drop(receivers);
