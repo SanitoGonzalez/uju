@@ -1,18 +1,15 @@
 use bytes::Bytes;
+use compio::BufResult;
 use compio::driver::BufferRef;
 use compio::io::{AsyncReadExt, AsyncReadManaged, AsyncWrite, AsyncWriteExt};
 use compio::net::TcpStream;
-use compio::runtime::{spawn, JoinHandle};
-use compio::BufResult;
+use compio::runtime::{JoinHandle, spawn};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 const INGRESS_CHANNEL_SIZE: usize = 64;
 
 pub struct Connection {
-    egress_tx: Option<mpsc::UnboundedSender<Bytes>>,
-    ingress_rx: mpsc::Receiver<BufferRef>,
-
     recv_handle: Option<JoinHandle<()>>,
     send_handle: Option<JoinHandle<()>>,
 }

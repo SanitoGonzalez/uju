@@ -4,3 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+compio.workspace = true
+crossfire.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

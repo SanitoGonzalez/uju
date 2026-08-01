@@ -2,10 +2,8 @@ pub mod rudp;
 pub mod tcp;
 
 use bytes::Bytes;
-use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy)]
 pub enum Protocol {
     Rudp,
     Tcp,

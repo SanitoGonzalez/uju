@@ -20,6 +20,11 @@ This project designs an ECS interaction as a parallelized transaction, keeping c
 - **ECS spawn/despawn**: how to handle this?
 
 
+## 3. Server Meshing
+
+- cluster > node > shard > cell
+- *shard*: shard-per-core with shared-nothing model. (ref. [compio](https://compio.rs/), [seastar](https://seastar.io/shared-nothing/))
+
 ## Ideas & Keywords
 
 - delta storage
