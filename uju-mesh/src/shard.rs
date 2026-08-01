@@ -26,7 +26,7 @@ impl Shard {
                 select! {
                     _ = interval.tick().fuse() => {
                         let now = Instant::now();
-                        shard.tick((ticked_at - now).as_secs_f32());
+                        shard.tick((now - ticked_at).as_secs_f32());
                         ticked_at = now;
                     },
                     _ = stop_rx_.recv().fuse() => {
