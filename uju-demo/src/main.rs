@@ -1,7 +1,10 @@
 use tracing_subscriber;
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    println!("Hello, world!");
+    let builder = uju::mesh::node::Builder::new();
+    builder.run()?;
+
+    Ok(())
 }

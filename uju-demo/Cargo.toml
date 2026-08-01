@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 uju = { path = "../uju" }
 
+anyhow = "1.0"
 tracing-subscriber = "0.3"
