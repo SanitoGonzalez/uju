@@ -5,19 +5,19 @@ use std::time::{Duration, Instant};
 use futures_util::{FutureExt, select};
 use tracing::{error, info};
 
-pub type Sender = crossfire::MTx<crossfire::mpsc::Array<Message>>;
-pub type Receiver = crossfire::AsyncRx<crossfire::mpsc::Array<Message>>;
-pub type ShutdownSource = crossfire::null::CloseHandle<crossfire::mpmc::Null>;
-pub type ShutdownToken = crossfire::MAsyncRx<crossfire::mpmc::Null>;
+pub type FrameTx = crossfire::MTx<crossfire::mpsc::Array<Message>>;
+pub type FrameRx = crossfire::AsyncRx<crossfire::mpsc::Array<Message>>;
+pub type ShutdownTx = crossfire::null::CloseHandle<crossfire::mpmc::Null>;
+pub type ShutdownRx = crossfire::MAsyncRx<crossfire::mpmc::Null>;
 
 pub struct Shard {
     id: u16,
-    senders: Vec<Sender>,
-    receiver: Option<Receiver>,
+    senders: Vec<FrameTx>,
+    receiver: Option<FrameRx>,
 }
 
 impl Shard {
-    async fn run(self: Rc<Self>, tick_interval: Duration, token: ShutdownToken) {
+    async fn run(self: Rc<Self>, tick_interval: Duration, token: ShutdownRx) {
         let shard = self.clone();
         let token_ = token.clone();
         compio::runtime::spawn(async move {
@@ -78,9 +78,9 @@ impl Builder {
     pub fn run(
         self,
         id: u16,
-        senders: Vec<Sender>,
-        receiver: Receiver,
-        token: ShutdownToken,
+        senders: Vec<FrameTx>,
+        receiver: FrameRx,
+        token: ShutdownRx,
     ) -> std::io::Result<()> {
         let Self { tick_interval } = self;
 
