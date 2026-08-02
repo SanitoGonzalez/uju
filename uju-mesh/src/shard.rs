@@ -1,3 +1,4 @@
+use std::num::NonZero;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -6,7 +7,8 @@ use tracing::{error, info};
 
 pub type Sender = crossfire::MTx<crossfire::mpsc::Array<Message>>;
 pub type Receiver = crossfire::AsyncRx<crossfire::mpsc::Array<Message>>;
-pub type StopReceiver = crossfire::MAsyncRx<crossfire::mpmc::Null>;
+pub type ShutdownSource = crossfire::null::CloseHandle<crossfire::mpmc::Null>;
+pub type ShutdownToken = crossfire::MAsyncRx<crossfire::mpmc::Null>;
 
 pub struct Shard {
     id: u16,
@@ -15,9 +17,9 @@ pub struct Shard {
 }
 
 impl Shard {
-    async fn run(self: Rc<Self>, tick_interval: Duration, stop_rx: StopReceiver) {
+    async fn run(self: Rc<Self>, tick_interval: Duration, token: ShutdownToken) {
         let shard = self.clone();
-        let stop_rx_ = stop_rx.clone();
+        let token_ = token.clone();
         compio::runtime::spawn(async move {
             let mut ticked_at = Instant::now();
             let mut interval = compio::time::interval(tick_interval);
@@ -29,7 +31,7 @@ impl Shard {
                         shard.tick((now - ticked_at).as_secs_f32());
                         ticked_at = now;
                     },
-                    _ = stop_rx_.recv().fuse() => {
+                    _ = token_.recv().fuse() => {
                         break;
                     }
                 }
@@ -37,7 +39,7 @@ impl Shard {
         })
         .detach();
 
-        _ = stop_rx.recv().await;
+        _ = token.recv().await;
 
         // todo: cleanup
         info!("[shard-{}] stopping", self.id);
@@ -78,16 +80,19 @@ impl Builder {
         id: u16,
         senders: Vec<Sender>,
         receiver: Receiver,
-        stop_rx: StopReceiver,
+        token: ShutdownToken,
     ) -> std::io::Result<()> {
         let Self { tick_interval } = self;
 
         let mut proactor = compio::driver::ProactorBuilder::new();
         proactor
             .capacity(4096) // todo: accept env variable
+            .cqsize(32768) // todo: accept env variable
             .single_issuer(true)
             .defer_taskrun(true)
-            .thread_pool_limit(0);
+            .thread_pool_limit(0)
+            .buffer_pool_size(NonZero::new(8192).unwrap()) // todo: accept env variable
+            .buffer_pool_buffer_len(2048); // todo: accept env variable
 
         let runtime = compio::runtime::RuntimeBuilder::new()
             .with_proactor(proactor)
@@ -101,7 +106,7 @@ impl Builder {
         });
 
         runtime.block_on(async move {
-            shard.run(tick_interval, stop_rx).await;
+            shard.run(tick_interval, token).await;
         });
 
         Ok(())

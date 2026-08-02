@@ -9,22 +9,50 @@ pub enum Protocol {
     Tcp,
 }
 
-pub enum Connection {
-    Rudp(rudp::Connection),
-    Tcp(tcp::Connection),
+pub enum Session {
+    Rudp(rudp::Session),
+    Tcp(tcp::Session),
 }
 
-pub enum Mode {
+pub enum Semantic {
     ReliableOrdered,
     ReliableUnordered,
+    UnreliableSequenced,
     Unreliable,
 }
 
-impl Connection {
-    fn send(&mut self, buf: Bytes, _mode: Mode) {
+impl Session {
+    fn send(&mut self, buf: Bytes, _semantic: Semantic) {
         match self {
             Self::Rudp(_c) => todo!(),
             Self::Tcp(c) => c.send(buf),
+        }
+    }
+
+    #[inline]
+    fn send_ro(&mut self, buf: Bytes) {
+        self.send(buf, Semantic::ReliableOrdered);
+    }
+
+    #[inline]
+    fn send_ru(&mut self, buf: Bytes) {
+        self.send(buf, Semantic::ReliableUnordered);
+    }
+
+    #[inline]
+    fn send_us(&mut self, buf: Bytes) {
+        self.send(buf, Semantic::UnreliableSequenced);
+    }
+
+    #[inline]
+    fn send_u(&mut self, buf: Bytes) {
+        self.send(buf, Semantic::Unreliable);
+    }
+
+    fn close(&mut self) {
+        match self {
+            Self::Rudp(_c) => todo!(),
+            Self::Tcp(c) => c.close(),
         }
     }
 }

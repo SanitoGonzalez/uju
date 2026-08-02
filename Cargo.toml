@@ -16,6 +16,7 @@ edition = "2024"
 compio = { version = "0.19", features = ["net", "signal", "time"] }
 crossfire = "3.1"
 futures-util = "0.3"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"

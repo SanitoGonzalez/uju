@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+uju-io = { path = "../uju-io" }
+
 compio.workspace = true
 crossfire.workspace = true
 futures-util.workspace = true

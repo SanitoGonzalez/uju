@@ -58,26 +58,26 @@ impl Builder {
             senders.push(tx);
             receivers.push(Some(rx));
         }
-
-        let (stop_tx, stop_rx) = crossfire::mpmc::Null::new().new_async();
+        
+        let (shutdown, token) = crossfire::mpmc::Null::new().new_async();
 
         for (id, cpu) in allowed_cpus.drain(..).enumerate() {
             let shard_builder = self.shard_builder.clone();
             let senders = senders.clone();
             let receiver = receivers[id].take().unwrap();
-            let stop_rx = stop_rx.clone();
 
             // todo: support Count, Range, NUMA
             let mut cpuset = CpuSet::new();
             cpuset.set(cpu)?;
-
+            
+            let token = token.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("shard-{id}"))
                 .spawn(move || {
                     sched_setaffinity(Pid::from_raw(0), &cpuset)?;
                     info!("[shard-{id}] thread pinned on cpu {cpu}");
 
-                    shard_builder.run(id as u16, senders, receiver, stop_rx)?;
+                    shard_builder.run(id as u16, senders, receiver, token)?;
                     Ok(())
                 })
                 .unwrap_or_else(|e| panic!("failed to spawn thread for shard-{id}: {e}"));
@@ -90,7 +90,8 @@ impl Builder {
 
         compio::runtime::spawn(async move {
             _ = compio::signal::ctrl_c().await;
-            drop(stop_tx);
+
+            drop(shutdown);
         })
         .detach();
 
