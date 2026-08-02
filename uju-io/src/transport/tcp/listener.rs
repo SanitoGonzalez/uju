@@ -5,40 +5,70 @@ use futures_util::{FutureExt, select};
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::{debug, error};
 
+use crate::error::Result;
 use crate::stop::StopToken;
 use crate::transport::tcp::session::Session;
 
-pub type Listener = TcpListener;
-
-pub fn bind(addr: SocketAddr) -> std::io::Result<Listener> {
+pub fn bind(addr: SocketAddr) -> Result<TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(libc::SOMAXCONN)?;
+    socket.set_reuse_port(true)?;
+    // socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     socket.set_tcp_nodelay(true)?;
+    // socket.set_keepalive(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(libc::SOMAXCONN)?;
 
     let listener: std::net::TcpListener = socket.into();
-    TcpListener::from_std(listener)
+    let listener = TcpListener::from_std(listener)?;
+    Ok(listener)
 }
 
-pub fn run(listener: Listener, token: StopToken) {
-    compio::runtime::spawn(async move {
-        loop {
-            select! {
-                result = listener.accept().fuse() => match result {
-                    Ok((stream, addr)) => {
-                        debug!("accepted from: {addr}");
-                        let session = Session::open(stream);
-                        // todo: register session
-                    }
-                    Err(e) => {
-                        error!("failed to accept: {e}");
-                    }
-                },
-                _ = token.wait().fuse() => break,
-            }
+pub async fn accept(listener: TcpListener, token: StopToken) {
+    loop {
+        select! {
+            result = listener.accept().fuse() => match result {
+                Ok((stream, addr)) => {
+                    debug!("accepted from: {addr}");
+                    let _session = Session::open(stream, &token);
+                    // todo: register session
+                }
+                Err(e) => {
+                    error!("failed to accept: {e}");
+                }
+            },
+            _ = token.wait().fuse() => break,
         }
-    })
-    .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stop::StopSource;
+
+    #[compio::test]
+    async fn test_listener_bind() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener1 = bind(addr).unwrap();
+        let _listener2 = bind(listener1.local_addr().unwrap()).unwrap();
+    }
+
+    #[compio::test]
+    async fn test_listener_accept() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener = bind(addr).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (stop, token) = StopSource::new();
+        let handle = compio::runtime::spawn(async move {
+            accept(listener, token).await;
+        });
+
+        let socket = compio::net::TcpSocket::new_v4().await.unwrap();
+        socket.connect(addr).await.unwrap();
+
+        stop.request();
+        handle.await.unwrap();
+    }
 }

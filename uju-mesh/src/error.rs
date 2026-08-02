@@ -1,4 +1,7 @@
-type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(thiserror::Error, Debug)]
-pub enum Error {}
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] uju_io::error::Error),
+}

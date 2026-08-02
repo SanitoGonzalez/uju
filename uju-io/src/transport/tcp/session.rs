@@ -7,7 +7,7 @@ use compio::net::TcpStream;
 use futures_util::{FutureExt, StreamExt, select};
 use tracing::warn;
 
-use crate::stop::{self, StopSource, StopToken};
+use crate::stop::{StopSource, StopToken};
 
 type EgressTx = crossfire::MTx<crossfire::mpsc::List<Bytes>>;
 type EgressRx = crossfire::AsyncRx<crossfire::mpsc::List<Bytes>>;
@@ -23,10 +23,10 @@ struct Header {
 }
 
 impl Session {
-    pub fn open(stream: TcpStream) -> Self {
+    pub fn open(stream: TcpStream, token: &StopToken) -> Self {
         let (reader, writer) = stream.into_split();
         let (egress_tx, egress_rx) = crossfire::mpsc::unbounded_async();
-        let (close, token) = stop::new();
+        let (close, token) = token.child();
 
         compio::runtime::spawn(Self::send_loop(writer, egress_rx, token.clone())).detach();
         compio::runtime::spawn(Self::recv_loop(reader, token)).detach();
@@ -34,12 +34,12 @@ impl Session {
         Self { egress_tx, close }
     }
 
-    pub fn send(&self, buf: Bytes) {
-        _ = self.egress_tx.send(buf);
-    }
-
     pub fn close(&mut self) {
         self.close.request();
+    }
+
+    pub fn send(&self, buf: Bytes) {
+        _ = self.egress_tx.send(buf);
     }
 
     async fn send_loop(mut writer: TcpStream, egress_rx: EgressRx, token: StopToken) {

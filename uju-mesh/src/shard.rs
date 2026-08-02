@@ -1,25 +1,65 @@
+use std::cell::RefCell;
+use std::net::SocketAddr;
 use std::num::NonZero;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, select};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use uju_io::stop::{StopSource, StopToken};
+use uju_io::transport::tcp;
+
+use crate::error::{Error, Result};
 
 pub type FrameTx = crossfire::MTx<crossfire::mpsc::Array<Message>>;
 pub type FrameRx = crossfire::AsyncRx<crossfire::mpsc::Array<Message>>;
 pub type ShutdownTx = crossfire::null::CloseHandle<crossfire::mpmc::Null>;
 pub type ShutdownRx = crossfire::MAsyncRx<crossfire::mpmc::Null>;
 
+// todo: implement this on uju-ecs
+#[derive(Default)]
+pub struct PseudoWorld {
+    count: u32,
+}
+
+impl PseudoWorld {
+    pub fn touch(&mut self) {
+        self.count += 1;
+    }
+
+    pub fn access(&self) -> u32 {
+        self.count
+    }
+}
+
 pub struct Shard {
     id: u16,
     senders: Vec<FrameTx>,
     receiver: Option<FrameRx>,
+    stop: StopSource,
+    token: StopToken,
+
+    // todo: replace to `UnsafeCell` after stabilization for optimization
+    world: RefCell<PseudoWorld>,
 }
 
 impl Shard {
-    async fn run(self: Rc<Self>, tick_interval: Duration, token: ShutdownRx) {
+    async fn run(self: Rc<Self>, tick_interval: Duration, shutdown: ShutdownRx) -> Result<()> {
+        self.spawn_tcp_server()?;
+        self.spawn_tick(tick_interval);
+
+        _ = shutdown.recv().await;
+        self.stop.request();
+
+        // todo: cleanup
+        info!("[shard-{}] stopping", self.id);
+        Ok(())
+    }
+
+    fn spawn_tick(self: &Rc<Self>, tick_interval: Duration) {
         let shard = self.clone();
-        let token_ = token.clone();
+        let token = self.token.clone();
+
         compio::runtime::spawn(async move {
             let mut ticked_at = Instant::now();
             let mut interval = compio::time::interval(tick_interval);
@@ -31,18 +71,25 @@ impl Shard {
                         shard.tick((now - ticked_at).as_secs_f32());
                         ticked_at = now;
                     },
-                    _ = token_.recv().fuse() => {
+                    _ = token.wait().fuse() => {
                         break;
                     }
                 }
             }
         })
         .detach();
+    }
 
-        _ = token.recv().await;
+    fn spawn_tcp_server(self: &Rc<Self>) -> Result<()> {
+        let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap(); // todo: accept config
+        let listener = tcp::listener::bind(addr)?;
+        let token = self.token.clone();
 
-        // todo: cleanup
-        info!("[shard-{}] stopping", self.id);
+        compio::runtime::spawn(async move {
+            tcp::listener::accept(listener, token).await;
+        })
+        .detach();
+        Ok(())
     }
 
     fn tick(self: &Rc<Self>, dt: f32) {
@@ -80,7 +127,7 @@ impl Builder {
         id: u16,
         senders: Vec<FrameTx>,
         receiver: FrameRx,
-        token: ShutdownRx,
+        shutdown: ShutdownRx,
     ) -> std::io::Result<()> {
         let Self { tick_interval } = self;
 
@@ -93,20 +140,25 @@ impl Builder {
             .thread_pool_limit(0)
             .buffer_pool_size(NonZero::new(8192).unwrap()) // todo: accept env variable
             .buffer_pool_buffer_len(2048); // todo: accept env variable
-
         let runtime = compio::runtime::RuntimeBuilder::new()
             .with_proactor(proactor)
             .event_interval(128) // todo: accept env variable
             .build()?;
 
+        let (stop, token) = StopSource::new();
         let shard = Rc::new(Shard {
             id,
             senders,
             receiver: Some(receiver),
+            stop,
+            token,
+            world: RefCell::new(PseudoWorld::default()),
         });
 
         runtime.block_on(async move {
-            shard.run(tick_interval, token).await;
+            if let Err(e) = shard.run(tick_interval, shutdown).await {
+                error!("[shard-{}] stopped with an error: {:?}", id, e);
+            }
         });
 
         Ok(())

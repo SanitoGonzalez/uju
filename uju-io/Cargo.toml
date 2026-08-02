@@ -4,11 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-bytes = "1"
+bytes.workspace = true
 compio.workspace = true
 crossfire.workspace = true
 futures-util.workspace = true
 libc.workspace = true
 socket2 = "0.6"
+smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
