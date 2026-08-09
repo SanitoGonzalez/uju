@@ -1,3 +1,4 @@
+pub mod component;
+pub mod entity;
 pub mod storage;
-
-pub type Entity = usize;
+pub mod world;

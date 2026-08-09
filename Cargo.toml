@@ -4,6 +4,7 @@ members = [
     "uju",
     "uju-demo",
     "uju-ecs",
+    "uju-ecs/macros",
     "uju-io",
     "uju-mesh",
 ]
