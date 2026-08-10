@@ -1,10 +1,11 @@
 use crate::component::Component;
-use crate::entity::Entity;
+use crate::entity::{Entity, EntityIndex};
+use crate::storage::sparse_array::SparseArray;
 
-const NULL: u32 = u32::MAX;
+const PAGE_LEN: usize = 4096;
 
 pub struct SparseSet<T: Component> {
-    sparse: Vec<u32>,
+    sparse: SparseArray<EntityIndex, PAGE_LEN>,
     dense: Vec<Entity>,
     data: Vec<T>,
 }
@@ -12,7 +13,7 @@ pub struct SparseSet<T: Component> {
 impl<T: Component> SparseSet<T> {
     pub(crate) fn new() -> Self {
         Self {
-            sparse: Vec::new(),
+            sparse: SparseArray::new(),
             dense: Vec::new(),
             data: Vec::new(),
         }
@@ -25,8 +26,8 @@ impl<T: Component> SparseSet<T> {
     }
 
     pub(crate) fn insert(&mut self, entity: Entity, component: T) {
-        if let Some(&dense_index) = self.sparse.get(entity.index()) {
-            if dense_index == NULL {}
+        if let Some(index) = self.sparse.get(entity) {
+            if index == EntityIndex::NULL {}
 
             return;
         }
@@ -48,7 +49,7 @@ impl<T: Component> SparseSet<T> {
 
     #[inline]
     pub fn contains(&self, entity: Entity) -> bool {
-        matches!(self.sparse.get(entity.index()), Some(&dense_index) if dense_index != NULL)
+        matches!(self.sparse.get(entity), Some(index) if index != EntityIndex::NULL)
     }
 }
 
