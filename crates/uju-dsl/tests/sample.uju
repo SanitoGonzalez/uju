@@ -1,0 +1,28 @@
+namespace foo.bar;
+
+// comments
+
+const NumberOne: i32 = 1;
+
+enum Color: u8 {
+    Red, // inline comments
+    Green,
+    Blue = 5,
+}
+
+const FavoriteColor: Color = Color.Red;
+
+struct EmptyStruct {}
+
+struct OneField {
+    field: EmptyStruct
+}
+
+struct OptionalField {
+    opt: i32?,
+}
+
+struct MultiField {
+    numbers: [i32],
+    colors: [Color],
+}

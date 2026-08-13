@@ -1,0 +1,8 @@
+[package]
+name = "uju-dsl"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chumsky = "0.13"
+logos = "0.16"
