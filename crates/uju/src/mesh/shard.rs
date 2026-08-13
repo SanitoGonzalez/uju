@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, select};
 use tracing::{error, info, warn};
-use uju_io::stop::{StopSource, StopToken};
-use uju_io::transport::tcp;
 
-use crate::error::{Error, Result};
+use crate::io::stop::{StopSource, StopToken};
+use crate::io::transport::tcp;
+use crate::mesh::error::{Error, Result};
 
 pub type FrameTx = crossfire::MTx<crossfire::mpsc::Array<Message>>;
 pub type FrameRx = crossfire::AsyncRx<crossfire::mpsc::Array<Message>>;

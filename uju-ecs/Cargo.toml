@@ -1,7 +1,0 @@
-[package]
-name = "uju-ecs"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-uju-ecs-macros = { path = "macros" }

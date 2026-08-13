@@ -1,14 +1,18 @@
 [package]
-name = "uju-mesh"
+name = "uju"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-uju-io = { path = "../uju-io" }
+uju-macros-ecs = { path = "macros/ecs" }
 
+bytes.workspace = true
 compio.workspace = true
 crossfire.workspace = true
 futures-util.workspace = true
+libc.workspace = true
 nix = { version = "0.31", features = ["sched"] }
+socket2 = "0.6"
+smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -5,9 +5,9 @@ use futures_util::{FutureExt, select};
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::{debug, error};
 
-use crate::error::Result;
-use crate::stop::StopToken;
-use crate::transport::tcp::session::Session;
+use crate::io::error::Result;
+use crate::io::stop::StopToken;
+use crate::io::transport::tcp::session::Session;
 
 pub fn bind(addr: SocketAddr) -> Result<TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
@@ -45,7 +45,7 @@ pub async fn accept(listener: TcpListener, token: StopToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stop::StopSource;
+    use crate::io::stop::StopSource;
 
     #[compio::test]
     async fn test_listener_bind() {

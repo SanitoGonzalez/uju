@@ -1,4 +1,4 @@
-use crate::entity::{Entity, EntityIndex};
+use crate::ecs::entity::{Entity, EntityIndex};
 
 pub struct SparseArray<T, const N: usize> {
     data: Vec<Option<Box<[T; N]>>>,

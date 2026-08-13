@@ -2,7 +2,7 @@ use std::thread::JoinHandle;
 
 use tracing::{error, info, warn};
 
-use crate::shard;
+use crate::mesh::shard;
 
 #[derive(Debug, Clone)]
 pub struct Builder {

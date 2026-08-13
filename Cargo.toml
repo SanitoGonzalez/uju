@@ -1,13 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
-    "uju",
-    "uju-demo",
-    "uju-ecs",
-    "uju-ecs/macros",
-    "uju-io",
-    "uju-mesh",
-]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,7 +12,10 @@ compio = { version = "0.19", features = ["macros", "net", "signal", "time"] }
 crossfire = "3.1"
 futures-util = "0.3"
 libc = "0.2"
+proc-macro2 = "1"
 serde = { version = "1", features = ["derive"] }
+quote = "1"
 smallvec = "1.15"
+syn = "3"
 thiserror = "2"
 tracing = "0.1"

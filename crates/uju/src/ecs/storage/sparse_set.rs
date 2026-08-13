@@ -1,6 +1,6 @@
-use crate::component::Component;
-use crate::entity::{Entity, EntityIndex};
-use crate::storage::sparse_array::SparseArray;
+use crate::ecs::component::Component;
+use crate::ecs::entity::{Entity, EntityIndex};
+use crate::ecs::storage::sparse_array::SparseArray;
 
 const PAGE_LEN: usize = 4096;
 

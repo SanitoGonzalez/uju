@@ -1,5 +1,5 @@
 [package]
-name = "uju-ecs-macros"
+name = "uju-macros-ecs"
 version.workspace = true
 edition.workspace = true
 
@@ -7,6 +7,6 @@ edition.workspace = true
 proc-macro = true
 
 [dependencies]
-proc-macro2 = "1"
-quote = "1"
-syn = "3"
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true

@@ -976,9 +976,17 @@ dependencies = [
 name = "uju"
 version = "0.1.0"
 dependencies = [
- "uju-ecs",
- "uju-io",
- "uju-mesh",
+ "bytes",
+ "compio",
+ "crossfire",
+ "futures-util",
+ "libc",
+ "nix",
+ "smallvec",
+ "socket2",
+ "thiserror",
+ "tracing",
+ "uju-macros-ecs",
 ]
 
 [[package]]
@@ -991,47 +999,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "uju-ecs"
-version = "0.1.0"
-dependencies = [
- "uju-ecs-macros",
-]
-
-[[package]]
-name = "uju-ecs-macros"
+name = "uju-macros-ecs"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
-]
-
-[[package]]
-name = "uju-io"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "compio",
- "crossfire",
- "futures-util",
- "libc",
- "smallvec",
- "socket2",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "uju-mesh"
-version = "0.1.0"
-dependencies = [
- "compio",
- "crossfire",
- "futures-util",
- "nix",
- "thiserror",
- "tracing",
- "uju-io",
 ]
 
 [[package]]
