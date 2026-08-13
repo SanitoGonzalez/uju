@@ -1,5 +1,5 @@
 [package]
-name = "uju-demo"
+name = "uju-worker"
 version.workspace = true
 edition.workspace = true
 
