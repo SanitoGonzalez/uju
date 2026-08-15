@@ -52,9 +52,7 @@ impl<T: Component> SparseSet<T> {
     }
 
     pub fn remove(&mut self, entity: Entity) -> Option<T> {
-        let Some(index) = self.index_of(entity) else {
-            return None;
-        };
+        let index = self.index_of(entity)?;
 
         self.sparse.remove(entity.index_sparse());
         self.dense.swap_remove(index);
@@ -121,6 +119,9 @@ impl<T: Component> Table for SparseSet<T> {
 
     fn len(&self) -> usize {
         self.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
     }
 
     fn remove(&mut self, entity: Entity) -> bool {

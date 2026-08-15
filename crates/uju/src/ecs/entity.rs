@@ -2,6 +2,8 @@ pub mod allocator;
 
 use std::fmt;
 
+use crate::mesh::{node, shard};
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]
 pub struct EntityIndex(u32);
@@ -155,6 +157,51 @@ impl fmt::Debug for Entity {
 
 impl fmt::Display for Entity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}v{}", self.index, self.generation,)
+        write!(f, "{}v{}", self.index, self.generation)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct UniversalEntity {
+    node: node::Id,
+    shard: shard::Id,
+    entity: Entity,
+}
+
+impl UniversalEntity {
+    #[inline]
+    pub fn new(node: node::Id, shard: shard::Id, entity: Entity) -> Self {
+        Self { node, shard, entity }
+    }
+
+    #[inline(always)]
+    pub fn node(&self) -> node::Id {
+        self.node
+    }
+
+    #[inline(always)]
+    pub fn shard(&self) -> shard::Id {
+        self.shard
+    }
+
+    #[inline(always)]
+    pub fn entity(&self) -> Entity {
+        self.entity
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.node == node::current() && self.shard == shard::current()
+    }
+}
+
+impl fmt::Debug for UniversalEntity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for UniversalEntity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}:{}", self.node, self.shard, self.entity)
     }
 }

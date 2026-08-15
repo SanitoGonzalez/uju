@@ -1,23 +1,28 @@
 use std::thread::JoinHandle;
 
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::mesh::shard;
 
+pub type Id = u16;
+
+static mut ID: Id = u16::MAX;
+
+/// Get the current node ID
+pub fn current() -> Id {
+    unsafe { ID }
+}
+
 #[derive(Debug, Clone)]
 pub struct Builder {
+    id: Id,
     shard_builder: shard::Builder,
 }
 
-impl Default for Builder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Builder {
-    pub fn new() -> Self {
+    pub fn new(id: Id) -> Self {
         Self {
+            id,
             shard_builder: shard::Builder::new(),
         }
     }
@@ -28,6 +33,8 @@ impl Builder {
     }
 
     pub fn run(self) -> std::io::Result<()> {
+        unsafe { ID = self.id }
+        
         let runtime = compio::runtime::Runtime::new()?;
         runtime.block_on(async move {
             self.run_inner().await?;
@@ -77,7 +84,7 @@ impl Builder {
                     sched_setaffinity(Pid::from_raw(0), &cpuset)?;
                     info!("[shard-{id}] thread pinned on cpu {cpu}");
 
-                    shard_builder.run(id as u16, senders, receiver, token)?;
+                    shard_builder.run(id as shard::Id, senders, receiver, token)?;
                     Ok(())
                 })
                 .unwrap_or_else(|e| panic!("failed to spawn thread for shard-{id}: {e}"));

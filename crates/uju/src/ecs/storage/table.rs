@@ -6,6 +6,7 @@ pub trait Table {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool;
     fn remove(&mut self, entity: Entity) -> bool;
     fn contains(&self, entity: Entity) -> bool;
     fn clear(&mut self);

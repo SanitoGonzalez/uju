@@ -1,50 +1,48 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::net::SocketAddr;
 use std::num::NonZero;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, select};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
-use crate::mesh::error::{Error, Result};
+use crate::ecs::world::World;
+use crate::mesh::error::Result;
 use crate::net::transport::tcp;
 use crate::util::stop::{StopSource, StopToken};
+
+pub type Id = u16;
+
+thread_local! { static ID: Cell<Id> = const { Cell::new(Id::MAX) } }
+
+/// Get the current shard ID
+#[inline(always)]
+pub fn current() -> Id {
+    ID.get()
+}
 
 pub type FrameTx = crossfire::MTx<crossfire::mpsc::Array<Message>>;
 pub type FrameRx = crossfire::AsyncRx<crossfire::mpsc::Array<Message>>;
 pub type ShutdownTx = crossfire::null::CloseHandle<crossfire::mpmc::Null>;
 pub type ShutdownRx = crossfire::MAsyncRx<crossfire::mpmc::Null>;
 
-// todo: implement this on uju-ecs
-#[derive(Default)]
-pub struct PseudoWorld {
-    count: u32,
-}
-
-impl PseudoWorld {
-    pub fn touch(&mut self) {
-        self.count += 1;
-    }
-
-    pub fn access(&self) -> u32 {
-        self.count
-    }
-}
 
 pub struct Shard {
-    id: u16,
+    id: Id,
     senders: Vec<FrameTx>,
     receiver: Option<FrameRx>,
     stop: StopSource,
     token: StopToken,
 
     // todo: replace to `UnsafeCell` after stabilization for optimization
-    world: RefCell<PseudoWorld>,
+    world: RefCell<World>,
 }
 
 impl Shard {
     async fn run(self: Rc<Self>, tick_interval: Duration, shutdown: ShutdownRx) -> Result<()> {
+        ID.set(self.id);
+
         self.spawn_tcp_server()?;
         self.spawn_tick(tick_interval);
 
@@ -92,7 +90,7 @@ impl Shard {
         Ok(())
     }
 
-    fn tick(self: &Rc<Self>, dt: f32) {
+    fn tick(self: &Rc<Self>, _dt: f32) {
         info!("[shard-{}] ticking", self.id);
     }
 }
@@ -124,7 +122,7 @@ impl Builder {
 
     pub fn run(
         self,
-        id: u16,
+        id: Id,
         senders: Vec<FrameTx>,
         receiver: FrameRx,
         shutdown: ShutdownRx,
@@ -152,7 +150,7 @@ impl Builder {
             receiver: Some(receiver),
             stop,
             token,
-            world: RefCell::new(PseudoWorld::default()),
+            world: RefCell::new(World::new()),
         });
 
         runtime.block_on(async move {
