@@ -1,5 +1,5 @@
 [package]
-name = "uju-dsl"
+name = "uju-schema"
 version.workspace = true
 edition.workspace = true
 

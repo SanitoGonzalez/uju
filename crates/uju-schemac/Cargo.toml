@@ -1,0 +1,9 @@
+[package]
+name = "uju-schemac"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+uju-schema = { path = "../uju-schema" }
+
+clap.workspace = true
