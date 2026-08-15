@@ -16,7 +16,10 @@ impl StopSource {
         let (tx, rx) = mpmc::Null::new().new_async();
         let requested = Rc::new(Cell::new(false));
         let mut links = SmallVec::new();
-        links.push(StopTokenLink { rx, requested: requested.clone() });
+        links.push(StopTokenLink {
+            rx,
+            requested: requested.clone(),
+        });
 
         let source = StopSource {
             tx: Cell::new(Some(tx)),

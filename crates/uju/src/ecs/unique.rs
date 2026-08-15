@@ -3,33 +3,31 @@ use std::sync::Once;
 
 use linkme::distributed_slice;
 
-use crate::ecs::storage::table::Table;
-
 pub type Id = u16;
 
-pub trait Component: Send + 'static {
+pub trait Unique: Send + 'static {
     fn id() -> Id;
 }
 
 pub struct Registration {
     pub name: &'static str,
     pub id: UnsafeCell<u16>,
-    pub new_table: fn() -> Box<dyn Table>,
 }
 
 unsafe impl Sync for Registration {}
 
 #[distributed_slice]
-pub static COMPONENTS: [Registration];
+pub static UNIQUES: [Registration];
 
 static INIT: Once = Once::new();
 
 pub fn init() {
     INIT.call_once(|| {
-        let registrations = registrations();
+        let mut registrations: Vec<_> = UNIQUES.iter().collect();
+        registrations.sort_unstable_by_key(|registration| registration.name);
         assert!(registrations.len() <= u16::MAX as usize);
         for pair in registrations.windows(2) {
-            assert_ne!(pair[0].name, pair[1].name, "duplicate component name");
+            assert_ne!(pair[0].name, pair[1].name, "duplicate unique name");
         }
         for (index, registration) in registrations.iter().enumerate() {
             unsafe { *registration.id.get() = index as u16 }
@@ -37,8 +35,6 @@ pub fn init() {
     });
 }
 
-pub(crate) fn registrations() -> Vec<&'static Registration> {
-    let mut registrations: Vec<_> = COMPONENTS.iter().collect();
-    registrations.sort_unstable_by_key(|registration| registration.name);
-    registrations
+pub(crate) fn count() -> usize {
+    UNIQUES.len()
 }

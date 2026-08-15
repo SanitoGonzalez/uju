@@ -58,7 +58,7 @@ impl Builder {
             senders.push(tx);
             receivers.push(Some(rx));
         }
-        
+
         let (shutdown, token) = crossfire::mpmc::Null::new().new_async();
 
         for (id, cpu) in allowed_cpus.drain(..).enumerate() {
@@ -69,7 +69,7 @@ impl Builder {
             // todo: support Count, Range, NUMA
             let mut cpuset = CpuSet::new();
             cpuset.set(cpu)?;
-            
+
             let token = token.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("shard-{id}"))

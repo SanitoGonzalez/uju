@@ -6,7 +6,7 @@ pub fn expand(ast: DeriveInput) -> Result<TokenStream> {
     if !ast.generics.params.is_empty() {
         return Err(Error::new_spanned(
             &ast.generics,
-            "generic types cannot derive Component",
+            "generic types cannot derive Unique",
         ));
     }
 
@@ -14,20 +14,17 @@ pub fn expand(ast: DeriveInput) -> Result<TokenStream> {
 
     Ok(quote! {
         const _: () = {
-            #[::uju::linkme::distributed_slice(::uju::ecs::component::COMPONENTS)]
+            #[::uju::linkme::distributed_slice(::uju::ecs::unique::UNIQUES)]
             #[linkme(crate = ::uju::linkme)]
-            static REGISTRATION: ::uju::ecs::component::Registration =
-                ::uju::ecs::component::Registration {
+            static REGISTRATION: ::uju::ecs::unique::Registration =
+                ::uju::ecs::unique::Registration {
                     name: ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident)),
                     id: ::core::cell::UnsafeCell::new(u16::MAX),
-                    new_table: || ::std::boxed::Box::new(
-                        ::uju::ecs::storage::sparse_set::SparseSet::<#ident>::new(),
-                    ),
                 };
 
-            impl ::uju::ecs::component::Component for #ident {
+            impl ::uju::ecs::unique::Unique for #ident {
                 #[inline(always)]
-                fn id() -> ::uju::ecs::component::Id {
+                fn id() -> ::uju::ecs::unique::Id {
                     unsafe { *REGISTRATION.id.get() }
                 }
             }

@@ -11,6 +11,7 @@ compio.workspace = true
 crossfire.workspace = true
 futures-util.workspace = true
 libc.workspace = true
+linkme = "0.3"
 nix = { version = "0.31", features = ["sched"] }
 socket2 = "0.6"
 smallvec.workspace = true

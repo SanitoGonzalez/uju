@@ -1,6 +1,9 @@
+use std::any::Any;
+
 use crate::ecs::component::Component;
 use crate::ecs::entity::Entity;
 use crate::ecs::storage::sparse_array::SparseArray;
+use crate::ecs::storage::table::Table;
 
 pub struct SparseSet<T: Component> {
     sparse: SparseArray<1024>,
@@ -33,16 +36,17 @@ impl<T: Component> SparseSet<T> {
         self.dense.is_empty()
     }
 
-    pub fn insert(&mut self, entity: Entity, component: T) {
+    pub fn insert(&mut self, entity: Entity, component: T) -> Option<T> {
         match self.sparse.get(entity.index_sparse()) {
             Some(index) => {
                 self.dense[index] = entity;
-                self.data[index] = component;
+                Some(std::mem::replace(&mut self.data[index], component))
             }
             None => {
                 self.sparse.insert(entity.index_sparse(), self.dense.len());
                 self.dense.push(entity);
                 self.data.push(component);
+                None
             }
         }
     }
@@ -84,7 +88,7 @@ impl<T: Component> SparseSet<T> {
         let index = self.sparse.get(entity.index_sparse())?;
         (self.dense[index] == entity).then_some(index)
     }
-    
+
     pub fn entities(&self) -> impl Iterator<Item = &Entity> {
         self.dense.iter()
     }
@@ -97,12 +101,38 @@ impl<T: Component> SparseSet<T> {
         self.data.iter_mut()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&Entity, &T)> {
-        self.dense.iter().zip(self.data.iter())
+    pub fn iter(&self) -> impl Iterator<Item = (Entity, &T)> {
+        self.dense.iter().copied().zip(self.data.iter())
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&Entity, &mut T)> {
-        self.dense.iter().zip(self.data.iter_mut())
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut T)> {
+        self.dense.iter().copied().zip(self.data.iter_mut())
+    }
+}
+
+impl<T: Component> Table for SparseSet<T> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn remove(&mut self, entity: Entity) -> bool {
+        self.remove(entity).is_some()
+    }
+
+    fn contains(&self, entity: Entity) -> bool {
+        self.contains(entity)
+    }
+
+    fn clear(&mut self) {
+        self.clear();
     }
 }
 
@@ -169,5 +199,10 @@ mod tests {
 
         *set.get_mut(e1).unwrap() = Foo(11);
         assert_eq!(set.get(e1), Some(&Foo(11)));
+
+        let e1_2nd = Entity::new(EntityIndex::from_bits(1), EntityGeneration::from_bits(1));
+        assert_eq!(set.insert(e1_2nd, Foo(42)), Some(Foo(11)));
+        assert_eq!(set.get(e1), None);
+        assert_eq!(set.get(e1_2nd), Some(&Foo(42)));
     }
 }
