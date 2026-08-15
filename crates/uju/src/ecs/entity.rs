@@ -48,12 +48,12 @@ impl EntityGeneration {
     }
 
     #[inline(always)]
-    const fn to_bits(self) -> u32 {
+    pub const fn to_bits(self) -> u32 {
         self.0
     }
 
     #[inline(always)]
-    const fn from_bits(bits: u32) -> Self {
+    pub const fn from_bits(bits: u32) -> Self {
         Self(bits)
     }
 
@@ -110,7 +110,7 @@ impl std::hash::Hash for Entity {
 }
 
 impl Entity {
-    pub(crate) const fn new(index: EntityIndex, generation: EntityGeneration) -> Self {
+    pub const fn new(index: EntityIndex, generation: EntityGeneration) -> Self {
         Self { index, generation }
     }
 
@@ -135,8 +135,8 @@ impl Entity {
     }
 
     #[inline]
-    pub const fn index_u32(self) -> u32 {
-        self.index.0
+    pub const fn index_sparse(self) -> usize {
+        self.index.0 as usize
     }
 
     #[inline]
