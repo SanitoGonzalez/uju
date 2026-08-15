@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use futures_util::{FutureExt, select};
 use tracing::{error, info, warn};
 
-use crate::io::stop::{StopSource, StopToken};
-use crate::io::transport::tcp;
 use crate::mesh::error::{Error, Result};
+use crate::net::transport::tcp;
+use crate::util::stop::{StopSource, StopToken};
 
 pub type FrameTx = crossfire::MTx<crossfire::mpsc::Array<Message>>;
 pub type FrameRx = crossfire::AsyncRx<crossfire::mpsc::Array<Message>>;

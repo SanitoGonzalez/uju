@@ -5,4 +5,5 @@ edition.workspace = true
 
 [dependencies]
 chumsky = "0.13"
+heck = "0.5"
 logos = "0.16"

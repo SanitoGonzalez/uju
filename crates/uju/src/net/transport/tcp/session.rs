@@ -7,7 +7,7 @@ use compio::net::TcpStream;
 use futures_util::{FutureExt, StreamExt, select};
 use tracing::warn;
 
-use crate::io::stop::{StopSource, StopToken};
+use crate::util::stop::{StopSource, StopToken};
 
 type EgressTx = crossfire::MTx<crossfire::mpsc::List<Bytes>>;
 type EgressRx = crossfire::AsyncRx<crossfire::mpsc::List<Bytes>>;

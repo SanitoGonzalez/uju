@@ -1,5 +1,4 @@
 pub mod ast;
-pub mod case;
 pub mod codegen;
 pub mod diag;
 pub mod ir;
