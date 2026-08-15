@@ -3,11 +3,13 @@ use std::cell::{Ref, RefCell, RefMut};
 
 use crate::ecs::{
     component::{self, Component},
+    entity::{self, Entity},
     storage::{sparse_set::SparseSet, table::Table},
     unique::{self, Unique},
 };
 
 pub struct World {
+    entities: RefCell<entity::allocator::Allocator>,
     tables: Vec<RefCell<Box<dyn Table>>>,
     uniques: Vec<RefCell<Option<Box<dyn Any>>>>,
 }
@@ -15,6 +17,7 @@ pub struct World {
 impl World {
     pub fn new() -> Self {
         Self {
+            entities: RefCell::new(entity::allocator::Allocator::new()),
             tables: component::registrations()
                 .into_iter()
                 .map(|registration| RefCell::new((registration.new_table)()))
@@ -69,6 +72,26 @@ impl World {
         RefMut::map(self.tables[C::id() as usize].borrow_mut(), |table| {
             table.as_any_mut().downcast_mut().unwrap()
         })
+    }
+
+    pub fn spawn(&self) -> Entity {
+        self.entities.borrow_mut().alloc()
+    }
+
+    // todo: despawning while table iteration causes `RefCell` panic - need deferred despawn
+    pub fn despawn(&self, entity: Entity) -> bool {
+        if !self.entities.borrow_mut().dealloc(entity) {
+            return false;
+        }
+        // todo: entity despawn is O(number of components) - optimization is needed
+        for table in &self.tables {
+            table.borrow_mut().remove(entity);
+        }
+        true
+    }
+
+    pub fn is_alive(&self, entity: Entity) -> bool {
+        self.entities.borrow().is_alive(entity)
     }
 }
 

@@ -155,11 +155,11 @@ mod tests {
     #[test]
     fn sparse_set() {
         let mut set = SparseSet::default();
-        let e0 = Entity::new(EntityIndex::from_bits(0), EntityGeneration::from_bits(0));
-        let e1 = Entity::new(EntityIndex::from_bits(1), EntityGeneration::from_bits(0));
-        let e2 = Entity::new(EntityIndex::from_bits(2), EntityGeneration::from_bits(0));
-        let e3 = Entity::new(EntityIndex::from_bits(3), EntityGeneration::from_bits(0));
-        let e4 = Entity::new(EntityIndex::from_bits(4), EntityGeneration::from_bits(0));
+        let e0 = Entity::new(EntityIndex::from_bits(0), EntityGeneration::from_bits(1));
+        let e1 = Entity::new(EntityIndex::from_bits(1), EntityGeneration::from_bits(1));
+        let e2 = Entity::new(EntityIndex::from_bits(2), EntityGeneration::from_bits(1));
+        let e3 = Entity::new(EntityIndex::from_bits(3), EntityGeneration::from_bits(1));
+        let e4 = Entity::new(EntityIndex::from_bits(4), EntityGeneration::from_bits(1));
 
         set.insert(e1, Foo(1));
         set.insert(e2, Foo(2));
@@ -200,7 +200,7 @@ mod tests {
         *set.get_mut(e1).unwrap() = Foo(11);
         assert_eq!(set.get(e1), Some(&Foo(11)));
 
-        let e1_2nd = Entity::new(EntityIndex::from_bits(1), EntityGeneration::from_bits(1));
+        let e1_2nd = Entity::new(EntityIndex::from_bits(1), EntityGeneration::from_bits(3));
         assert_eq!(set.insert(e1_2nd, Foo(42)), Some(Foo(11)));
         assert_eq!(set.get(e1), None);
         assert_eq!(set.get(e1_2nd), Some(&Foo(42)));

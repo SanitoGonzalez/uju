@@ -1,3 +1,5 @@
+pub mod allocator;
+
 use std::fmt;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
