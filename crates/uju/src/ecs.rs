@@ -1,5 +1,6 @@
 pub mod component;
 pub mod entity;
+pub mod ghost;
 pub mod storage;
 pub mod unique;
 pub mod world;

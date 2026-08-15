@@ -76,11 +76,8 @@ impl fmt::Display for EntityGeneration {
 #[derive(Clone, Copy)]
 #[repr(C, align(8))]
 pub struct Entity {
-    #[cfg(target_endian = "little")]
     index: EntityIndex,
     generation: EntityGeneration,
-    #[cfg(target_endian = "big")]
-    index: EntityIndex,
 }
 
 impl PartialEq for Entity {
@@ -161,7 +158,7 @@ impl fmt::Display for Entity {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UniversalEntity {
     node: node::Id,
     shard: shard::Id,
@@ -169,6 +166,8 @@ pub struct UniversalEntity {
 }
 
 impl UniversalEntity {
+    pub const BYTES: usize = 12;
+
     #[inline]
     pub fn new(node: node::Id, shard: shard::Id, entity: Entity) -> Self {
         Self {
@@ -176,6 +175,11 @@ impl UniversalEntity {
             shard,
             entity,
         }
+    }
+
+    #[inline]
+    pub fn current(entity: Entity) -> Self {
+        Self::new(node::current(), shard::current(), entity)
     }
 
     #[inline(always)]
@@ -186,6 +190,11 @@ impl UniversalEntity {
     #[inline(always)]
     pub fn shard(&self) -> shard::Id {
         self.shard
+    }
+
+    #[inline(always)]
+    pub fn tuple(&self) -> (node::Id, shard::Id) {
+        (self.node, self.shard)
     }
 
     #[inline(always)]

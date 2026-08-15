@@ -4,12 +4,14 @@ use std::cell::{Ref, RefCell, RefMut};
 use crate::ecs::{
     component::{self, Component},
     entity::{self, Entity},
+    ghost,
     storage::{sparse_set::SparseSet, table::Table},
     unique::{self, Unique, time::Time},
 };
 
 pub struct World {
     entities: RefCell<entity::allocator::Allocator>,
+    ghosts: ghost::Registry,
     tables: Vec<RefCell<Box<dyn Table>>>,
     uniques: Vec<RefCell<Option<Box<dyn Any>>>>,
 }
@@ -18,6 +20,7 @@ impl World {
     pub fn new() -> Self {
         let world = Self {
             entities: RefCell::new(entity::allocator::Allocator::new()),
+            ghosts: ghost::Registry::new(),
             tables: component::registrations()
                 .into_iter()
                 .map(|registration| RefCell::new((registration.new_table)()))
