@@ -1,0 +1,5 @@
+#!/bin/sh
+if ! cargo +nightly fmt -- --check; then
+    echo "rustfmt needed: cargo +nightly fmt"
+    exit 1
+fi
