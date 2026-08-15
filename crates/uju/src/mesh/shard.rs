@@ -27,7 +27,6 @@ pub type FrameRx = crossfire::AsyncRx<crossfire::mpsc::Array<Message>>;
 pub type ShutdownTx = crossfire::null::CloseHandle<crossfire::mpmc::Null>;
 pub type ShutdownRx = crossfire::MAsyncRx<crossfire::mpmc::Null>;
 
-
 pub struct Shard {
     id: Id,
     senders: Vec<FrameTx>,

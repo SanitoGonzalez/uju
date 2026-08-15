@@ -171,7 +171,11 @@ pub struct UniversalEntity {
 impl UniversalEntity {
     #[inline]
     pub fn new(node: node::Id, shard: shard::Id, entity: Entity) -> Self {
-        Self { node, shard, entity }
+        Self {
+            node,
+            shard,
+            entity,
+        }
     }
 
     #[inline(always)]

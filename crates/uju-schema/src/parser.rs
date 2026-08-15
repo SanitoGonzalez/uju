@@ -29,8 +29,8 @@ pub fn namespace<'src, I: TokenInput<'src>>()
     todo()
 }
 
-pub fn item<'src, I: TokenInput<'src>>()
--> impl Parser<'src, I, Item, extra::Err<ParseError<'src>>> {
+pub fn item<'src, I: TokenInput<'src>>() -> impl Parser<'src, I, Item, extra::Err<ParseError<'src>>>
+{
     todo()
 }
 

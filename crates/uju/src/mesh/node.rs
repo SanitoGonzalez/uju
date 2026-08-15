@@ -34,7 +34,7 @@ impl Builder {
 
     pub fn run(self) -> std::io::Result<()> {
         unsafe { ID = self.id }
-        
+
         let runtime = compio::runtime::Runtime::new()?;
         runtime.block_on(async move {
             self.run_inner().await?;

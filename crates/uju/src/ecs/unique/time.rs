@@ -12,11 +12,11 @@ impl Time {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     pub fn ticks(&self) -> u64 {
         self.ticks
     }
-    
+
     pub fn delta(&self) -> Duration {
         self.delta
     }
