@@ -37,26 +37,26 @@ impl World {
             .map(|unique| *unique.downcast().unwrap())
     }
 
-    pub fn unique<U: Unique>(&self) -> Ref<'_, U> {
-        Ref::map(self.uniques[U::id() as usize].borrow(), |slot| {
-            slot.as_ref()
-                .expect("unique not inserted")
-                .downcast_ref()
-                .unwrap()
+    pub fn get_unique<U: Unique>(&self) -> Option<Ref<'_, U>> {
+        Ref::filter_map(self.uniques[U::id() as usize].borrow(), |slot| {
+            slot.as_ref().map(|unique| unique.downcast_ref().unwrap())
         })
+        .ok()
+    }
+
+    pub fn get_unique_mut<U: Unique>(&self) -> Option<RefMut<'_, U>> {
+        RefMut::filter_map(self.uniques[U::id() as usize].borrow_mut(), |slot| {
+            slot.as_mut().map(|unique| unique.downcast_mut().unwrap())
+        })
+        .ok()
+    }
+
+    pub fn unique<U: Unique>(&self) -> Ref<'_, U> {
+        self.get_unique().expect("unique not inserted")
     }
 
     pub fn unique_mut<U: Unique>(&self) -> RefMut<'_, U> {
-        RefMut::map(self.uniques[U::id() as usize].borrow_mut(), |slot| {
-            slot.as_mut()
-                .expect("unique not inserted")
-                .downcast_mut()
-                .unwrap()
-        })
-    }
-
-    pub fn contains_unique<U: Unique>(&self) -> bool {
-        self.uniques[U::id() as usize].borrow().is_some()
+        self.get_unique_mut().expect("unique not inserted")
     }
 
     fn sparse_set<C: Component>(&self) -> Ref<'_, SparseSet<C>> {
@@ -117,18 +117,23 @@ mod tests {
         let world = World::new();
 
         assert_ne!(Counter::id(), Config::id());
-        assert!(!world.contains_unique::<Counter>());
+        assert!(world.get_unique::<Counter>().is_none());
+        assert!(world.get_unique_mut::<Counter>().is_none());
 
         assert_eq!(world.insert_unique(Counter(1)), None);
         assert_eq!(world.insert_unique(Config(7)), None);
         assert_eq!(*world.unique::<Counter>(), Counter(1));
+        assert_eq!(world.get_unique::<Counter>().as_deref(), Some(&Counter(1)));
 
         world.unique_mut::<Counter>().0 += 1;
         assert_eq!(*world.unique::<Counter>(), Counter(2));
 
-        assert_eq!(world.insert_unique(Counter(10)), Some(Counter(2)));
+        world.get_unique_mut::<Counter>().unwrap().0 += 1;
+        assert_eq!(*world.unique::<Counter>(), Counter(3));
+
+        assert_eq!(world.insert_unique(Counter(10)), Some(Counter(3)));
         assert_eq!(world.remove_unique::<Counter>(), Some(Counter(10)));
-        assert!(!world.contains_unique::<Counter>());
+        assert!(world.get_unique::<Counter>().is_none());
         assert_eq!(*world.unique::<Config>(), Config(7));
     }
 
