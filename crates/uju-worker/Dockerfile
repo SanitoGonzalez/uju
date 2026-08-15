@@ -1,4 +1,4 @@
-FROM rust:trixie AS chef
+FROM rust:1.97.1-trixie AS chef
 
 RUN cargo install cargo-chef
 WORKDIR /build
