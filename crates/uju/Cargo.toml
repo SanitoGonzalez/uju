@@ -3,13 +3,21 @@ name = "uju"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["3d"]
+
+2d = []
+3d = []
+
 [dependencies]
 uju-macros-ecs = { path = "macros/ecs" }
 
 bytes.workspace = true
 compio.workspace = true
 crossfire.workspace = true
+derive_more.workspace = true
 futures-util.workspace = true
+glam.workspace = true
 libc.workspace = true
 linkme = "0.3"
 nix = { version = "0.31", features = ["sched"] }

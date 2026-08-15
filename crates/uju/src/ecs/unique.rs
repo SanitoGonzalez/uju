@@ -1,3 +1,5 @@
+pub mod time;
+
 use std::cell::UnsafeCell;
 use std::sync::Once;
 

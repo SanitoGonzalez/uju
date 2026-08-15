@@ -5,7 +5,7 @@ use crate::ecs::{
     component::{self, Component},
     entity::{self, Entity},
     storage::{sparse_set::SparseSet, table::Table},
-    unique::{self, Unique},
+    unique::{self, Unique, time::Time},
 };
 
 pub struct World {
@@ -16,14 +16,17 @@ pub struct World {
 
 impl World {
     pub fn new() -> Self {
-        Self {
+        let world = Self {
             entities: RefCell::new(entity::allocator::Allocator::new()),
             tables: component::registrations()
                 .into_iter()
                 .map(|registration| RefCell::new((registration.new_table)()))
                 .collect(),
             uniques: (0..unique::count()).map(|_| RefCell::new(None)).collect(),
-        }
+        };
+        world.insert_unique(Time::new());
+
+        world
     }
 
     pub fn insert_unique<U: Unique>(&self, unique: U) -> Option<U> {
