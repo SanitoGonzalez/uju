@@ -10,19 +10,66 @@ enum Color: u8 {
     Blue = 5,
 }
 
+// enum derives u32 by default
+// enum can only derive unsigned integers
+enum Numbers {
+    Thousand = 1000,
+    Million = 1000000,
+    Billion = 1000000000,
+}
+
 const FavoriteColor: Color = Color.Red;
 
 struct EmptyStruct {}
 
-struct OneField {
-    field: EmptyStruct
+// struct is a fixed-size type with scalar fields
+struct Optional {
+    opt: i32?, // optional
 }
 
-struct OptionalField {
-    opt: i32?,
+// component is a variable-size type with entity embedded
+component Position {
+    x: f32,
+    y: f32,
 }
 
-struct MultiField {
-    numbers: [i32],
-    colors: [Color],
+struct Velocity {
+    x: f32,
+    y: f32,
+}
+
+message Scalars {
+    uint8: u8,
+    uint16: u16,
+    uint32: u32,
+    uint64: u64,
+    int8: i8,
+    int16: i16,
+    int32: i32,
+    int64: i64,
+    boolean: bool,
+    float32: f32,
+    float64: f64,
+
+    dt: datetime, // 64-bit milliseconds precision, UTC
+    it: interval, // 64-bit milliseconds precision
+}
+
+message NonScalars {
+    v: vec<i32>,
+    s: set<i32>,
+    m: map<i32, i32>,
+
+    // complex
+    v1: vec<Position>,
+    v2: vec<Velocity>,
+    v2d: vec<vec<Position>>,
+    vs: vec<set<i32>>,
+    s1: set<Position>,
+    m1: map<u32, Position>,
+    m2: map<u8, vec<Position>>,
+    m3: map<i8, Position?>,
+
+    str: string,
+    b: bytes,
 }
