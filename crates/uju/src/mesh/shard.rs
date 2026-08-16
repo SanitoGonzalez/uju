@@ -1,3 +1,5 @@
+pub mod message;
+
 use std::cell::{Cell, RefCell};
 use std::net::SocketAddr;
 use std::num::NonZero;
@@ -9,6 +11,7 @@ use tracing::{error, info};
 
 use crate::ecs::world::World;
 use crate::mesh::error::Result;
+use crate::mesh::shard::message::{Frame, Message, ReplicationOp};
 use crate::net::transport::tcp;
 use crate::util::stop::{StopSource, StopToken};
 
@@ -22,15 +25,14 @@ pub fn current() -> Id {
     ID.get()
 }
 
-pub type FrameTx = crossfire::MTx<crossfire::mpsc::Array<Message>>;
-pub type FrameRx = crossfire::AsyncRx<crossfire::mpsc::Array<Message>>;
+pub type FrameTx = crossfire::MTx<crossfire::mpsc::Array<Frame>>;
+pub type FrameRx = crossfire::AsyncRx<crossfire::mpsc::Array<Frame>>;
 pub type ShutdownTx = crossfire::null::CloseHandle<crossfire::mpmc::Null>;
 pub type ShutdownRx = crossfire::MAsyncRx<crossfire::mpmc::Null>;
 
 pub struct Shard {
     id: Id,
-    senders: Vec<FrameTx>,
-    receiver: Option<FrameRx>,
+    tx: Vec<FrameTx>,
     stop: StopSource,
     token: StopToken,
 
@@ -39,11 +41,17 @@ pub struct Shard {
 }
 
 impl Shard {
-    async fn run(self: Rc<Self>, tick_interval: Duration, shutdown: ShutdownRx) -> Result<()> {
+    async fn run(
+        self: Rc<Self>,
+        rx: FrameRx,
+        tick_interval: Duration,
+        shutdown: ShutdownRx,
+    ) -> Result<()> {
         ID.set(self.id);
 
-        self.spawn_tcp_server()?;
-        self.spawn_tick(tick_interval);
+        Self::spawn_recv_loop(self.clone(), rx);
+        Self::spawn_tcp_server(self.clone())?;
+        Self::spawn_tick(self.clone(), tick_interval); // todo: move tick interval into configs
 
         _ = shutdown.recv().await;
         self.stop.request();
@@ -53,9 +61,25 @@ impl Shard {
         Ok(())
     }
 
-    fn spawn_tick(self: &Rc<Self>, tick_interval: Duration) {
-        let shard = self.clone();
-        let token = self.token.clone();
+    fn spawn_recv_loop(shard: Rc<Self>, rx: FrameRx) {
+        let token = shard.token.clone();
+
+        compio::runtime::spawn(async move {
+            loop {
+                select! {
+                    result = rx.recv().fuse() => match result {
+                        Ok(msg) => shard.process(msg).await,
+                        Err(_) => break,
+                    },
+                    _ = token.wait().fuse() => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_tick(shard: Rc<Self>, tick_interval: Duration) {
+        let token = shard.token.clone();
 
         compio::runtime::spawn(async move {
             let mut ticked_at = Instant::now();
@@ -68,19 +92,17 @@ impl Shard {
                         shard.tick((now - ticked_at).as_secs_f32());
                         ticked_at = now;
                     },
-                    _ = token.wait().fuse() => {
-                        break;
-                    }
+                    _ = token.wait().fuse() => break,
                 }
             }
         })
         .detach();
     }
 
-    fn spawn_tcp_server(self: &Rc<Self>) -> Result<()> {
+    fn spawn_tcp_server(shard: Rc<Self>) -> Result<()> {
         let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap(); // todo: accept config
         let listener = tcp::listener::bind(addr)?;
-        let token = self.token.clone();
+        let token = shard.token.clone();
 
         compio::runtime::spawn(async move {
             tcp::listener::accept(listener, token).await;
@@ -92,9 +114,52 @@ impl Shard {
     fn tick(self: &Rc<Self>, _dt: f32) {
         info!("[shard-{}] ticking", self.id);
     }
-}
 
-pub struct Message {}
+    async fn process(self: &Rc<Self>, frame: Frame) {
+        let Frame {
+            node,
+            shard,
+            msg,
+            result_tx,
+        } = frame;
+
+        // todo: extract/refactor
+        match msg {
+            Message::Replication(ops) => {
+                for op in ops {
+                    match op {
+                        ReplicationOp::Upsert {
+                            universal,
+                            components,
+                        } => {
+                            let local = self
+                                .world
+                                .borrow()
+                                .replicas
+                                .borrow()
+                                .local(universal)
+                                .unwrap_or_else(|| {
+                                    // let replica = world.spawn_replica();
+                                    // self.world.borrow().replicas.borrow().link(universal, replica);
+                                    // replica
+                                    todo!()
+                                });
+                            for (id, component) in components {
+                                todo!("apply replication")
+                            }
+                        }
+                        ReplicationOp::Remove { universal } => {
+                            // if let Some(replica) = self.world.borrow().replicas.borrow().unlink(universal) {
+                            //     self.world.despawn(replica);
+                            // }
+                            todo!()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Builder {
@@ -122,8 +187,8 @@ impl Builder {
     pub fn run(
         self,
         id: Id,
-        senders: Vec<FrameTx>,
-        receiver: FrameRx,
+        tx: Vec<FrameTx>,
+        rx: FrameRx,
         shutdown: ShutdownRx,
     ) -> std::io::Result<()> {
         let Self { tick_interval } = self;
@@ -145,15 +210,14 @@ impl Builder {
         let (stop, token) = StopSource::new();
         let shard = Rc::new(Shard {
             id,
-            senders,
-            receiver: Some(receiver),
+            tx,
             stop,
             token,
             world: RefCell::new(World::new()),
         });
 
         runtime.block_on(async move {
-            if let Err(e) = shard.run(tick_interval, shutdown).await {
+            if let Err(e) = shard.run(rx, tick_interval, shutdown).await {
                 error!("[shard-{}] stopped with an error: {:?}", id, e);
             }
         });

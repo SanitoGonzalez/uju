@@ -1,9 +1,9 @@
-use std::ops::{Deref, DerefMut};
+use derive_more::{Deref, DerefMut};
 
 const NULL: u32 = u32::MAX;
 
 pub struct SparseArray<const N: usize> {
-    data: Vec<Option<Box<Page<N>>>>,
+    data: Vec<Slot<N>>,
 }
 
 impl<const N: usize> SparseArray<N> {
@@ -18,7 +18,7 @@ impl<const N: usize> SparseArray<N> {
     }
 
     pub fn get(&self, index: usize) -> Option<usize> {
-        let value = self.data.get(index / N)?.as_deref()?[index % N];
+        let value = self.data.get(index / N)?.page.as_deref()?[index % N];
         if value == NULL {
             None
         } else {
@@ -29,21 +29,40 @@ impl<const N: usize> SparseArray<N> {
     pub fn insert(&mut self, index: usize, value: usize) {
         assert!(value < NULL as usize);
 
-        let page = index / N;
-        if page >= self.data.len() {
-            self.data.resize_with(page + 1, || None);
+        let page_index = index / N;
+        if page_index >= self.data.len() {
+            self.data.resize_with(page_index + 1, Slot::empty);
         }
 
-        self.data[page].get_or_insert_with(|| Box::new(Page::new()))[index % N] = value as u32;
+        let slot = &mut self.data[page_index];
+        let page = slot.page.get_or_insert_with(|| Box::new(Page::new()));
+
+        let entry = &mut page[index % N];
+        if *entry == NULL {
+            slot.len += 1;
+        }
+        *entry = value as u32;
     }
 
     pub fn remove(&mut self, index: usize) -> Option<usize> {
-        let page = self.data.get_mut(index / N)?.as_deref_mut()?;
-        let slot = &mut page[index % N];
-        match std::mem::replace(slot, NULL) {
-            NULL => None,
-            removed => Some(removed as usize),
+        let page_index = index / N;
+        let slot = self.data.get_mut(page_index)?;
+        let page = slot.page.as_deref_mut()?;
+
+        let removed = match std::mem::replace(&mut page[index % N], NULL) {
+            NULL => return None,
+            removed => removed,
+        };
+
+        slot.len -= 1;
+        if slot.len == 0 {
+            slot.page = None;
+            while self.data.last().is_some_and(|slot| slot.page.is_none()) {
+                self.data.pop();
+            }
         }
+
+        Some(removed as usize)
     }
 }
 
@@ -54,6 +73,19 @@ impl<const N: usize> Default for SparseArray<N> {
     }
 }
 
+struct Slot<const N: usize> {
+    page: Option<Box<Page<N>>>,
+    len: u32,
+}
+
+impl<const N: usize> Slot<N> {
+    #[inline]
+    fn empty() -> Self {
+        Self { page: None, len: 0 }
+    }
+}
+
+#[derive(Deref, DerefMut)]
 #[repr(C, align(4096))]
 struct Page<const N: usize>([u32; N]);
 
@@ -61,21 +93,5 @@ impl<const N: usize> Page<N> {
     #[inline]
     fn new() -> Self {
         Self([NULL; N])
-    }
-}
-
-impl<const N: usize> Deref for Page<N> {
-    type Target = [u32; N];
-
-    #[inline]
-    fn deref(&self) -> &<Self as Deref>::Target {
-        &self.0
-    }
-}
-
-impl<const N: usize> DerefMut for Page<N> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
     }
 }

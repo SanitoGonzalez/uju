@@ -178,7 +178,7 @@ impl UniversalEntity {
     }
 
     #[inline]
-    pub fn current(entity: Entity) -> Self {
+    pub fn with_current(entity: Entity) -> Self {
         Self::new(node::current(), shard::current(), entity)
     }
 
