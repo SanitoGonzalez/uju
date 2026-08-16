@@ -9,6 +9,7 @@ use crate::ecs::{
         table::Table,
         view::{View, ViewMut},
     },
+    tx::Tx,
     unique::{self, Unique, time::Time},
 };
 
@@ -102,6 +103,20 @@ impl World {
 
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.entities.borrow().is_alive(entity)
+    }
+
+    /// Runs a system - a closure over [`Tx`] - to completion, immediately,
+    /// and returns its result. Commands buffered on the transaction
+    /// (despawns) are applied after the system returns.
+    ///
+    /// This is the local fast path. Running the same systems under MVCC
+    /// snapshot isolation across shards is future work behind the same
+    /// [`Tx`] API.
+    pub fn run<R>(&self, system: impl FnOnce(&Tx) -> R) -> R {
+        let tx = Tx::new(self);
+        let result = system(&tx);
+        tx.commit();
+        result
     }
 }
 

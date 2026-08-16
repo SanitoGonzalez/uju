@@ -110,6 +110,12 @@ impl_joinable!(J0 j0, J1 j1, J2 j2, J3 j3, J4 j4);
 impl_joinable!(J0 j0, J1 j1, J2 j2, J3 j3, J4 j4, J5 j5);
 impl_joinable!(J0 j0, J1 j1, J2 j2, J3 j3, J4 j4, J5 j5, J6 j6);
 impl_joinable!(J0 j0, J1 j1, J2 j2, J3 j3, J4 j4, J5 j5, J6 j6, J7 j7);
+impl_joinable!(J0 j0, J1 j1, J2 j2, J3 j3, J4 j4, J5 j5, J6 j6, J7 j7, J8 j8);
+impl_joinable!(J0 j0, J1 j1, J2 j2, J3 j3, J4 j4, J5 j5, J6 j6, J7 j7, J8 j8, J9 j9);
+impl_joinable!(J0 j0, J1 j1, J2 j2, J3 j3, J4 j4, J5 j5, J6 j6, J7 j7, J8 j8, J9 j9, J10 j10);
+impl_joinable!(
+    J0 j0, J1 j1, J2 j2, J3 j3, J4 j4, J5 j5, J6 j6, J7 j7, J8 j8, J9 j9, J10 j10, J11 j11
+);
 
 #[cfg(test)]
 mod tests {

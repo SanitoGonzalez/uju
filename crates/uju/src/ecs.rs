@@ -2,6 +2,7 @@ pub mod component;
 pub mod entity;
 pub mod replica;
 pub mod storage;
+pub mod tx;
 pub mod unique;
 pub mod world;
 
