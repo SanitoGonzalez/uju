@@ -5,7 +5,10 @@ use crate::ecs::{
     component::{self, Component},
     entity::{self, Entity},
     replica,
-    storage::{sparse_set::SparseSet, table::Table},
+    storage::{
+        table::Table,
+        view::{View, ViewMut},
+    },
     unique::{self, Unique, time::Time},
 };
 
@@ -68,16 +71,17 @@ impl World {
         self.get_unique_mut().expect("unique not inserted")
     }
 
-    fn sparse_set<C: Component>(&self) -> Ref<'_, SparseSet<C>> {
-        Ref::map(self.tables[C::id() as usize].borrow(), |table| {
+    pub fn view<C: Component>(&self) -> View<'_, C> {
+        View(Ref::map(self.tables[C::id() as usize].borrow(), |table| {
             table.as_any().downcast_ref().unwrap()
-        })
+        }))
     }
 
-    fn sparse_set_mut<C: Component>(&self) -> RefMut<'_, SparseSet<C>> {
-        RefMut::map(self.tables[C::id() as usize].borrow_mut(), |table| {
-            table.as_any_mut().downcast_mut().unwrap()
-        })
+    pub fn view_mut<C: Component>(&self) -> ViewMut<'_, C> {
+        ViewMut(RefMut::map(
+            self.tables[C::id() as usize].borrow_mut(),
+            |table| table.as_any_mut().downcast_mut().unwrap(),
+        ))
     }
 
     pub fn spawn(&self) -> Entity {
@@ -133,11 +137,11 @@ mod tests {
 
         assert_ne!(Alpha::id(), Beta::id());
 
-        world.sparse_set_mut::<Alpha>().insert(entity, Alpha(1));
-        world.sparse_set_mut::<Beta>().insert(entity, Beta(2));
+        world.view_mut::<Alpha>().insert(entity, Alpha(1));
+        world.view_mut::<Beta>().insert(entity, Beta(2));
 
-        assert_eq!(world.sparse_set::<Alpha>().get(entity), Some(&Alpha(1)));
-        assert_eq!(world.sparse_set::<Beta>().get(entity), Some(&Beta(2)));
+        assert_eq!(world.view::<Alpha>().get(entity), Some(&Alpha(1)));
+        assert_eq!(world.view::<Beta>().get(entity), Some(&Beta(2)));
     }
 
     #[test]

@@ -35,9 +35,7 @@ pub struct Shard {
     tx: Vec<FrameTx>,
     stop: StopSource,
     token: StopToken,
-
-    // todo: replace to `UnsafeCell` after stabilization for optimization
-    world: RefCell<World>,
+    world: World,
 }
 
 impl Shard {
@@ -134,7 +132,6 @@ impl Shard {
                         } => {
                             let local = self
                                 .world
-                                .borrow()
                                 .replicas
                                 .borrow()
                                 .local(universal)
@@ -213,7 +210,7 @@ impl Builder {
             tx,
             stop,
             token,
-            world: RefCell::new(World::new()),
+            world: World::new(),
         });
 
         runtime.block_on(async move {

@@ -2,8 +2,11 @@ use std::any::Any;
 
 use crate::ecs::component::Component;
 use crate::ecs::entity::Entity;
-use crate::ecs::storage::sparse_array::SparseArray;
-use crate::ecs::storage::table::Table;
+use crate::ecs::storage::{
+    join::{Entities, Joinable},
+    sparse_array::SparseArray,
+    table::Table,
+};
 
 pub struct SparseSet<T: Component> {
     sparse: SparseArray<1024>,
@@ -106,6 +109,40 @@ impl<T: Component> SparseSet<T> {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut T)> {
         self.dense.iter().copied().zip(self.data.iter_mut())
     }
+
+    /// Dense entity iterator with a caller-chosen lifetime, for join terms
+    /// that cannot express `'a` through their `&self` receiver.
+    ///
+    /// # Safety
+    ///
+    /// The set must be borrowed for the whole `'a`, and `dense` must not be
+    /// mutated while the iterator is alive.
+    #[inline]
+    pub(crate) unsafe fn entities_unbound<'a>(&self) -> Entities<'a> {
+        unsafe { std::slice::from_raw_parts(self.dense.as_ptr(), self.dense.len()) }
+            .iter()
+            .copied()
+    }
+
+    /// Mutable probe with a caller-chosen lifetime, for join terms.
+    ///
+    /// # Safety
+    ///
+    /// The set must be borrowed exclusively for the whole `'a`, and the same
+    /// entity must not be probed twice while a returned borrow is alive -
+    /// that would alias two `&mut` to one component.
+    #[inline]
+    pub(crate) unsafe fn get_mut_unbound<'a>(&mut self, entity: Entity) -> Option<&'a mut T> {
+        let index = self.index_of(entity)?;
+        unsafe { Some(&mut *self.data.as_mut_ptr().add(index)) }
+    }
+}
+
+impl<T: Component> Default for SparseSet<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: Component> Table for SparseSet<T> {
@@ -137,10 +174,43 @@ impl<T: Component> Table for SparseSet<T> {
     }
 }
 
-impl<T: Component> Default for SparseSet<T> {
+unsafe impl<'a, T: Component> Joinable<'a> for &'a SparseSet<T> {
+    type Item = &'a T;
+
     #[inline]
-    fn default() -> Self {
-        Self::new()
+    fn len(&self) -> usize {
+        self.dense.len()
+    }
+
+    #[inline]
+    fn entities(&self) -> Entities<'a> {
+        let set = *self;
+        set.dense.iter().copied()
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        let set = *self;
+        set.get(entity)
+    }
+}
+
+unsafe impl<'a, T: Component> Joinable<'a> for &'a mut SparseSet<T> {
+    type Item = &'a mut T;
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.dense.len()
+    }
+
+    #[inline]
+    fn entities(&self) -> Entities<'a> {
+        unsafe { self.entities_unbound() }
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        unsafe { self.get_mut_unbound(entity) }
     }
 }
 
