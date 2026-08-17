@@ -9,6 +9,7 @@ pub enum Severity {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
     pub severity: Severity,
+    pub file: usize,
     pub message: String,
     pub span: Span,
     pub notes: Vec<String>,
@@ -17,6 +18,7 @@ pub struct Diagnostic {
 #[derive(Debug, Clone, Default)]
 pub struct Diagnostics {
     entries: Vec<Diagnostic>,
+    file: usize,
 }
 
 impl Diagnostics {
@@ -24,9 +26,14 @@ impl Diagnostics {
         Self::default()
     }
 
+    pub fn set_file(&mut self, file: usize) {
+        self.file = file;
+    }
+
     pub fn error(&mut self, span: Span, message: impl Into<String>) {
         self.push(Diagnostic {
             severity: Severity::Error,
+            file: self.file,
             message: message.into(),
             span,
             notes: Vec::new(),
@@ -36,6 +43,7 @@ impl Diagnostics {
     pub fn warning(&mut self, span: Span, message: impl Into<String>) {
         self.push(Diagnostic {
             severity: Severity::Warning,
+            file: self.file,
             message: message.into(),
             span,
             notes: Vec::new(),

@@ -59,12 +59,20 @@ compile time:
 - **Var heap**: payloads of variable-size fields, in field order,
   immediately after the fixed part.
 
-Offsets are relative to the start of the record's encoding. A record
-encoding is self-contained: a record embedded inside another record (as a
-field or container element) is a complete nested encoding whose internal
-offsets are relative to its own start. Since payloads always live at or
-after the fixed part, a payload offset is never 0, and `0` in an offset
-slot means "absent" for optional variable-size fields.
+Every offset is relative to the start of the thing that owns the offset
+table: a record's field slots are relative to the record start, a
+container's offset table is relative to the container start. Each encoding
+is therefore self-contained and composes without threading a base offset
+through nested values. Since payloads always live at or after the fixed
+part, a payload offset is never 0, and `0` in a field slot means "absent"
+for optional variable-size fields.
+
+Payloads are **strictly sequential**: the first present variable-size
+payload starts exactly at the end of the fixed part, and each subsequent
+one starts exactly where the previous ended, in field order. Offsets are
+therefore fully derivable — they exist as an O(1) random-access index, and
+validation rejects any encoding whose offsets deviate. This is what makes
+the format canonical rather than merely well-formed.
 
 Optional semantics:
 
@@ -92,15 +100,21 @@ concatenate back-to-back with no inter-record padding, so a batch is
 Container payloads live in the enclosing record's var heap.
 
 - `vec<T>`, `T` fixed-size: `u16 count` + `count` packed elements.
-- `vec<T>`, `T` variable-size: `u16 count` + `u16 offsets[count]`
-  (relative to the enclosing record's start) + payloads.
+- `vec<T>`, `T` variable-size: `u16 count` + `u16 offsets[count]` +
+  payloads.
 - `set<T>`: same as `vec<T>`, with elements unique and sorted in canonical
   order. Elements must not be containers.
-- `map<K, V>`: `u16 count` + key column + value column. Each column is
-  packed elements (fixed-size) or a `u16` offset table + payloads
-  (variable-size). Keys are unique and sorted in canonical order; the i-th
-  value belongs to the i-th key. Keys must not be containers; values are
-  unrestricted.
+- `map<K, V>`: `u16 count` + `u16 values_start` + key column + value
+  column. Each column is packed elements (fixed-size) or a `u16` offset
+  table + payloads (variable-size). `values_start` locates the value
+  column in O(1) even when keys are variable-size; validation checks it
+  against the canonical position. Keys are unique and sorted in canonical
+  order; the i-th value belongs to the i-th key. Keys must not be
+  containers; values are unrestricted.
+
+Splitting a map into a key column and a value column (rather than
+interleaving pairs) keeps the keys cache-dense for the binary search that
+lookup performs.
 
 An empty container is `count = 0`; it is still present (its offset slot
 points at the count).
@@ -108,12 +122,18 @@ points at the count).
 ### Canonical order
 
 Used for sorting set elements and map keys, and by binary search at read
-time:
+time. The order is **structural**, not a comparison of encoded bytes, so
+it can be evaluated on in-memory values without encoding them first:
 
-- integers, `bool`, enums, `timestamp`, `interval`: ascending numeric.
-- everything else (`string`, `bytes`, floats, `entity`, `uentity`,
-  records): lexicographic over the encoded bytes; a proper prefix sorts
-  first. Deterministic even for NaN.
+- integers, `bool`, enums (by repr), `timestamp`, `interval`: ascending
+  numeric.
+- `f32`/`f64`: IEEE 754 total order (Rust's `total_cmp`), so NaN is
+  ordered deterministically rather than being incomparable.
+- `string`/`bytes`: bytewise lexicographic; a proper prefix sorts first.
+- `entity`/`uentity`: numeric, fieldwise over their components.
+- records: fieldwise in declaration order, each field by its own canonical
+  order. An absent optional field sorts before a present one.
+- containers (as record fields): elementwise, then by length.
 
 ## Reading and writing
 
@@ -127,15 +147,53 @@ on access with unaligned loads. Container views iterate without heap
 allocation; map/set views additionally support O(log n) lookup by binary
 search over the sorted key column.
 
-**Validation**: view accessors do no bounds or well-formedness checks.
-Untrusted bytes (anything that crossed the network) must pass
-`validate(&[u8])` once before views are constructed. Validation checks,
-recursively for nested records: buffer bounds against the fixed part,
-every offset in range (`fixed_size ≤ offset ≤ len`, or 0 where absent
-is allowed), counts consistent with available space, `bool` in {0, 1},
-UTF-8 well-formedness of strings, zero-filled absent optional slots, and
-sortedness/uniqueness of sets and map keys. Trusted intra-process bytes
-may skip validation.
+**Validation**: view accessors do no well-formedness checks — they assume
+canonical input. Untrusted bytes (anything that crossed the network) must
+pass `validate(&[u8])` once before views are constructed. Validation walks
+the value recursively and checks: buffer bounds against the fixed part,
+every offset exactly at its canonical sequential position, counts
+consistent with available space, `bool` in {0, 1}, enum values against
+known variants, UTF-8 well-formedness of strings, zero-filled absent
+optional slots, zero-filled unused bitmap bits, and sortedness/uniqueness
+of sets and map keys. It returns the total consumed length. Trusted
+intra-process bytes may skip validation.
+
+Accessors remain memory-safe on unvalidated input (they are bounds-checked
+slice reads, so a malformed buffer panics rather than reading out of
+bounds), but only validated input is guaranteed to be panic-free.
+
+## Rust representation
+
+The `uju::wire` module provides the runtime that generated Rust links
+against. Schema types map as follows:
+
+| schema        | owned Rust             | zero-copy view      |
+|---------------|------------------------|---------------------|
+| `i32`, `f64`… | `i32`, `f64`…          | same                |
+| `timestamp`   | `uju::wire::Timestamp` | same                |
+| `interval`    | `uju::wire::Interval`  | same                |
+| `entity`      | `uju::wire::Entity`    | same                |
+| `uentity`     | `uju::wire::UEntity`   | same                |
+| `string`      | `String`               | `&'a str`           |
+| `bytes`       | `Vec<u8>`              | `&'a [u8]`          |
+| `vec<T>`      | `Vec<T>`               | `VecView<'a, T>`    |
+| `set<T>`      | `uju::wire::Set<T>`    | `SetView<'a, T>`    |
+| `map<K, V>`   | `uju::wire::Map<K, V>` | `MapView<'a, K, V>` |
+| `enum E`      | `E`                    | same                |
+| record `R`    | `R`                    | `RRef<'a>`          |
+| optional `T?` | `Option<T>`            | `Option<view>`      |
+
+`Set` and `Map` are sorted-vec wrappers, not `BTreeSet`/`BTreeMap`. They
+mirror the wire layout exactly, enforce the canonical order as a
+construction invariant (so `encode` never has to sort and stays
+allocation-free), and avoid requiring `Ord` on user types — which records
+containing `f32` cannot provide.
+
+The core traits are `Wire` (encode side: `FIXED_SIZE`, `encoded_size`,
+`encode`), `View<'a>` (read side: `read`, `validate`, `owned`), and
+`Canonical` (the ordering above). Records also implement the marker traits
+`Component`, `Message` (carrying `MESSAGE_ID`), and `Request` (carrying
+`type Response`) according to their kind.
 
 ## Messages
 

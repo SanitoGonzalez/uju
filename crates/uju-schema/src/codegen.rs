@@ -1,4 +1,3 @@
-pub mod csharp;
 pub mod rust;
 
 use std::path::PathBuf;

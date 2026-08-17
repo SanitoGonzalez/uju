@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, Prim, Spanned, TypeRef};
 use crate::diag::Diagnostics;
-use crate::ir::{RecordKind, TypeId};
+use crate::ir::{Name, RecordKind, TypeId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Symbol {
@@ -15,14 +15,21 @@ pub struct SymbolTable<'a> {
     pub types: Vec<TypeEntry<'a>>,
     pub consts: Vec<ConstEntry<'a>>,
     symbols: HashMap<String, Symbol>,
+    files: Vec<FileInfo>,
     order: Vec<TypeId>,
-    namespace: Option<String>,
+}
+
+#[derive(Debug)]
+struct FileInfo {
+    namespace: Vec<String>,
+    uses: Vec<Vec<String>>,
 }
 
 #[derive(Debug)]
 pub struct TypeEntry<'a> {
-    pub name: String,
-    pub scope: Option<String>,
+    pub name: Name,
+    pub file: usize,
+    pub scope: Vec<String>,
     pub decl: TypeDecl<'a>,
 }
 
@@ -42,16 +49,22 @@ pub struct RecordDecl<'a> {
 
 #[derive(Debug)]
 pub struct ConstEntry<'a> {
-    pub name: String,
-    pub scope: Option<String>,
+    pub name: Name,
+    pub file: usize,
     pub decl: &'a ast::Const,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Context<'s> {
+    pub file: usize,
+    pub scope: &'s [String],
+}
+
 impl TypeEntry<'_> {
-    pub fn field_scope(&self) -> Option<&str> {
-        match &self.decl {
-            TypeDecl::Record(decl) if decl.kind == RecordKind::Message => Some(&self.name),
-            _ => self.scope.as_deref(),
+    pub fn context(&self) -> Context<'_> {
+        Context {
+            file: self.file,
+            scope: &self.scope,
         }
     }
 
@@ -63,29 +76,44 @@ impl TypeEntry<'_> {
     }
 }
 
+impl ConstEntry<'_> {
+    pub fn context(&self) -> Context<'_> {
+        Context {
+            file: self.file,
+            scope: &self.name.scope,
+        }
+    }
+}
+
 impl<'a> SymbolTable<'a> {
-    pub fn lookup(&self, scope: Option<&str>, path: &ast::Path) -> Option<Symbol> {
+    pub fn lookup(&self, cx: Context, path: &ast::Path) -> Option<Symbol> {
         let name = dotted(path);
-        if path.0.len() == 1 {
-            if let Some(scope) = scope {
-                if let Some(symbol) = self.symbols.get(&format!("{scope}.{name}")) {
-                    return Some(*symbol);
-                }
+        let file = &self.files[cx.file];
+
+        for depth in (0..=cx.scope.len()).rev() {
+            let mut candidate = file.namespace.clone();
+            candidate.extend_from_slice(&cx.scope[..depth]);
+            if let Some(symbol) = self.symbols.get(&join(&candidate, &name)) {
+                return Some(*symbol);
             }
         }
         if let Some(symbol) = self.symbols.get(&name) {
             return Some(*symbol);
         }
-        if let Some(ns) = &self.namespace {
-            if let Some(rest) = name.strip_prefix(&format!("{ns}.")) {
-                return self.symbols.get(rest).copied();
+        let mut found = None;
+        for used in &file.uses {
+            if let Some(symbol) = self.symbols.get(&join(used, &name)) {
+                if found.is_some_and(|f| f != *symbol) {
+                    return None;
+                }
+                found = Some(*symbol);
             }
         }
-        None
+        found
     }
 
-    pub fn lookup_type(&self, scope: Option<&str>, path: &ast::Path) -> Option<TypeId> {
-        match self.lookup(scope, path) {
+    pub fn lookup_type(&self, cx: Context, path: &ast::Path) -> Option<TypeId> {
+        match self.lookup(cx, path) {
             Some(Symbol::Type(id)) => Some(id),
             _ => None,
         }
@@ -108,6 +136,14 @@ pub fn dotted(path: &ast::Path) -> String {
         .join(".")
 }
 
+fn join(prefix: &[String], name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}.{name}", prefix.join("."))
+    }
+}
+
 pub fn strip_optional(ty: &Spanned<TypeRef>) -> (&Spanned<TypeRef>, bool) {
     match &ty.node {
         TypeRef::Optional(inner) => (inner, true),
@@ -115,12 +151,14 @@ pub fn strip_optional(ty: &Spanned<TypeRef>) -> (&Spanned<TypeRef>, bool) {
     }
 }
 
-pub fn resolve<'a>(schema: &'a ast::Schema, diags: &mut Diagnostics) -> Option<SymbolTable<'a>> {
-    let mut table = collect(schema, diags);
+pub fn resolve<'a>(files: &'a [ast::Schema], diags: &mut Diagnostics) -> Option<SymbolTable<'a>> {
+    let mut table = collect(files, diags);
+    check_uses(files, &table, diags);
     check_references(&table, diags);
     check_enums(&table, diags);
     check_fields(&table, diags);
     sort_topologically(&mut table, diags);
+    diags.set_file(0);
     if diags.has_errors() {
         None
     } else {
@@ -128,54 +166,74 @@ pub fn resolve<'a>(schema: &'a ast::Schema, diags: &mut Diagnostics) -> Option<S
     }
 }
 
-fn collect<'a>(schema: &'a ast::Schema, diags: &mut Diagnostics) -> SymbolTable<'a> {
+fn collect<'a>(files: &'a [ast::Schema], diags: &mut Diagnostics) -> SymbolTable<'a> {
     let mut table = SymbolTable {
         types: Vec::new(),
         consts: Vec::new(),
         symbols: HashMap::new(),
+        files: Vec::new(),
         order: Vec::new(),
-        namespace: schema.namespace.as_ref().map(dotted),
     };
-    for item in &schema.items {
-        collect_item(&mut table, None, item, diags);
+    for (index, file) in files.iter().enumerate() {
+        let namespace: Vec<String> = file
+            .namespace
+            .as_ref()
+            .map(|p| p.0.iter().map(|i| i.node.clone()).collect())
+            .unwrap_or_default();
+        table.files.push(FileInfo {
+            namespace: namespace.clone(),
+            uses: file
+                .uses
+                .iter()
+                .map(|p| p.0.iter().map(|i| i.node.clone()).collect())
+                .collect(),
+        });
+        diags.set_file(index);
+        for item in &file.items {
+            collect_item(&mut table, index, &namespace, &[], item, diags);
+        }
     }
     table
 }
 
 fn collect_item<'a>(
     table: &mut SymbolTable<'a>,
-    scope: Option<&str>,
+    file: usize,
+    namespace: &[String],
+    scope: &[String],
     item: &'a ast::Item,
     diags: &mut Diagnostics,
 ) {
     match item {
         ast::Item::Const(c) => {
-            if let Some(name) = declare(table, scope, &c.name, false, diags) {
+            if let Some(name) = declare(table, namespace, scope, &c.name, false, diags) {
                 table.consts.push(ConstEntry {
                     name,
-                    scope: scope.map(str::to_string),
+                    file,
                     decl: c,
                 });
             }
         }
         ast::Item::Enum(e) => {
-            if let Some(name) = declare(table, scope, &e.name, true, diags) {
+            if let Some(name) = declare(table, namespace, scope, &e.name, true, diags) {
                 table.types.push(TypeEntry {
                     name,
-                    scope: scope.map(str::to_string),
+                    file,
+                    scope: scope.to_vec(),
                     decl: TypeDecl::Enum(e),
                 });
             }
         }
         ast::Item::Struct(s) => {
-            if let Some(name) = declare(table, scope, &s.name, true, diags) {
+            if let Some(name) = declare(table, namespace, scope, &s.name, true, diags) {
                 let kind = match s.kind {
                     ast::StructKind::Struct => RecordKind::Struct,
                     ast::StructKind::Component => RecordKind::Component,
                 };
                 table.types.push(TypeEntry {
                     name,
-                    scope: scope.map(str::to_string),
+                    file,
+                    scope: scope.to_vec(),
                     decl: TypeDecl::Record(RecordDecl {
                         kind,
                         ident: &s.name,
@@ -186,12 +244,14 @@ fn collect_item<'a>(
             }
         }
         ast::Item::Message(m) => {
-            let Some(name) = declare(table, scope, &m.name, true, diags) else {
+            let Some(name) = declare(table, namespace, scope, &m.name, true, diags) else {
                 return;
             };
+            let inner: Vec<String> = scope.iter().cloned().chain([m.name.node.clone()]).collect();
             table.types.push(TypeEntry {
-                name: name.clone(),
-                scope: scope.map(str::to_string),
+                name,
+                file,
+                scope: inner.clone(),
                 decl: TypeDecl::Record(RecordDecl {
                     kind: RecordKind::Message,
                     ident: &m.name,
@@ -200,7 +260,7 @@ fn collect_item<'a>(
                 }),
             });
             for nested in &m.items {
-                collect_item(table, Some(&name), nested, diags);
+                collect_item(table, file, namespace, &inner, nested, diags);
             }
         }
     }
@@ -208,17 +268,20 @@ fn collect_item<'a>(
 
 fn declare(
     table: &mut SymbolTable,
-    scope: Option<&str>,
+    namespace: &[String],
+    scope: &[String],
     ident: &ast::Ident,
     is_type: bool,
     diags: &mut Diagnostics,
-) -> Option<String> {
-    let name = match scope {
-        Some(scope) => format!("{scope}.{}", ident.node),
-        None => ident.node.clone(),
+) -> Option<Name> {
+    let name = Name {
+        namespace: namespace.to_vec(),
+        scope: scope.to_vec(),
+        name: ident.node.clone(),
     };
-    if table.symbols.contains_key(&name) {
-        diags.error(ident.span, format!("duplicate definition `{name}`"));
+    let qualified = name.qualified();
+    if table.symbols.contains_key(&qualified) {
+        diags.error(ident.span, format!("duplicate definition `{qualified}`"));
         return None;
     }
     let symbol = if is_type {
@@ -226,8 +289,25 @@ fn declare(
     } else {
         Symbol::Const(table.consts.len() as u32)
     };
-    table.symbols.insert(name.clone(), symbol);
+    table.symbols.insert(qualified, symbol);
     Some(name)
+}
+
+fn check_uses(files: &[ast::Schema], table: &SymbolTable, diags: &mut Diagnostics) {
+    let known: HashSet<&[String]> = table
+        .types
+        .iter()
+        .map(|t| t.name.namespace.as_slice())
+        .collect();
+    for (index, file) in files.iter().enumerate() {
+        diags.set_file(index);
+        for used in &file.uses {
+            let path: Vec<String> = used.0.iter().map(|i| i.node.clone()).collect();
+            if !known.contains(path.as_slice()) {
+                diags.error(used.span(), format!("unknown namespace `{}`", dotted(used)));
+            }
+        }
+    }
 }
 
 fn check_references(table: &SymbolTable, diags: &mut Diagnostics) {
@@ -235,12 +315,13 @@ fn check_references(table: &SymbolTable, diags: &mut Diagnostics) {
         let TypeDecl::Record(decl) = &entry.decl else {
             continue;
         };
-        let scope = entry.field_scope();
+        diags.set_file(entry.file);
+        let cx = entry.context();
         for field in decl.fields {
-            check_typeref(&field.ty, scope, table, diags);
+            check_typeref(&field.ty, cx, table, diags);
         }
         if let Some(returns) = decl.returns {
-            match table.lookup(scope, returns) {
+            match table.lookup(cx, returns) {
                 Some(Symbol::Type(id)) => {
                     let is_message = matches!(
                         &table.entry(id).decl,
@@ -261,19 +342,15 @@ fn check_references(table: &SymbolTable, diags: &mut Diagnostics) {
         }
     }
     for entry in &table.consts {
-        check_typeref(&entry.decl.ty, entry.scope.as_deref(), table, diags);
+        diags.set_file(entry.file);
+        check_typeref(&entry.decl.ty, entry.context(), table, diags);
     }
 }
 
-fn check_typeref(
-    ty: &Spanned<TypeRef>,
-    scope: Option<&str>,
-    table: &SymbolTable,
-    diags: &mut Diagnostics,
-) {
+fn check_typeref(ty: &Spanned<TypeRef>, cx: Context, table: &SymbolTable, diags: &mut Diagnostics) {
     match &ty.node {
         TypeRef::Prim(_) => {}
-        TypeRef::Named(path) => match table.lookup(scope, path) {
+        TypeRef::Named(path) => match table.lookup(cx, path) {
             Some(Symbol::Type(_)) => {}
             Some(Symbol::Const(_)) => diags.error(
                 path.span(),
@@ -282,11 +359,11 @@ fn check_typeref(
             None => diags.error(path.span(), format!("unknown type `{}`", dotted(path))),
         },
         TypeRef::Vec(t) | TypeRef::Set(t) | TypeRef::Optional(t) => {
-            check_typeref(t, scope, table, diags)
+            check_typeref(t, cx, table, diags)
         }
         TypeRef::Map(k, v) => {
-            check_typeref(k, scope, table, diags);
-            check_typeref(v, scope, table, diags);
+            check_typeref(k, cx, table, diags);
+            check_typeref(v, cx, table, diags);
         }
     }
 }
@@ -296,6 +373,7 @@ fn check_enums(table: &SymbolTable, diags: &mut Diagnostics) {
         let TypeDecl::Enum(e) = &entry.decl else {
             continue;
         };
+        diags.set_file(entry.file);
         let repr = match &e.repr {
             Some(r) => {
                 if !r.node.is_unsigned() {
@@ -342,6 +420,7 @@ fn check_fields(table: &SymbolTable, diags: &mut Diagnostics) {
         let TypeDecl::Record(decl) = &entry.decl else {
             continue;
         };
+        diags.set_file(entry.file);
         let mut names = HashSet::new();
         for field in decl.fields {
             if !names.insert(field.name.node.as_str()) {
@@ -374,18 +453,22 @@ fn visit(
         2 => return,
         1 => {
             let entry = &table.types[idx];
-            diags.error(entry.span(), format!("recursive type `{}`", entry.name));
+            diags.set_file(entry.file);
+            diags.error(
+                entry.span(),
+                format!("recursive type `{}`", entry.name.qualified()),
+            );
             return;
         }
         _ => {}
     }
     state[idx] = 1;
     if let TypeDecl::Record(decl) = &table.types[idx].decl {
-        let scope = table.types[idx].field_scope();
+        let cx = table.types[idx].context();
         for field in decl.fields {
             let (ty, _) = strip_optional(&field.ty);
             if let TypeRef::Named(path) = &ty.node {
-                if let Some(dep) = table.lookup_type(scope, path) {
+                if let Some(dep) = table.lookup_type(cx, path) {
                     visit(dep.0 as usize, table, state, order, diags);
                 }
             }

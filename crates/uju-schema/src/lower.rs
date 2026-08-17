@@ -2,14 +2,10 @@ use crate::ast::{self, Expr, Prim, Spanned, TypeRef};
 use crate::diag::Diagnostics;
 use crate::ir::{self, ConstValue, RecordKind, Size, Ty};
 use crate::resolve::{
-    ConstEntry, RecordDecl, SymbolTable, TypeDecl, TypeEntry, dotted, strip_optional,
+    ConstEntry, Context, RecordDecl, SymbolTable, TypeDecl, TypeEntry, dotted, strip_optional,
 };
 
-pub fn lower(
-    schema: &ast::Schema,
-    table: &SymbolTable,
-    diags: &mut Diagnostics,
-) -> Option<ir::Schema> {
+pub fn lower(table: &SymbolTable, diags: &mut Diagnostics) -> Option<ir::Schema> {
     let mut message_ids = vec![0u32; table.types.len()];
     let mut next_id = 0;
     for (idx, entry) in table.types.iter().enumerate() {
@@ -25,8 +21,9 @@ pub fn lower(
     for &id in table.topological_order() {
         let idx = id.0 as usize;
         let entry = &table.types[idx];
+        diags.set_file(entry.file);
         types[idx] = match &entry.decl {
-            TypeDecl::Enum(e) => Some(ir::TypeDef::Enum(lower_enum(&entry.name, e))),
+            TypeDecl::Enum(e) => Some(ir::TypeDef::Enum(lower_enum(entry, e))),
             TypeDecl::Record(decl) => {
                 lower_record(entry, decl, message_ids[idx], table, &types, diags)
                     .map(ir::TypeDef::Record)
@@ -36,28 +33,23 @@ pub fn lower(
 
     let mut consts = Vec::new();
     for entry in &table.consts {
+        diags.set_file(entry.file);
         if let Some(def) = lower_const(entry, table, &types, diags) {
             consts.push(def);
         }
     }
 
+    diags.set_file(0);
     if diags.has_errors() {
         return None;
     }
     Some(ir::Schema {
-        namespace: lower_namespace(schema.namespace.as_ref()),
         types: types.into_iter().map(Option::unwrap).collect(),
         consts,
     })
 }
 
-fn lower_namespace(namespace: Option<&ast::Path>) -> Vec<String> {
-    namespace
-        .map(|p| p.0.iter().map(|i| i.node.clone()).collect())
-        .unwrap_or_default()
-}
-
-fn lower_enum(name: &str, def: &ast::Enum) -> ir::EnumDef {
+fn lower_enum(entry: &TypeEntry, def: &ast::Enum) -> ir::EnumDef {
     let repr = def.repr.as_ref().map(|r| r.node).unwrap_or(Prim::U32);
     let mut variants = Vec::with_capacity(def.variants.len());
     let mut next = 0u64;
@@ -74,7 +66,7 @@ fn lower_enum(name: &str, def: &ast::Enum) -> ir::EnumDef {
         next = value.saturating_add(1);
     }
     ir::EnumDef {
-        name: name.to_string(),
+        name: entry.name.clone(),
         repr,
         variants,
     }
@@ -88,11 +80,11 @@ fn lower_record(
     types: &[Option<ir::TypeDef>],
     diags: &mut Diagnostics,
 ) -> Option<ir::RecordDef> {
-    let scope = entry.field_scope();
+    let cx = entry.context();
     let mut fields = Vec::with_capacity(decl.fields.len());
     for field in decl.fields {
         let (ty_ast, optional) = strip_optional(&field.ty);
-        let ty = lower_type(ty_ast, scope, table, diags)?;
+        let ty = lower_type(ty_ast, cx, table, diags)?;
         fields.push((field, ty, optional));
     }
 
@@ -102,7 +94,7 @@ fn lower_record(
         .zip(&sizes)
         .filter(|((_, _, optional), size)| *optional && matches!(size, Size::Fixed(_)))
         .count() as u32;
-    let bitmap_bytes = (optional_fixed + 7) / 8;
+    let bitmap_bytes = optional_fixed.div_ceil(8);
 
     let mut cursor = bitmap_bytes;
     let mut next_bit = 0u32;
@@ -136,14 +128,17 @@ fn lower_record(
     if decl.kind == RecordKind::Struct && variable {
         diags.error(
             decl.ident.span,
-            format!("struct `{}` must be fixed-size", entry.name),
+            format!("struct `{}` must be fixed-size", entry.name.qualified()),
         );
         return None;
     }
     if cursor > u16::MAX as u32 {
         diags.error(
             decl.ident.span,
-            format!("fixed part of `{}` exceeds 65535 bytes", entry.name),
+            format!(
+                "fixed part of `{}` exceeds 65535 bytes",
+                entry.name.qualified()
+            ),
         );
         return None;
     }
@@ -155,7 +150,7 @@ fn lower_record(
     };
     let message = (decl.kind == RecordKind::Message).then(|| ir::MessageInfo {
         id: message_id,
-        returns: decl.returns.and_then(|path| table.lookup_type(scope, path)),
+        returns: decl.returns.and_then(|path| table.lookup_type(cx, path)),
     });
     Some(ir::RecordDef {
         name: entry.name.clone(),
@@ -183,16 +178,16 @@ fn size_of(ty: &Ty, types: &[Option<ir::TypeDef>]) -> Size {
 
 fn lower_type(
     ty: &Spanned<TypeRef>,
-    scope: Option<&str>,
+    cx: Context,
     table: &SymbolTable,
     diags: &mut Diagnostics,
 ) -> Option<Ty> {
     match &ty.node {
         TypeRef::Prim(p) => Some(Ty::Prim(*p)),
-        TypeRef::Named(path) => table.lookup_type(scope, path).map(Ty::Ref),
-        TypeRef::Vec(t) => Some(Ty::Vec(Box::new(lower_type(t, scope, table, diags)?))),
+        TypeRef::Named(path) => table.lookup_type(cx, path).map(Ty::Ref),
+        TypeRef::Vec(t) => Some(Ty::Vec(Box::new(lower_type(t, cx, table, diags)?))),
         TypeRef::Set(t) => {
-            let element = lower_type(t, scope, table, diags)?;
+            let element = lower_type(t, cx, table, diags)?;
             if element.is_container() {
                 diags.error(t.span, "set elements cannot be containers");
                 return None;
@@ -200,12 +195,12 @@ fn lower_type(
             Some(Ty::Set(Box::new(element)))
         }
         TypeRef::Map(k, v) => {
-            let key = lower_type(k, scope, table, diags)?;
+            let key = lower_type(k, cx, table, diags)?;
             if key.is_container() {
                 diags.error(k.span, "map keys cannot be containers");
                 return None;
             }
-            let value = lower_type(v, scope, table, diags)?;
+            let value = lower_type(v, cx, table, diags)?;
             Some(Ty::Map(Box::new(key), Box::new(value)))
         }
         TypeRef::Optional(_) => {
@@ -221,10 +216,10 @@ fn lower_const(
     types: &[Option<ir::TypeDef>],
     diags: &mut Diagnostics,
 ) -> Option<ir::ConstDef> {
-    let scope = entry.scope.as_deref();
+    let cx = entry.context();
     let decl = entry.decl;
-    let ty = lower_type(&decl.ty, scope, table, diags)?;
-    let value = lower_expr(&decl.value, &ty, decl.ty.span, scope, table, types, diags)?;
+    let ty = lower_type(&decl.ty, cx, table, diags)?;
+    let value = lower_expr(&decl.value, &ty, decl.ty.span, cx, table, types, diags)?;
     Some(ir::ConstDef {
         name: entry.name.clone(),
         ty,
@@ -236,7 +231,7 @@ fn lower_expr(
     expr: &Spanned<Expr>,
     ty: &Ty,
     ty_span: ast::Span,
-    scope: Option<&str>,
+    cx: Context,
     table: &SymbolTable,
     types: &[Option<ir::TypeDef>],
     diags: &mut Diagnostics,
@@ -284,10 +279,14 @@ fn lower_expr(
                 return mismatch(diags);
             }
             let enum_path = ast::Path(prefix.to_vec());
-            if table.lookup_type(scope, &enum_path) != Some(*id) {
+            if table.lookup_type(cx, &enum_path) != Some(*id) {
                 diags.error(
                     expr.span,
-                    format!("`{}` is not a variant of `{}`", dotted(path), def.name),
+                    format!(
+                        "`{}` is not a variant of `{}`",
+                        dotted(path),
+                        def.name.qualified()
+                    ),
                 );
                 return None;
             }
@@ -299,7 +298,11 @@ fn lower_expr(
                 None => {
                     diags.error(
                         variant.span,
-                        format!("no variant `{}` in `{}`", variant.node, def.name),
+                        format!(
+                            "no variant `{}` in `{}`",
+                            variant.node,
+                            def.name.qualified()
+                        ),
                     );
                     None
                 }

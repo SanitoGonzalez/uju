@@ -1,3 +1,5 @@
+use core::fmt::Write as _;
+
 pub use crate::ast::Prim;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -9,9 +11,27 @@ pub enum Size {
     Variable,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Name {
+    pub namespace: Vec<String>,
+    pub scope: Vec<String>,
+    pub name: String,
+}
+
+impl Name {
+    pub fn qualified(&self) -> String {
+        let mut out = String::new();
+        for part in self.namespace.iter().chain(&self.scope) {
+            out.push_str(part);
+            out.push('.');
+        }
+        out.push_str(&self.name);
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
-    pub namespace: Vec<String>,
     pub types: Vec<TypeDef>,
     pub consts: Vec<ConstDef>,
 }
@@ -31,7 +51,7 @@ pub enum RecordKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordDef {
-    pub name: String,
+    pub name: Name,
     pub kind: RecordKind,
     pub fields: Vec<FieldDef>,
     pub layout: Layout,
@@ -62,7 +82,7 @@ pub struct FieldDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumDef {
-    pub name: String,
+    pub name: Name,
     pub repr: Prim,
     pub variants: Vec<VariantDef>,
 }
@@ -75,7 +95,7 @@ pub struct VariantDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConstDef {
-    pub name: String,
+    pub name: Name,
     pub ty: Ty,
     pub value: ConstValue,
 }
@@ -103,16 +123,87 @@ impl Schema {
         &self.types[id.0 as usize]
     }
 
-    pub fn type_id(&self, name: &str) -> Option<TypeId> {
+    pub fn record(&self, id: TypeId) -> Option<&RecordDef> {
+        match self.type_def(id) {
+            TypeDef::Record(def) => Some(def),
+            TypeDef::Enum(_) => None,
+        }
+    }
+
+    pub fn type_id(&self, qualified: &str) -> Option<TypeId> {
         self.types
             .iter()
-            .position(|t| t.name() == name)
+            .position(|t| t.name().qualified() == qualified)
             .map(|i| TypeId(i as u32))
+    }
+
+    pub fn namespaces(&self) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for namespace in self
+            .types
+            .iter()
+            .map(|t| &t.name().namespace)
+            .chain(self.consts.iter().map(|c| &c.name.namespace))
+        {
+            if !out.contains(namespace) {
+                out.push(namespace.clone());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    pub fn hash(&self) -> u64 {
+        let mut text = String::new();
+        for def in &self.types {
+            match def {
+                TypeDef::Enum(def) => {
+                    let _ = write!(text, "enum {}:{};", def.name.qualified(), def.repr.name());
+                    for variant in &def.variants {
+                        let _ = write!(text, "{}={};", variant.name, variant.value);
+                    }
+                }
+                TypeDef::Record(def) => {
+                    let _ = write!(
+                        text,
+                        "record {}:{:?}:{}:{};",
+                        def.name.qualified(),
+                        def.kind,
+                        def.layout.bitmap_bytes,
+                        def.layout.fixed_size
+                    );
+                    if let Some(info) = def.message {
+                        let _ = write!(text, "id={};", info.id);
+                    }
+                    for field in &def.fields {
+                        let _ = write!(
+                            text,
+                            "{}@{}{}:{};",
+                            field.name,
+                            field.offset,
+                            if field.optional { "?" } else { "" },
+                            self.ty_text(&field.ty)
+                        );
+                    }
+                }
+            }
+        }
+        fnv1a(text.as_bytes())
+    }
+
+    fn ty_text(&self, ty: &Ty) -> String {
+        match ty {
+            Ty::Prim(p) => p.name().to_string(),
+            Ty::Ref(id) => self.type_def(*id).name().qualified(),
+            Ty::Vec(t) => format!("vec<{}>", self.ty_text(t)),
+            Ty::Set(t) => format!("set<{}>", self.ty_text(t)),
+            Ty::Map(k, v) => format!("map<{},{}>", self.ty_text(k), self.ty_text(v)),
+        }
     }
 }
 
 impl TypeDef {
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &Name {
         match self {
             TypeDef::Record(def) => &def.name,
             TypeDef::Enum(def) => &def.name,
@@ -139,4 +230,13 @@ impl Ty {
     pub fn is_container(&self) -> bool {
         matches!(self, Ty::Vec(_) | Ty::Set(_) | Ty::Map(_, _))
     }
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
 }
