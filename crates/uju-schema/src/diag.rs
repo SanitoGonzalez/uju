@@ -21,30 +21,40 @@ pub struct Diagnostics {
 
 impl Diagnostics {
     pub fn new() -> Self {
-        todo!()
+        Self::default()
     }
 
     pub fn error(&mut self, span: Span, message: impl Into<String>) {
-        todo!()
+        self.push(Diagnostic {
+            severity: Severity::Error,
+            message: message.into(),
+            span,
+            notes: Vec::new(),
+        });
     }
 
     pub fn warning(&mut self, span: Span, message: impl Into<String>) {
-        todo!()
+        self.push(Diagnostic {
+            severity: Severity::Warning,
+            message: message.into(),
+            span,
+            notes: Vec::new(),
+        });
     }
 
     pub fn push(&mut self, diagnostic: Diagnostic) {
-        todo!()
+        self.entries.push(diagnostic);
     }
 
     pub fn has_errors(&self) -> bool {
-        todo!()
+        self.entries.iter().any(|d| d.severity == Severity::Error)
     }
 
     pub fn entries(&self) -> &[Diagnostic] {
-        todo!()
+        &self.entries
     }
 
     pub fn into_vec(self) -> Vec<Diagnostic> {
-        todo!()
+        self.entries
     }
 }

@@ -1,3 +1,5 @@
+use core::fmt;
+
 use logos::Logos;
 
 use crate::ast::Prim;
@@ -11,6 +13,9 @@ pub enum Token<'src> {
     #[token("namespace")]
     Namespace,
 
+    #[token("use")]
+    Use,
+
     #[token("const")]
     Const,
 
@@ -19,6 +24,21 @@ pub enum Token<'src> {
 
     #[token("struct")]
     Struct,
+
+    #[token("component")]
+    Component,
+
+    #[token("message")]
+    Message,
+
+    #[token("vec")]
+    Vec,
+
+    #[token("set")]
+    Set,
+
+    #[token("map")]
+    Map,
 
     #[token("i8", |_| Prim::I8)]
     #[token("i16", |_| Prim::I16)]
@@ -31,7 +51,12 @@ pub enum Token<'src> {
     #[token("f32", |_| Prim::F32)]
     #[token("f64", |_| Prim::F64)]
     #[token("bool", |_| Prim::Bool)]
+    #[token("timestamp", |_| Prim::Timestamp)]
+    #[token("interval", |_| Prim::Interval)]
+    #[token("entity", |_| Prim::Entity)]
+    #[token("uentity", |_| Prim::UEntity)]
     #[token("string", |_| Prim::String)]
+    #[token("bytes", |_| Prim::Bytes)]
     Prim(Prim),
 
     #[token("{")]
@@ -40,11 +65,11 @@ pub enum Token<'src> {
     #[token("}")]
     BraceClose,
 
-    #[token("[")]
-    BracketOpen,
+    #[token("<")]
+    Lt,
 
-    #[token("]")]
-    BracketClose,
+    #[token(">")]
+    Gt,
 
     #[token(":")]
     Colon,
@@ -64,6 +89,9 @@ pub enum Token<'src> {
     #[token("?")]
     Question,
 
+    #[token("->")]
+    Arrow,
+
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice())]
     Ident(&'src str),
 
@@ -81,6 +109,52 @@ pub enum Token<'src> {
     Str(&'src str),
 }
 
+impl fmt::Display for Token<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Token::Namespace => f.write_str("namespace"),
+            Token::Use => f.write_str("use"),
+            Token::Const => f.write_str("const"),
+            Token::Enum => f.write_str("enum"),
+            Token::Struct => f.write_str("struct"),
+            Token::Component => f.write_str("component"),
+            Token::Message => f.write_str("message"),
+            Token::Vec => f.write_str("vec"),
+            Token::Set => f.write_str("set"),
+            Token::Map => f.write_str("map"),
+            Token::Prim(p) => f.write_str(p.name()),
+            Token::BraceOpen => f.write_str("{"),
+            Token::BraceClose => f.write_str("}"),
+            Token::Lt => f.write_str("<"),
+            Token::Gt => f.write_str(">"),
+            Token::Colon => f.write_str(":"),
+            Token::Semicolon => f.write_str(";"),
+            Token::Comma => f.write_str(","),
+            Token::Dot => f.write_str("."),
+            Token::Equal => f.write_str("="),
+            Token::Question => f.write_str("?"),
+            Token::Arrow => f.write_str("->"),
+            Token::Ident(s) => f.write_str(s),
+            Token::Bool(b) => write!(f, "{b}"),
+            Token::Int(x) => write!(f, "{x}"),
+            Token::Float(x) => write!(f, "{x}"),
+            Token::Str(s) => f.write_str(s),
+        }
+    }
+}
+
 pub fn lex(src: &str) -> Result<Vec<(Token<'_>, Span)>, Vec<Span>> {
-    todo!()
+    let mut tokens = Vec::new();
+    let mut errors = Vec::new();
+    for (result, span) in Token::lexer(src).spanned() {
+        match result {
+            Ok(token) => tokens.push((token, span)),
+            Err(()) => errors.push(span),
+        }
+    }
+    if errors.is_empty() {
+        Ok(tokens)
+    } else {
+        Err(errors)
+    }
 }

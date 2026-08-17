@@ -25,7 +25,7 @@ fn escape_keyword(name: &str) -> String {
     todo!()
 }
 
-fn struct_def(schema: &ir::Schema, def: &ir::StructDef) -> String {
+fn struct_def(schema: &ir::Schema, def: &ir::RecordDef) -> String {
     todo!()
 }
 
@@ -37,11 +37,11 @@ fn const_def(schema: &ir::Schema, def: &ir::ConstDef) -> String {
     todo!()
 }
 
-fn encode_method(schema: &ir::Schema, def: &ir::StructDef) -> String {
+fn encode_method(schema: &ir::Schema, def: &ir::RecordDef) -> String {
     todo!()
 }
 
-fn decode_method(schema: &ir::Schema, def: &ir::StructDef) -> String {
+fn decode_method(schema: &ir::Schema, def: &ir::RecordDef) -> String {
     todo!()
 }
 

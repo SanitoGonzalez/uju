@@ -27,7 +27,7 @@ struct Optional {
     opt: i32?, // optional
 }
 
-// component is a variable-size type with entity embedded
+// component is a variable-size type
 component Position {
     x: f32,
     y: f32,
@@ -51,8 +51,11 @@ message Scalars {
     float32: f32,
     float64: f64,
 
-    dt: datetime, // 64-bit milliseconds precision, UTC
-    it: interval, // 64-bit milliseconds precision
+    ts: timestamp, // 64-bit microseconds resolution, UTC
+    it: interval, // 64-bit microseconds resolution
+
+    et: entity, // 64-bit local entity (index, generation)
+    uet: uentity, // 96-bit universal entity (node ID, shard ID, index, generation)
 }
 
 message NonScalars {
@@ -68,8 +71,21 @@ message NonScalars {
     s1: set<Position>,
     m1: map<u32, Position>,
     m2: map<u8, vec<Position>>,
-    m3: map<i8, Position?>,
 
     str: string,
     b: bytes,
+}
+
+// message with a return type
+message MyRequest -> MyResponse {
+    foo: i32,
+}
+
+message MyResponse {
+    enum Result {
+        Ok,
+        Error,
+    }
+
+    result: Result,
 }

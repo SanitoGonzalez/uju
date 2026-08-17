@@ -1,0 +1,8 @@
+namespace hello;
+
+use foo.bar;
+
+message ExternalTypes {
+    velocity: Velocity,
+    position: foo.bar.Position, // explicit type import
+}

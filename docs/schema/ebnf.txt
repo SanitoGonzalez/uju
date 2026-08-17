@@ -1,0 +1,57 @@
+(* uju schema grammar *)
+
+schema     = [ namespace ] , { use } , { item } ;
+
+namespace  = "namespace" , path , ";" ;
+use        = "use" , path , ";" ;
+
+item       = const | enum | record | message ;
+
+const      = "const" , ident , ":" , type , "=" , expr , ";" ;
+
+enum       = "enum" , ident , [ ":" , prim ] ,
+             "{" , { variant , "," } , "}" ;
+variant    = ident , [ "=" , int ] ;
+
+record     = ( "struct" | "component" ) , ident , fields ;
+fields     = "{" , { field , "," } , "}" ;
+field      = ident , ":" , type , [ "?" ] ;
+
+message    = "message" , ident , [ "->" , path ] ,
+             "{" , { entry } , "}" ;
+entry      = const | enum | record | ( field , "," ) ;
+
+type       = prim | container | path ;
+container  = "vec" , "<" , type , ">"
+           | "set" , "<" , type , ">"
+           | "map" , "<" , type , "," , type , ">" ;
+prim       = "i8" | "i16" | "i32" | "i64"
+           | "u8" | "u16" | "u32" | "u64"
+           | "f32" | "f64" | "bool"
+           | "timestamp" | "interval"
+           | "entity" | "uentity"
+           | "string" | "bytes" ;
+
+expr       = int | float | bool | str | path ;
+path       = ident , { "." , ident } ;
+
+ident      = ( letter | "_" ) , { letter | digit | "_" } ;
+int        = [ "-" ] , digit , { digit } ;
+float      = [ "-" ] , digit , { digit } , "." , digit , { digit } ;
+bool       = "true" | "false" ;
+str        = '"' , { character } , '"' ;
+
+(* notes
+   - "//" starts a line comment; comments and whitespace are ignored.
+   - "?" (optional) is allowed only as a field suffix, not inside
+     containers.
+   - a comma is a terminator: every field and enum variant ends with
+     one, including the last.
+   - an enum without a repr defaults to u32; reprs must be unsigned
+     integers.
+   - messages may nest const/enum/struct declarations; nested names
+     are referenced unqualified within the message and as
+     "Message.Name" outside.
+   - "message A -> B" declares B as the response type of A; B must be
+     a message.
+*)
