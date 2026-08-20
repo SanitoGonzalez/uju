@@ -13,6 +13,7 @@ default = ["3d"]
 uju-macros-ecs = { path = "macros/ecs" }
 
 bytes.workspace = true
+chrono.workspace = true
 compio.workspace = true
 crossfire.workspace = true
 derive_more.workspace = true

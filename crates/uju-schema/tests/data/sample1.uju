@@ -22,13 +22,7 @@ const FavoriteColor: Color = Color.Red;
 
 struct EmptyStruct {}
 
-// struct is a fixed-size type with scalar fields
-struct Optional {
-    opt: i32?, // optional
-}
-
-// component is a variable-size type
-component Position {
+struct Position {
     x: f32,
     y: f32,
 }
@@ -56,21 +50,28 @@ message Scalars {
 
     et: entity, // 64-bit local entity (index, generation)
     uet: uentity, // 96-bit universal entity (node ID, shard ID, index, generation)
+
+    id: uuid,
 }
 
 message NonScalars {
     v: vec<i32>,
     s: set<i32>,
     m: map<i32, i32>,
+    ar: array<i32, 4>,
 
     // complex
     v1: vec<Position>,
     v2: vec<Velocity>,
     v2d: vec<vec<Position>>,
     vs: vec<set<i32>>,
+    vo: vec<i32>?,
     s1: set<Position>,
     m1: map<u32, Position>,
     m2: map<u8, vec<Position>>,
+
+    // invalid - item types cannot be optional
+    // vec<i32?>,
 
     str: string,
     b: bytes,
@@ -88,4 +89,12 @@ message MyResponse {
     }
 
     result: Result,
+}
+
+union SomeUnion {
+    v: vec<i32>,
+    s: string,
+    vel: Velocity,
+
+    // note: message cannot be union
 }

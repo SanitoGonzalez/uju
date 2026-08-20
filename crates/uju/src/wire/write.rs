@@ -56,6 +56,17 @@ impl<'a> Writer<'a> {
     }
 
     #[inline]
+    pub fn long(&mut self, value: u128) -> i64 {
+        match i64::try_from(value) {
+            Ok(v) => v,
+            Err(_) => {
+                self.overflow = true;
+                0
+            }
+        }
+    }
+
+    #[inline]
     pub fn push_bytes(&mut self, bytes: &[u8]) {
         let at = self.pos;
         self.pos += bytes.len();

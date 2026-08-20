@@ -6,9 +6,12 @@ pub mod traits;
 pub mod view;
 pub mod write;
 
+#[cfg(test)]
+mod tests;
+
 pub use collections::{Map, Set};
 pub use error::{Error, Result, need};
-pub use prim::{Entity, Interval, Timestamp, UEntity};
+pub use prim::{Entity, Interval, Timestamp, UniversalEntity};
 pub use read::*;
 pub use traits::{
     Canonical, Component, Message, Request, View, Wire, encode, encode_into, validate, view,

@@ -1,29 +1,16 @@
 use core::cmp::Ordering;
 
+use chrono::{DateTime, Utc};
+
+pub use crate::ecs::entity::{Entity, UniversalEntity};
+use crate::ecs::entity::{EntityGeneration, EntityIndex};
 use crate::wire::error::{Error, Result, need};
 use crate::wire::read::*;
 use crate::wire::traits::{Canonical, View, Wire};
 use crate::wire::write::Writer;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Timestamp(pub i64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Interval(pub i64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Entity {
-    pub index: u32,
-    pub generation: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct UEntity {
-    pub node: u16,
-    pub shard: u16,
-    pub index: u32,
-    pub generation: u32,
-}
+pub type Timestamp = DateTime<Utc>;
+pub type Interval = core::time::Duration;
 
 macro_rules! scalar {
     ($ty:ty, $n:literal, $read:ident, $push:ident) => {
@@ -136,49 +123,86 @@ impl Canonical for bool {
     }
 }
 
-macro_rules! newtype_i64 {
-    ($ty:ty) => {
-        impl Wire for $ty {
-            const FIXED_SIZE: Option<usize> = Some(8);
+impl Wire for Timestamp {
+    const FIXED_SIZE: Option<usize> = Some(8);
 
-            fn encoded_size(&self) -> usize {
-                8
-            }
+    fn encoded_size(&self) -> usize {
+        8
+    }
 
-            fn encode(&self, w: &mut Writer) {
-                w.push_i64(self.0);
-            }
-        }
-
-        impl<'a> View<'a> for $ty {
-            type Owned = Self;
-
-            const FIXED_SIZE: Option<usize> = Some(8);
-
-            fn read(bytes: &'a [u8]) -> Self {
-                Self(read_i64(bytes, 0))
-            }
-
-            fn owned(self) -> Self {
-                self
-            }
-
-            fn validate(bytes: &'a [u8]) -> Result<usize> {
-                need(bytes, 8)?;
-                Ok(8)
-            }
-        }
-
-        impl Canonical for $ty {
-            fn canonical_cmp(&self, other: &Self) -> Ordering {
-                self.cmp(other)
-            }
-        }
-    };
+    fn encode(&self, w: &mut Writer) {
+        w.push_i64(self.timestamp_micros());
+    }
 }
 
-newtype_i64!(Timestamp);
-newtype_i64!(Interval);
+impl<'a> View<'a> for Timestamp {
+    type Owned = Self;
+
+    const FIXED_SIZE: Option<usize> = Some(8);
+
+    fn read(bytes: &'a [u8]) -> Self {
+        DateTime::from_timestamp_micros(read_i64(bytes, 0)).unwrap_or_default()
+    }
+
+    fn owned(self) -> Self {
+        self
+    }
+
+    fn validate(bytes: &'a [u8]) -> Result<usize> {
+        need(bytes, 8)?;
+        match DateTime::<Utc>::from_timestamp_micros(read_i64(bytes, 0)) {
+            Some(_) => Ok(8),
+            None => Err(Error::BadTimestamp),
+        }
+    }
+}
+
+impl Canonical for Timestamp {
+    fn canonical_cmp(&self, other: &Self) -> Ordering {
+        self.cmp(other)
+    }
+}
+
+impl Wire for Interval {
+    const FIXED_SIZE: Option<usize> = Some(8);
+
+    fn encoded_size(&self) -> usize {
+        8
+    }
+
+    fn encode(&self, w: &mut Writer) {
+        let micros = w.long(self.as_micros());
+        w.push_i64(micros);
+    }
+}
+
+impl<'a> View<'a> for Interval {
+    type Owned = Self;
+
+    const FIXED_SIZE: Option<usize> = Some(8);
+
+    fn read(bytes: &'a [u8]) -> Self {
+        Self::from_micros(read_i64(bytes, 0).max(0) as u64)
+    }
+
+    fn owned(self) -> Self {
+        self
+    }
+
+    fn validate(bytes: &'a [u8]) -> Result<usize> {
+        need(bytes, 8)?;
+        if read_i64(bytes, 0) < 0 {
+            return Err(Error::BadInterval);
+        }
+        Ok(8)
+    }
+}
+
+impl Canonical for Interval {
+    fn canonical_cmp(&self, other: &Self) -> Ordering {
+        self.cmp(other)
+    }
+}
 
 impl Wire for Entity {
     const FIXED_SIZE: Option<usize> = Some(8);
@@ -188,8 +212,8 @@ impl Wire for Entity {
     }
 
     fn encode(&self, w: &mut Writer) {
-        w.push_u32(self.index);
-        w.push_u32(self.generation);
+        w.push_u32(self.index().to_bits());
+        w.push_u32(self.generation().to_bits());
     }
 }
 
@@ -203,66 +227,73 @@ impl<'a> View<'a> for Entity {
     }
 
     fn read(bytes: &'a [u8]) -> Self {
-        Self {
-            index: read_u32(bytes, 0),
-            generation: read_u32(bytes, 4),
-        }
+        Self::new(
+            EntityIndex::from_bits(read_u32(bytes, 0)),
+            EntityGeneration::from_bits(read_u32(bytes, 4)),
+        )
     }
 
     fn validate(bytes: &'a [u8]) -> Result<usize> {
         need(bytes, 8)?;
+        if read_u32(bytes, 0) == EntityIndex::NULL.to_bits() {
+            return Err(Error::BadEntity);
+        }
         Ok(8)
     }
 }
 
 impl Canonical for Entity {
     fn canonical_cmp(&self, other: &Self) -> Ordering {
-        self.cmp(other)
+        self.index()
+            .cmp(&other.index())
+            .then_with(|| self.generation().cmp(&other.generation()))
     }
 }
 
-impl Wire for UEntity {
-    const FIXED_SIZE: Option<usize> = Some(12);
+impl Wire for UniversalEntity {
+    const FIXED_SIZE: Option<usize> = Some(Self::BYTES);
 
     fn encoded_size(&self) -> usize {
-        12
+        Self::BYTES
     }
 
     fn encode(&self, w: &mut Writer) {
-        w.push_u16(self.node);
-        w.push_u16(self.shard);
-        w.push_u32(self.index);
-        w.push_u32(self.generation);
+        w.push_u16(self.node());
+        w.push_u16(self.shard());
+        self.entity().encode(w);
     }
 }
 
-impl<'a> View<'a> for UEntity {
+impl<'a> View<'a> for UniversalEntity {
     type Owned = Self;
 
-    const FIXED_SIZE: Option<usize> = Some(12);
+    const FIXED_SIZE: Option<usize> = Some(Self::BYTES);
 
     fn owned(self) -> Self {
         self
     }
 
     fn read(bytes: &'a [u8]) -> Self {
-        Self {
-            node: read_u16(bytes, 0),
-            shard: read_u16(bytes, 2),
-            index: read_u32(bytes, 4),
-            generation: read_u32(bytes, 8),
-        }
+        Self::new(
+            read_u16(bytes, 0),
+            read_u16(bytes, 2),
+            Entity::read(&bytes[4..]),
+        )
     }
 
     fn validate(bytes: &'a [u8]) -> Result<usize> {
-        need(bytes, 12)?;
-        Ok(12)
+        need(bytes, Self::BYTES)?;
+        Entity::validate(&bytes[4..])?;
+        Ok(Self::BYTES)
     }
 }
 
-impl Canonical for UEntity {
+impl Canonical for UniversalEntity {
     fn canonical_cmp(&self, other: &Self) -> Ordering {
-        self.cmp(other)
+        self.node()
+            .cmp(&other.node())
+            .then_with(|| self.shard().cmp(&other.shard()))
+            .then_with(|| self.entity().canonical_cmp(&other.entity()))
     }
 }
 
@@ -369,6 +400,17 @@ impl<T: Wire + Canonical> Wire for Vec<T> {
                 w.put_u16(table + i * 2, offset);
                 element.encode(w);
             }
+        }
+    }
+}
+
+impl<T: Canonical> Canonical for Option<T> {
+    fn canonical_cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(a), Some(b)) => a.canonical_cmp(b),
         }
     }
 }

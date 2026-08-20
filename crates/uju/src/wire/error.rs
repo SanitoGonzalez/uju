@@ -4,12 +4,18 @@ use thiserror::Error;
 pub enum Error {
     #[error("buffer truncated")]
     Truncated,
-    #[error("value exceeds the 16-bit size limit")]
+    #[error("value exceeds its encodable range")]
     TooLarge,
     #[error("bool is neither 0 nor 1")]
     BadBool,
     #[error("no such enum variant")]
     BadEnum,
+    #[error("timestamp is out of range")]
+    BadTimestamp,
+    #[error("interval is negative")]
+    BadInterval,
+    #[error("entity index is null")]
+    BadEntity,
     #[error("string is not valid UTF-8")]
     BadUtf8,
     #[error("offset is not canonical")]
