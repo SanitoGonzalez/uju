@@ -1,4 +1,4 @@
-// pub mod backend;
+pub mod backend;
 pub mod diagnostic;
 pub mod ir;
 pub mod lexer;
@@ -7,11 +7,7 @@ pub mod resolve;
 
 use crate::diagnostic::{Diagnostic, SourceId};
 
-/// Compile schema sources into the IR, reporting every problem found.
-///
-/// The sources are compiled together: one may `use` the namespace of another,
-/// and sources sharing a `namespace` are merged. The [`SourceId`] carried by
-/// each diagnostic indexes into `sources`.
+/// Compile schema sources into the IR.
 pub fn compile(sources: &[&str]) -> Result<ir::Schema, Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
     let mut schemas = Vec::with_capacity(sources.len());
@@ -33,8 +29,6 @@ pub fn compile(sources: &[&str]) -> Result<ir::Schema, Vec<Diagnostic>> {
         schemas.push(schema);
     }
 
-    // Lowering needs every source intact, since resolution runs across all
-    // of them at once; syntax errors end the pipeline here.
     let schemas: Vec<_> = schemas.into_iter().flatten().collect();
     if !diagnostics.is_empty() || schemas.len() != sources.len() {
         return Err(diagnostics);

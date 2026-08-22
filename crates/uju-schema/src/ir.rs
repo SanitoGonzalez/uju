@@ -1,7 +1,3 @@
-//! The resolved, validated form of a set of schemas, produced by [`lower`]
-//! and consumed by the wire-format layout and the backends. All names are
-//! resolved to ids; a [`Schema`] is only produced when it is free of errors.
-
 mod lower;
 pub mod wire;
 
@@ -32,7 +28,6 @@ pub struct Schema {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Namespace {
-    /// Dotted segments, such as `["foo", "bar"]` for `namespace foo.bar`.
     pub name: Vec<String>,
 }
 
@@ -88,7 +83,6 @@ pub struct Union {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
-    /// The message answering this one, for `message A -> B`.
     pub response: Option<TypeId>,
     pub fields: Vec<Field>,
 }
@@ -137,12 +131,13 @@ pub struct Const {
     pub value: Value,
 }
 
-/// An evaluated constant. Strings are stored with their escapes decoded.
+/// An evaluated constant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Bool(bool),
     Int(i128),
     Float(f64),
+    /// Strings are stored with their escapes decoded.
     Str(String),
     /// A variant of the enum, by index into its variant list.
     EnumVariant(TypeId, usize),

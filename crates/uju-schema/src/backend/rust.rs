@@ -1,10 +1,10 @@
-use heck::{ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
-
-use crate::backend::Backend;
-use crate::ir::*;
+use crate::backend::{Backend, Error, GeneratedFile};
+use crate::ir;
 
 pub struct Rust;
 
 impl Backend for Rust {
-    fn generate(&self, schema: &ir::Schema) -> Result<Vec<GeneratedFile>, Error>;
+    fn generate(&self, _schema: &ir::Schema) -> Result<Vec<GeneratedFile>, Error> {
+        todo!()
+    }
 }
