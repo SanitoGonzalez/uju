@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
+use clap::Parser;
 use clap::builder::PossibleValuesParser;
-use clap::{Parser, Subcommand};
-use uju_schema::backend::{self, BACKENDS, Backend, GeneratedFile};
+use uju_schema::backend::{self, BACKENDS, GeneratedFile};
 use uju_schema::compile;
 
 /// The extension directories are searched for.
@@ -16,38 +16,20 @@ const EXTENSION: &str = "uju";
 #[derive(Parser, Debug)]
 #[command(name = "ujuc", version, about = "Compile uju schemas")]
 struct Args {
-    #[command(subcommand)]
-    command: Command,
-}
+    /// Target to generate; `ir` emits the compiled IR as JSON
+    #[arg(
+        value_name = "BACKEND",
+        value_parser = PossibleValuesParser::new(BACKENDS.iter().copied()),
+    )]
+    backend: String,
 
-/// What a run emits. A run emits one of these, never both: the IR is not a
-/// target language, and each may grow options the other has no use for.
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Generate code for a target language
-    Gen {
-        #[arg(
-            value_name = "BACKEND",
-            value_parser = PossibleValuesParser::new(BACKENDS.iter().copied()),
-        )]
-        backend: String,
-
-        #[command(flatten)]
-        input: Input,
-    },
-
-    /// Emit the compiled IR as JSON, one file per namespace
-    Ir {
-        #[command(flatten)]
-        input: Input,
-    },
-}
-
-#[derive(clap::Args, Debug)]
-struct Input {
     /// Directory to write generated files into
     #[arg(short = 'o', long = "out", value_name = "DIR", default_value = ".")]
     out: PathBuf,
+
+    /// Compile and report what would be written, without writing it
+    #[arg(long)]
+    dry_run: bool,
 
     /// Schema files, or directories searched recursively for `*.uju`
     #[arg(value_name = "PATH", required = true)]
@@ -65,20 +47,11 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<()> {
-    let (name, generator, input): (&str, Box<dyn Backend>, &Input) = match &args.command {
-        Command::Gen { backend, input } => {
-            let generator = backend::backend(backend).with_context(|| {
-                format!(
-                    "no backend named `{backend}`; known: {}",
-                    BACKENDS.join(", ")
-                )
-            })?;
-            (backend, generator, input)
-        }
-        Command::Ir { input } => ("ir", Box::new(backend::ir::Ir), input),
-    };
+    let name = args.backend.as_str();
+    let generator = backend::backend(name)
+        .with_context(|| format!("no backend named `{name}`; known: {}", BACKENDS.join(", ")))?;
 
-    let inputs = collect(&input.paths)?;
+    let inputs = collect(&args.paths)?;
     if inputs.is_empty() {
         bail!("no `*.{EXTENSION}` files found");
     }
@@ -106,8 +79,19 @@ fn run(args: &Args) -> Result<()> {
     let files = generator
         .generate(&schema)
         .with_context(|| format!("generating `{name}`"))?;
-    write(&input.out, &files).with_context(|| format!("generating `{name}`"))?;
-    println!("{name}: {} file(s) -> {}", files.len(), input.out.display());
+    if args.dry_run {
+        for file in &files {
+            println!("{}", args.out.join(&file.path).display());
+        }
+        println!(
+            "{name}: {} file(s) -> {} (dry run, nothing written)",
+            files.len(),
+            args.out.display()
+        );
+        return Ok(());
+    }
+    write(&args.out, &files).with_context(|| format!("generating `{name}`"))?;
+    println!("{name}: {} file(s) -> {}", files.len(), args.out.display());
 
     Ok(())
 }
