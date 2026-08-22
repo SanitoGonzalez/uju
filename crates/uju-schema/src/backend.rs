@@ -1,10 +1,11 @@
+pub mod ir;
 pub mod rust;
 
 use std::fmt;
 use std::path::PathBuf;
 
 use crate::backend::rust::Rust;
-use crate::ir;
+use crate::ir::Schema;
 
 /// Every name [`backend`] accepts, for listing in help and error messages.
 pub const BACKENDS: &[&str] = &["rust"];
@@ -24,9 +25,9 @@ impl GeneratedFile {
     }
 }
 
-/// Emits source for one target language from a lowered [`ir::Schema`].
+/// Emits source for one target language from a lowered [`Schema`].
 pub trait Backend {
-    fn generate(&self, schema: &ir::Schema) -> Result<Vec<GeneratedFile>, Error>;
+    fn generate(&self, schema: &Schema) -> Result<Vec<GeneratedFile>, Error>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

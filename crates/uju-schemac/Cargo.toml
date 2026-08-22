@@ -3,7 +3,12 @@ name = "uju-schemac"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "ujuc"
+path = "src/main.rs"
+
 [dependencies]
 uju-schema = { path = "../uju-schema" }
 
+anyhow.workspace = true
 clap.workspace = true
