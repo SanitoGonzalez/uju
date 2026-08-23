@@ -10,6 +10,8 @@ pub enum Error {
     BadBool,
     #[error("no such enum variant")]
     BadEnum,
+    #[error("no such union member")]
+    BadTag,
     #[error("timestamp is out of range")]
     BadTimestamp,
     #[error("interval is negative")]
@@ -18,20 +20,19 @@ pub enum Error {
     BadEntity,
     #[error("string is not valid UTF-8")]
     BadUtf8,
-    #[error("offset is not canonical")]
-    BadOffset,
-    #[error("absent optional slot is not zero-filled")]
+    #[error("absent optional field is not zero-filled")]
     BadPadding,
-    #[error("set or map keys are not sorted")]
+    #[error("set items or map keys are not sorted")]
     Unsorted,
-    #[error("duplicate set element or map key")]
+    #[error("duplicate set item or map key")]
     Duplicate,
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-pub fn need(bytes: &[u8], len: usize) -> Result<()> {
-    if bytes.len() < len {
+/// Checks that `bytes` reaches `end`, an offset from the start of the message.
+pub fn need(bytes: &[u8], end: usize) -> Result<()> {
+    if bytes.len() < end {
         Err(Error::Truncated)
     } else {
         Ok(())

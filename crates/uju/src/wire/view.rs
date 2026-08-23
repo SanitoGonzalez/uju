@@ -1,24 +1,35 @@
+//! Zero-copy views of the containers: they hold the buffer, the offset of the
+//! payload, and the count from the head, and read items on demand.
+//!
+//! Fixed-size items are packed at a constant stride, so they are indexed
+//! directly; variable-size ones are consecutive blocks, so reaching the `n`-th
+//! means walking the ones before it.
+
 use core::cmp::Ordering;
 use core::marker::PhantomData;
 
+use crate::wire::collections::{Map, Set};
 use crate::wire::error::{Error, Result, need};
-use crate::wire::read::read_u16;
-use crate::wire::traits::{Canonical, View};
+use crate::wire::traits::{
+    Canonical, Entry, Layout, View, element_align, element_end, entry, fixed_size, pad,
+    read_element, validate_element, validate_fixed,
+};
 
 pub struct VecView<'a, T> {
     bytes: &'a [u8],
+    at: usize,
     len: usize,
-    _element: PhantomData<T>,
+    item: PhantomData<T>,
 }
 
 pub struct SetView<'a, T>(VecView<'a, T>);
 
 pub struct MapView<'a, K, V> {
     bytes: &'a [u8],
+    at: usize,
     len: usize,
-    values: usize,
-    _key: PhantomData<K>,
-    _value: PhantomData<V>,
+    key: PhantomData<K>,
+    value: PhantomData<V>,
 }
 
 impl<T> Clone for VecView<'_, T> {
@@ -45,51 +56,6 @@ impl<K, V> Clone for MapView<'_, K, V> {
 
 impl<K, V> Copy for MapView<'_, K, V> {}
 
-fn element_at<'a, T: View<'a>>(bytes: &'a [u8], table: usize, index: usize) -> T {
-    let at = match T::FIXED_SIZE {
-        Some(n) => table + index * n,
-        None => read_u16(bytes, table + index * 2) as usize,
-    };
-    T::read(&bytes[at..])
-}
-
-fn validate_column<'a, T: View<'a>>(bytes: &'a [u8], table: usize, len: usize) -> Result<usize> {
-    match T::FIXED_SIZE {
-        Some(n) => {
-            let end = table + len * n;
-            need(bytes, end)?;
-            for i in 0..len {
-                T::validate(&bytes[table + i * n..])?;
-            }
-            Ok(end)
-        }
-        None => {
-            let mut cursor = table + len * 2;
-            need(bytes, cursor)?;
-            for i in 0..len {
-                if read_u16(bytes, table + i * 2) as usize != cursor {
-                    return Err(Error::BadOffset);
-                }
-                cursor += T::validate(&bytes[cursor..])?;
-            }
-            Ok(cursor)
-        }
-    }
-}
-
-fn check_sorted<'a, T: View<'a>>(bytes: &'a [u8], table: usize, len: usize) -> Result<()> {
-    for i in 1..len {
-        let previous: T = element_at(bytes, table, i - 1);
-        let current: T = element_at(bytes, table, i);
-        match previous.canonical_cmp(&current) {
-            Ordering::Less => {}
-            Ordering::Equal => return Err(Error::Duplicate),
-            Ordering::Greater => return Err(Error::Unsorted),
-        }
-    }
-    Ok(())
-}
-
 impl<'a, T: View<'a>> VecView<'a, T> {
     pub fn len(self) -> usize {
         self.len
@@ -99,60 +65,87 @@ impl<'a, T: View<'a>> VecView<'a, T> {
         self.len == 0
     }
 
+    /// Offset just past the payload.
+    pub fn end(self) -> usize {
+        match T::FIXED_SIZE {
+            Some(size) => self.at + self.len * size,
+            None => self
+                .offsets()
+                .last()
+                .map_or(self.at, |at| element_end::<T>(self.bytes, at)),
+        }
+    }
+
     pub fn get(self, index: usize) -> Option<T> {
-        (index < self.len).then(|| element_at(self.bytes, 2, index))
+        if index >= self.len {
+            return None;
+        }
+        match T::FIXED_SIZE {
+            Some(size) => Some(read_element(self.bytes, self.at + index * size)),
+            None => self.iter().nth(index),
+        }
     }
 
     pub fn iter(self) -> impl Iterator<Item = T> + 'a {
         let bytes = self.bytes;
-        (0..self.len).map(move |i| element_at(bytes, 2, i))
+        self.offsets().map(move |at| read_element(bytes, at))
     }
+
+    /// Offset of each item, walking the blocks when they are variable-size.
+    fn offsets(self) -> impl Iterator<Item = usize> + 'a {
+        let bytes = self.bytes;
+        let align = element_align(T::FIXED_SIZE, T::ALIGN);
+        let mut cursor = self.at;
+        (0..self.len).map(move |_| {
+            let at = pad(cursor, align);
+            cursor = element_end::<T>(bytes, at);
+            at
+        })
+    }
+}
+
+impl<'a, T: Layout> Layout for VecView<'a, T> {
+    const FIXED_SIZE: Option<usize> = None;
+    const ALIGN: usize = element_align(T::FIXED_SIZE, T::ALIGN);
 }
 
 impl<'a, T: View<'a>> View<'a> for VecView<'a, T> {
     type Owned = Vec<T::Owned>;
 
-    const FIXED_SIZE: Option<usize> = None;
-
-    fn owned(self) -> Vec<T::Owned> {
-        self.iter().map(View::owned).collect()
-    }
-
-    fn read(bytes: &'a [u8]) -> Self {
+    fn read(bytes: &'a [u8], at: usize, head: u16) -> Self {
         Self {
             bytes,
-            len: read_u16(bytes, 0) as usize,
-            _element: PhantomData,
+            at,
+            len: head as usize,
+            item: PhantomData,
         }
     }
 
-    fn validate(bytes: &'a [u8]) -> Result<usize> {
-        need(bytes, 2)?;
-        validate_column::<T>(bytes, 2, read_u16(bytes, 0) as usize)
+    fn end(bytes: &'a [u8], at: usize, head: u16) -> usize {
+        Self::read(bytes, at, head).end()
+    }
+
+    fn validate(bytes: &'a [u8], at: usize, head: u16) -> Result<usize> {
+        validate_items::<T>(bytes, at, head as usize)
+    }
+
+    fn to_owned(self) -> Vec<T::Owned> {
+        self.iter().map(View::to_owned).collect()
     }
 }
 
-impl<'a, T: View<'a>> Canonical for VecView<'a, T> {
-    fn canonical_cmp(&self, other: &Self) -> Ordering {
-        for i in 0..self.len.min(other.len) {
-            let a: T = element_at(self.bytes, 2, i);
-            let b: T = element_at(other.bytes, 2, i);
-            match a.canonical_cmp(&b) {
-                Ordering::Equal => {}
-                ord => return ord,
-            }
-        }
-        self.len.cmp(&other.len)
-    }
-}
-
-impl<'a, T: View<'a>> SetView<'a, T> {
+impl<'a, T: View<'a> + Canonical> SetView<'a, T> {
     pub fn len(self) -> usize {
         self.0.len()
     }
 
     pub fn is_empty(self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Offset just past the payload.
+    pub fn end(self) -> usize {
+        self.0.end()
     }
 
     pub fn get(self, index: usize) -> Option<T> {
@@ -164,47 +157,57 @@ impl<'a, T: View<'a>> SetView<'a, T> {
     }
 
     pub fn contains(self, value: &T) -> bool {
-        self.position(value).is_ok()
-    }
-
-    fn position(self, value: &T) -> core::result::Result<usize, usize> {
-        binary_search(self.0.len, |i| {
-            let probe: T = element_at(self.0.bytes, 2, i);
-            probe.canonical_cmp(value)
-        })
+        match T::FIXED_SIZE {
+            Some(size) => search(self.0.len, |index| {
+                let item: T = read_element(self.0.bytes, self.0.at + index * size);
+                item.canonical_cmp(value)
+            })
+            .is_ok(),
+            None => self
+                .iter()
+                .any(|item| item.canonical_cmp(value) == Ordering::Equal),
+        }
     }
 }
 
-impl<'a, T: View<'a>> View<'a> for SetView<'a, T>
+impl<'a, T: Layout> Layout for SetView<'a, T> {
+    const FIXED_SIZE: Option<usize> = None;
+    const ALIGN: usize = element_align(T::FIXED_SIZE, T::ALIGN);
+}
+
+impl<'a, T: View<'a> + Canonical> View<'a> for SetView<'a, T>
 where
     T::Owned: Canonical,
 {
-    type Owned = crate::wire::collections::Set<T::Owned>;
+    type Owned = Set<T::Owned>;
 
-    const FIXED_SIZE: Option<usize> = None;
-
-    fn owned(self) -> crate::wire::collections::Set<T::Owned> {
-        crate::wire::collections::Set::from_vec(self.iter().map(View::owned).collect())
+    fn read(bytes: &'a [u8], at: usize, head: u16) -> Self {
+        Self(VecView::read(bytes, at, head))
     }
 
-    fn read(bytes: &'a [u8]) -> Self {
-        Self(VecView::read(bytes))
+    fn end(bytes: &'a [u8], at: usize, head: u16) -> usize {
+        Self::read(bytes, at, head).end()
     }
 
-    fn validate(bytes: &'a [u8]) -> Result<usize> {
-        let end = VecView::<T>::validate(bytes)?;
-        check_sorted::<T>(bytes, 2, read_u16(bytes, 0) as usize)?;
+    fn validate(bytes: &'a [u8], at: usize, head: u16) -> Result<usize> {
+        let end = validate_items::<T>(bytes, at, head as usize)?;
+        sorted(Self::read(bytes, at, head).iter())?;
         Ok(end)
     }
-}
 
-impl<'a, T: View<'a>> Canonical for SetView<'a, T> {
-    fn canonical_cmp(&self, other: &Self) -> Ordering {
-        self.0.canonical_cmp(&other.0)
+    fn to_owned(self) -> Set<T::Owned> {
+        Set::from_vec(self.iter().map(View::to_owned).collect())
     }
 }
 
 impl<'a, K: View<'a>, V: View<'a>> MapView<'a, K, V> {
+    const ENTRY: Entry = entry(
+        fixed_size(K::FIXED_SIZE),
+        K::ALIGN,
+        fixed_size(V::FIXED_SIZE),
+        V::ALIGN,
+    );
+
     pub fn len(self) -> usize {
         self.len
     }
@@ -213,96 +216,198 @@ impl<'a, K: View<'a>, V: View<'a>> MapView<'a, K, V> {
         self.len == 0
     }
 
+    /// Offset just past the payload.
+    pub fn end(self) -> usize {
+        match V::FIXED_SIZE {
+            Some(_) => self.at + self.len * Self::ENTRY.size,
+            None => {
+                let mut cursor = self.at;
+                for (_, value) in self.entries() {
+                    cursor = element_end::<V>(self.bytes, value);
+                }
+                cursor
+            }
+        }
+    }
+
     pub fn key(self, index: usize) -> Option<K> {
-        (index < self.len).then(|| element_at(self.bytes, 4, index))
+        let (key, _) = self.entry_at(index)?;
+        Some(read_element(self.bytes, key))
     }
 
     pub fn value(self, index: usize) -> Option<V> {
-        (index < self.len).then(|| element_at(self.bytes, self.values, index))
-    }
-
-    pub fn get(self, key: &K) -> Option<V> {
-        let index = binary_search(self.len, |i| {
-            let probe: K = element_at(self.bytes, 4, i);
-            probe.canonical_cmp(key)
-        })
-        .ok()?;
-        self.value(index)
+        let (_, value) = self.entry_at(index)?;
+        Some(read_element(self.bytes, value))
     }
 
     pub fn iter(self) -> impl Iterator<Item = (K, V)> + 'a {
-        let (bytes, values) = (self.bytes, self.values);
-        (0..self.len).map(move |i| (element_at(bytes, 4, i), element_at(bytes, values, i)))
+        let bytes = self.bytes;
+        self.entries()
+            .map(move |(key, value)| (read_element(bytes, key), read_element(bytes, value)))
     }
 
     pub fn keys(self) -> impl Iterator<Item = K> + 'a {
         let bytes = self.bytes;
-        (0..self.len).map(move |i| element_at(bytes, 4, i))
+        self.entries().map(move |(key, _)| read_element(bytes, key))
     }
 
     pub fn values(self) -> impl Iterator<Item = V> + 'a {
-        let (bytes, values) = (self.bytes, self.values);
-        (0..self.len).map(move |i| element_at(bytes, values, i))
+        let bytes = self.bytes;
+        self.entries()
+            .map(move |(_, value)| read_element(bytes, value))
+    }
+
+    fn entry_at(self, index: usize) -> Option<(usize, usize)> {
+        if index >= self.len {
+            return None;
+        }
+        match V::FIXED_SIZE {
+            Some(_) => {
+                let at = self.at + index * Self::ENTRY.size;
+                Some((at + Self::ENTRY.key, at + Self::ENTRY.value))
+            }
+            None => self.entries().nth(index),
+        }
+    }
+
+    /// Offset of each entry's key and value, walking the entries when the
+    /// value is variable-size.
+    fn entries(self) -> impl Iterator<Item = (usize, usize)> + 'a {
+        let bytes = self.bytes;
+        let mut cursor = self.at;
+        (0..self.len).map(move |_| {
+            let at = pad(cursor, Self::ALIGN);
+            match V::FIXED_SIZE {
+                Some(_) => {
+                    cursor = at + Self::ENTRY.size;
+                    (at + Self::ENTRY.key, at + Self::ENTRY.value)
+                }
+                None => {
+                    let value = value_at::<K, V>(at);
+                    cursor = element_end::<V>(bytes, value);
+                    (at, value)
+                }
+            }
+        })
     }
 }
 
-impl<'a, K: View<'a>, V: View<'a>> View<'a> for MapView<'a, K, V>
+impl<'a, K: View<'a> + Canonical, V: View<'a>> MapView<'a, K, V> {
+    pub fn get(self, key: &K) -> Option<V> {
+        let index = match V::FIXED_SIZE {
+            Some(_) => search(self.len, |index| {
+                let probe: K = read_element(
+                    self.bytes,
+                    self.at + index * Self::ENTRY.size + Self::ENTRY.key,
+                );
+                probe.canonical_cmp(key)
+            })
+            .ok()?,
+            None => self
+                .keys()
+                .position(|probe| probe.canonical_cmp(key) == Ordering::Equal)?,
+        };
+        self.value(index)
+    }
+}
+
+impl<'a, K: Layout, V: Layout> Layout for MapView<'a, K, V> {
+    const FIXED_SIZE: Option<usize> = None;
+    const ALIGN: usize = {
+        let value = element_align(V::FIXED_SIZE, V::ALIGN);
+        if K::ALIGN > value { K::ALIGN } else { value }
+    };
+}
+
+impl<'a, K: View<'a> + Canonical, V: View<'a>> View<'a> for MapView<'a, K, V>
 where
     K::Owned: Canonical,
 {
-    type Owned = crate::wire::collections::Map<K::Owned, V::Owned>;
+    type Owned = Map<K::Owned, V::Owned>;
 
-    const FIXED_SIZE: Option<usize> = None;
-
-    fn owned(self) -> crate::wire::collections::Map<K::Owned, V::Owned> {
-        crate::wire::collections::Map::from_vec(
-            self.iter().map(|(k, v)| (k.owned(), v.owned())).collect(),
-        )
-    }
-
-    fn read(bytes: &'a [u8]) -> Self {
+    fn read(bytes: &'a [u8], at: usize, head: u16) -> Self {
         Self {
             bytes,
-            len: read_u16(bytes, 0) as usize,
-            values: read_u16(bytes, 2) as usize,
-            _key: PhantomData,
-            _value: PhantomData,
+            at,
+            len: head as usize,
+            key: PhantomData,
+            value: PhantomData,
         }
     }
 
-    fn validate(bytes: &'a [u8]) -> Result<usize> {
-        need(bytes, 4)?;
-        let len = read_u16(bytes, 0) as usize;
-        let values = read_u16(bytes, 2) as usize;
-        if validate_column::<K>(bytes, 4, len)? != values {
-            return Err(Error::BadOffset);
-        }
-        let end = validate_column::<V>(bytes, values, len)?;
-        check_sorted::<K>(bytes, 4, len)?;
-        Ok(end)
+    fn end(bytes: &'a [u8], at: usize, head: u16) -> usize {
+        Self::read(bytes, at, head).end()
     }
-}
 
-impl<'a, K: View<'a>, V: View<'a>> Canonical for MapView<'a, K, V> {
-    fn canonical_cmp(&self, other: &Self) -> Ordering {
-        for i in 0..self.len.min(other.len) {
-            let ak: K = element_at(self.bytes, 4, i);
-            let bk: K = element_at(other.bytes, 4, i);
-            let av: V = element_at(self.bytes, self.values, i);
-            let bv: V = element_at(other.bytes, other.values, i);
-            match ak.canonical_cmp(&bk).then_with(|| av.canonical_cmp(&bv)) {
-                Ordering::Equal => {}
-                ord => return ord,
+    fn validate(bytes: &'a [u8], at: usize, head: u16) -> Result<usize> {
+        let len = head as usize;
+        let mut cursor = at;
+        for _ in 0..len {
+            let entry = pad(cursor, Self::ALIGN);
+            match V::FIXED_SIZE {
+                Some(_) => {
+                    need(bytes, entry + Self::ENTRY.size)?;
+                    validate_fixed::<K>(bytes, entry + Self::ENTRY.key)?;
+                    validate_fixed::<V>(bytes, entry + Self::ENTRY.value)?;
+                    cursor = entry + Self::ENTRY.size;
+                }
+                None => {
+                    validate_fixed::<K>(bytes, entry)?;
+                    cursor = validate_element::<V>(bytes, value_at::<K, V>(entry))?;
+                }
             }
         }
-        self.len.cmp(&other.len)
+        sorted(Self::read(bytes, at, head).keys())?;
+        Ok(cursor)
+    }
+
+    fn to_owned(self) -> Map<K::Owned, V::Owned> {
+        Map::from_vec(
+            self.iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+        )
     }
 }
 
-fn binary_search(
-    len: usize,
-    probe: impl Fn(usize) -> Ordering,
-) -> core::result::Result<usize, usize> {
+/// Offset of a variable-size value inside a `map` entry starting at `at`.
+fn value_at<'a, K: View<'a>, V: View<'a>>(at: usize) -> usize {
+    pad(
+        at + fixed_size(K::FIXED_SIZE),
+        element_align(V::FIXED_SIZE, V::ALIGN),
+    )
+}
+
+fn validate_items<'a, T: View<'a>>(bytes: &'a [u8], at: usize, len: usize) -> Result<usize> {
+    let align = element_align(T::FIXED_SIZE, T::ALIGN);
+    let mut cursor = at;
+    if let Some(size) = T::FIXED_SIZE {
+        need(bytes, at + len * size)?;
+    }
+    for _ in 0..len {
+        cursor = validate_element::<T>(bytes, pad(cursor, align))?;
+    }
+    Ok(cursor)
+}
+
+/// Checks that `items` are in ascending [`Canonical`] order, as `set` items
+/// and `map` keys are on the wire.
+fn sorted<T: Canonical>(items: impl Iterator<Item = T>) -> Result<()> {
+    let mut previous: Option<T> = None;
+    for item in items {
+        if let Some(previous) = &previous {
+            match previous.canonical_cmp(&item) {
+                Ordering::Less => {}
+                Ordering::Equal => return Err(Error::Duplicate),
+                Ordering::Greater => return Err(Error::Unsorted),
+            }
+        }
+        previous = Some(item);
+    }
+    Ok(())
+}
+
+fn search(len: usize, probe: impl Fn(usize) -> Ordering) -> core::result::Result<usize, usize> {
     let (mut lo, mut hi) = (0, len);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;

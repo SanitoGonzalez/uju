@@ -1,11 +1,17 @@
 use core::cmp::Ordering;
 
-use crate::wire::traits::{Canonical, Wire};
+use crate::wire::traits::{
+    Canonical, Entry, Layout, Wire, element_align, element_size, encode_element, encode_items,
+    entry, fixed_size, items_size, pad,
+};
 use crate::wire::write::Writer;
 
+/// A `set`: items in [`Canonical`] order, without duplicates — the order they
+/// are written in.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Set<T>(Vec<T>);
 
+/// A `map`: entries sorted by key, without duplicate keys.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Map<K, V>(Vec<(K, V)>);
 
@@ -21,7 +27,7 @@ impl<T: Canonical> Set<T> {
     }
 
     pub fn insert(&mut self, value: T) -> bool {
-        match self.0.binary_search_by(|p| p.canonical_cmp(&value)) {
+        match self.0.binary_search_by(|probe| probe.canonical_cmp(&value)) {
             Ok(_) => false,
             Err(at) => {
                 self.0.insert(at, value);
@@ -31,7 +37,9 @@ impl<T: Canonical> Set<T> {
     }
 
     pub fn contains(&self, value: &T) -> bool {
-        self.0.binary_search_by(|p| p.canonical_cmp(value)).is_ok()
+        self.0
+            .binary_search_by(|probe| probe.canonical_cmp(value))
+            .is_ok()
     }
 
     pub fn as_slice(&self) -> &[T] {
@@ -73,7 +81,7 @@ impl<K: Canonical, V> Map<K, V> {
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        match self.0.binary_search_by(|p| p.0.canonical_cmp(&key)) {
+        match self.0.binary_search_by(|probe| probe.0.canonical_cmp(&key)) {
             Ok(at) => Some(core::mem::replace(&mut self.0[at].1, value)),
             Err(at) => {
                 self.0.insert(at, (key, value));
@@ -83,7 +91,7 @@ impl<K: Canonical, V> Map<K, V> {
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
-        match self.0.binary_search_by(|p| p.0.canonical_cmp(key)) {
+        match self.0.binary_search_by(|probe| probe.0.canonical_cmp(key)) {
             Ok(at) => Some(&self.0[at].1),
             Err(_) => None,
         }
@@ -116,91 +124,110 @@ impl<K: Canonical, V> FromIterator<(K, V)> for Map<K, V> {
     }
 }
 
-fn column_size<'a, T: Wire + 'a>(items: impl Iterator<Item = &'a T>, len: usize) -> usize {
-    match T::FIXED_SIZE {
-        Some(n) => len * n,
-        None => len * 2 + items.map(|e| e.encoded_size()).sum::<usize>(),
-    }
-}
-
-fn encode_column<'a, T: Wire + 'a>(
-    w: &mut Writer,
-    start: usize,
-    items: impl Iterator<Item = &'a T>,
-    len: usize,
-) {
-    if T::FIXED_SIZE.is_some() {
-        for element in items {
-            element.encode(w);
-        }
-        return;
-    }
-    let table = w.pos();
-    w.push_zeros(len * 2);
-    for (i, element) in items.enumerate() {
-        let offset = w.short(w.pos() - start);
-        w.put_u16(table + i * 2, offset);
-        element.encode(w);
-    }
-}
-
-impl<T: Wire + Canonical> Wire for Set<T> {
+/// `vec<T>`: the item count in the head, then the items.
+impl<T: Layout> Layout for Vec<T> {
     const FIXED_SIZE: Option<usize> = None;
+    const ALIGN: usize = element_align(T::FIXED_SIZE, T::ALIGN);
+}
 
+impl<T: Wire> Wire for Vec<T> {
     fn encoded_size(&self) -> usize {
-        2 + column_size(self.0.iter(), self.0.len())
+        items_size(self.iter(), self.len())
     }
 
     fn encode(&self, w: &mut Writer) {
-        let start = w.pos();
-        let count = w.short(self.0.len());
-        w.push_u16(count);
-        encode_column(w, start, self.0.iter(), self.0.len());
+        encode_items(self.iter(), w);
+    }
+
+    fn head(&self) -> usize {
+        self.len()
     }
 }
 
-impl<T: Canonical> Canonical for Set<T> {
-    fn canonical_cmp(&self, other: &Self) -> Ordering {
-        for (a, b) in self.0.iter().zip(&other.0) {
-            match a.canonical_cmp(b) {
-                Ordering::Equal => {}
-                ord => return ord,
-            }
-        }
-        self.0.len().cmp(&other.0.len())
-    }
-}
-
-impl<K: Wire + Canonical, V: Wire + Canonical> Wire for Map<K, V> {
+impl<T: Layout> Layout for Set<T> {
     const FIXED_SIZE: Option<usize> = None;
+    const ALIGN: usize = element_align(T::FIXED_SIZE, T::ALIGN);
+}
 
+impl<T: Wire> Wire for Set<T> {
     fn encoded_size(&self) -> usize {
-        let keys = column_size(self.0.iter().map(|(k, _)| k), self.0.len());
-        let values = column_size(self.0.iter().map(|(_, v)| v), self.0.len());
-        4 + keys + values
+        items_size(self.0.iter(), self.0.len())
     }
 
     fn encode(&self, w: &mut Writer) {
-        let start = w.pos();
-        let count = w.short(self.0.len());
-        w.push_u16(count);
-        let values_slot = w.pos();
-        w.push_u16(0);
-        encode_column(w, start, self.0.iter().map(|(k, _)| k), self.0.len());
-        let values_start = w.short(w.pos() - start);
-        w.put_u16(values_slot, values_start);
-        encode_column(w, start, self.0.iter().map(|(_, v)| v), self.0.len());
+        encode_items(self.0.iter(), w);
+    }
+
+    fn head(&self) -> usize {
+        self.0.len()
     }
 }
 
-impl<K: Canonical, V: Canonical> Canonical for Map<K, V> {
-    fn canonical_cmp(&self, other: &Self) -> Ordering {
-        for ((ak, av), (bk, bv)) in self.0.iter().zip(&other.0) {
-            match ak.canonical_cmp(bk).then_with(|| av.canonical_cmp(bv)) {
-                Ordering::Equal => {}
-                ord => return ord,
+/// `map<K, V>`: the entry count in the head, then the entries. A fixed-size
+/// value packs with its key like struct fields; a variable-size one follows
+/// the key as a block.
+impl<K: Layout, V: Layout> Layout for Map<K, V> {
+    const FIXED_SIZE: Option<usize> = None;
+    const ALIGN: usize = {
+        let value = element_align(V::FIXED_SIZE, V::ALIGN);
+        if K::ALIGN > value { K::ALIGN } else { value }
+    };
+}
+
+impl<K: Wire, V: Wire> Map<K, V> {
+    const ENTRY: Entry = entry(
+        fixed_size(K::FIXED_SIZE),
+        K::ALIGN,
+        fixed_size(V::FIXED_SIZE),
+        V::ALIGN,
+    );
+}
+
+impl<K: Wire, V: Wire> Wire for Map<K, V> {
+    fn encoded_size(&self) -> usize {
+        match V::FIXED_SIZE {
+            Some(_) => self.0.len() * Self::ENTRY.size,
+            None => self.0.iter().fold(0, |cursor, (_, value)| {
+                let at = pad(cursor, Self::ALIGN);
+                let value_at = pad(
+                    at + fixed_size(K::FIXED_SIZE),
+                    element_align(V::FIXED_SIZE, V::ALIGN),
+                );
+                value_at + element_size(value)
+            }),
+        }
+    }
+
+    fn encode(&self, w: &mut Writer) {
+        for (key, value) in &self.0 {
+            w.align(Self::ALIGN);
+            match V::FIXED_SIZE {
+                Some(_) => {
+                    let at = w.pos();
+                    let entry = Self::ENTRY;
+                    if entry.key <= entry.value {
+                        w.pad_to(at + entry.key);
+                        key.encode(w);
+                        w.pad_to(at + entry.value);
+                        value.encode(w);
+                    } else {
+                        w.pad_to(at + entry.value);
+                        value.encode(w);
+                        w.pad_to(at + entry.key);
+                        key.encode(w);
+                    }
+                    w.pad_to(at + entry.size);
+                }
+                None => {
+                    key.encode(w);
+                    w.align(element_align(V::FIXED_SIZE, V::ALIGN));
+                    encode_element(value, w);
+                }
             }
         }
-        self.0.len().cmp(&other.0.len())
+    }
+
+    fn head(&self) -> usize {
+        self.0.len()
     }
 }
