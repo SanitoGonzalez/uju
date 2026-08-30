@@ -1,10 +1,10 @@
 use core::cmp::Ordering;
 
-use crate::wire::traits::{
+use crate::net::wire::traits::{
     Canonical, Entry, Layout, Wire, element_align, element_size, encode_element, encode_items,
     entry, fixed_size, items_size, pad,
 };
-use crate::wire::write::Writer;
+use crate::net::wire::write::Writer;
 
 /// A `set`: items in [`Canonical`] order, without duplicates — the order they
 /// are written in.

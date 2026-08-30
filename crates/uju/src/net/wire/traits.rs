@@ -8,9 +8,9 @@
 
 use core::cmp::Ordering;
 
-use crate::wire::error::{Result, need};
-use crate::wire::read::read_u16;
-use crate::wire::write::Writer;
+use crate::net::wire::error::{Result, need};
+use crate::net::wire::read::read_u16;
+use crate::net::wire::write::Writer;
 
 /// Size and alignment of a wire type, shared by an owned value and its view.
 pub trait Layout {

@@ -5,10 +5,10 @@ use chrono::{DateTime, Utc};
 
 pub use crate::ecs::entity::{Entity, UniversalEntity};
 use crate::ecs::entity::{EntityGeneration, EntityIndex};
-use crate::wire::error::{Error, Result, need};
-use crate::wire::read::*;
-use crate::wire::traits::{Canonical, Layout, View, Wire, fixed_size};
-use crate::wire::write::Writer;
+use crate::net::wire::error::{Error, Result, need};
+use crate::net::wire::read::*;
+use crate::net::wire::traits::{Canonical, Layout, View, Wire, fixed_size};
+use crate::net::wire::write::Writer;
 
 pub type Timestamp = DateTime<Utc>;
 pub type Interval = core::time::Duration;

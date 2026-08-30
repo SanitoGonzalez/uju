@@ -1,6 +1,6 @@
 pub mod message;
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::net::SocketAddr;
 use std::num::NonZero;
 use std::rc::Rc;
