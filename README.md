@@ -63,3 +63,20 @@ keeping component storage/access as MVCC. (maybe hybrid - MVCC for )
     - use position as a shard criteria
     - migrate entities on shard criteria
     - migrate entities if cross-shard interaction exceeds the threshold
+
+- MVCC (2026.09.06):
+    - Postgres-styled MVCC looks to be a good fit here, though it's considered "terrible backend" on disk oriented DBMS
+      field.
+    - Protocol = MV2PL: On write-write, let the last writer wait. (Must not block the thread, though.) Abortion on write
+      conflict requires retriable transaction, which is not easy on game programming. So we better wait rather than
+      abort. However, This requires EVERY yield in the transaction to have a reasonable timeout to prevent HOLB.
+      (Inter-shard transaction will yield. If the peer shard dies without responding, it will be an infinite stall if no
+      timeout.)
+    - Version Storage = Append-Only Storage: All versions should reside in the one dense array. If we manage separate
+      arena, the iteration would lack cache locality. Therefore, keep version chains in the dense array and let
+      iteration see the latest version of its timestamp view. Delta Storage might introduce the burden for the users to
+      implement and manage delta ops per component.
+    - Garbage Collection: Transaction level
+    - Indexes: Only implement/provide primary index as entity. Secondary indexes introduce complexity and most game
+      logics don't need them.
+    
