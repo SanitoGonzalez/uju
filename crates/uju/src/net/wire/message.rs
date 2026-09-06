@@ -1,5 +1,5 @@
-use crate::wire::error::{Result, need};
-use crate::wire::write::Writer;
+use crate::net::wire::error::{Result, need};
+use crate::net::wire::write::Writer;
 
 /// A zero-copy view of an encoded message.
 pub trait MessageView<'a>: Copy + Sized {

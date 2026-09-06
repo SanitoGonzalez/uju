@@ -8,9 +8,9 @@
 use core::cmp::Ordering;
 use core::marker::PhantomData;
 
-use crate::wire::collections::{Map, Set};
-use crate::wire::error::{Error, Result, need};
-use crate::wire::traits::{
+use crate::net::wire::collections::{Map, Set};
+use crate::net::wire::error::{Error, Result, need};
+use crate::net::wire::traits::{
     Canonical, Entry, Layout, View, element_align, element_end, entry, fixed_size, pad,
     read_element, validate_element, validate_fixed,
 };

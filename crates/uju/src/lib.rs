@@ -5,7 +5,6 @@ pub mod math;
 pub mod mesh;
 pub mod net;
 pub mod util;
-pub mod wire;
 
 #[doc(hidden)]
 pub use linkme;

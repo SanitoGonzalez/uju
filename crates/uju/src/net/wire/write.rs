@@ -1,4 +1,4 @@
-use crate::wire::error::{Error, Result};
+use crate::net::wire::error::{Error, Result};
 
 /// An append-only cursor over a message buffer. Padding is zero-filled, so a
 /// value is written by aligning — or seeking to a known offset — and pushing.
