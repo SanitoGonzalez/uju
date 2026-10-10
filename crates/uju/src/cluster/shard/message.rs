@@ -1,7 +1,7 @@
 use smallvec::SmallVec;
 
+use crate::cluster::{node, shard};
 use crate::ecs::entity::UniversalEntity;
-use crate::mesh::{node, shard};
 
 pub struct Frame {
     pub node: node::Id,

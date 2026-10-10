@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::cluster::{node, shard};
 use crate::ecs::entity::{Entity, UniversalEntity};
-use crate::mesh::{node, shard};
 
 /// What a `link` displaced. `local` is a proxy nothing maps anymore - the caller must despawn it.
 #[must_use]

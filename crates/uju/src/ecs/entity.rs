@@ -2,7 +2,7 @@ pub mod allocator;
 
 use std::fmt;
 
-use crate::mesh::{node, shard};
+use crate::cluster::{node, shard};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]
