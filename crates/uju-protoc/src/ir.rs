@@ -12,17 +12,12 @@ pub struct NamespaceId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(pub usize);
 
-/// Index of a [`Const`] in [`Schema::consts`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConstId(pub usize);
-
 /// A set of schema sources lowered into one unit. Sources sharing a
 /// `namespace` are merged into a single [`Namespace`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
     pub namespaces: Vec<Namespace>,
     pub defs: Vec<Def>,
-    pub consts: Vec<Const>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +70,16 @@ pub struct Struct {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
-    pub response: Option<TypeId>,
+    pub direction: Direction,
     pub fields: Vec<Field>,
+}
+
+/// Which way a message travels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    In,
+    Out,
+    Bi,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,8 +89,15 @@ pub struct Field {
     pub optional: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Type {
+/// A type along with the constraints its values must satisfy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Type {
+    pub kind: TypeKind,
+    pub constraints: Constraints,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeKind {
     I8,
     I16,
     I32,
@@ -113,26 +123,31 @@ pub enum Type {
     Named(TypeId),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Const {
-    pub namespace: NamespaceId,
-    /// The declaration this one is nested in, if any.
-    pub parent: Option<TypeId>,
-    pub name: String,
-    pub ty: Type,
-    pub value: Value,
+/// Constraints on a value, checked by the validation step. Which apply
+/// depends on the type: `min`/`max` on numbers, `infinite`/`nan` on floats,
+/// `min_length`/`max_length` on strings, bytes, and variable-size
+/// collections.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Constraints {
+    /// Inclusive lower bound of a number.
+    pub min: Option<Number>,
+    /// Inclusive upper bound of a number.
+    pub max: Option<Number>,
+    /// Inclusive lower bound on the length of a string, bytes, or collection.
+    pub min_length: Option<u64>,
+    /// Inclusive upper bound on the length of a string, bytes, or collection.
+    pub max_length: Option<u64>,
+    /// Whether a float may be infinite; floats are finite by default.
+    pub infinite: bool,
+    /// Whether a float may be NaN; floats are not NaN by default.
+    pub nan: bool,
 }
 
-/// An evaluated constant.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Bool(bool),
+/// A bound, typed after the number it constrains.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Number {
     Int(i128),
     Float(f64),
-    /// Strings are stored with their escapes decoded.
-    Str(String),
-    /// A variant of the enum, by index into its variant list.
-    EnumVariant(TypeId, usize),
 }
 
 impl Schema {
@@ -156,6 +171,31 @@ impl Schema {
         }
         path.reverse();
         path
+    }
+}
+
+impl From<TypeKind> for Type {
+    fn from(kind: TypeKind) -> Self {
+        Type {
+            kind,
+            constraints: Constraints::default(),
+        }
+    }
+}
+
+impl Constraints {
+    pub fn is_empty(&self) -> bool {
+        *self == Constraints::default()
+    }
+}
+
+impl Direction {
+    pub fn name(self) -> &'static str {
+        match self {
+            Direction::In => "in",
+            Direction::Out => "out",
+            Direction::Bi => "bi",
+        }
     }
 }
 
@@ -192,5 +232,44 @@ impl EnumRepr {
 impl fmt::Display for EnumRepr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+/// Prints as written in source, `[min=0, max=10]`, or nothing when empty.
+impl fmt::Display for Constraints {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut entries = Vec::new();
+        if let Some(min) = self.min {
+            entries.push(format!("min={min}"));
+        }
+        if let Some(max) = self.max {
+            entries.push(format!("max={max}"));
+        }
+        if let Some(min_length) = self.min_length {
+            entries.push(format!("min_length={min_length}"));
+        }
+        if let Some(max_length) = self.max_length {
+            entries.push(format!("max_length={max_length}"));
+        }
+        if self.infinite {
+            entries.push("infinite".to_string());
+        }
+        if self.nan {
+            entries.push("nan".to_string());
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        write!(f, "[{}]", entries.join(", "))
+    }
+}
+
+impl fmt::Display for Number {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Number::Int(value) => write!(f, "{value}"),
+            // `{:?}` keeps the fraction of whole floats: `1.0`, not `1`.
+            Number::Float(value) => write!(f, "{value:?}"),
+        }
     }
 }

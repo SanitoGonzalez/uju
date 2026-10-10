@@ -3,7 +3,7 @@ namespace hello;
 
 use foo.bar;
 
-message ExternalTypes {
-    velocity: Velocity,
+message[in] ExternalTypes {
+    color: Color,
     position: foo.bar.Position, // explicit type import
 }

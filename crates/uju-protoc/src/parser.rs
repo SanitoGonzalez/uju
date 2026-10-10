@@ -58,6 +58,31 @@ where
         })
         .labelled("path");
 
+    let number = select! {
+        Token::Int(value) => Number::Int(value),
+        Token::Float(value) => Number::Float(value),
+    }
+    .map_with(|value, e| (value, e.span()))
+    .labelled("number");
+
+    let constraint = ident
+        .then(just(Token::Equal).ignore_then(number).or_not())
+        .map_with(|(name, value), e| Constraint {
+            name,
+            value,
+            span: e.span(),
+        })
+        .labelled("constraint");
+
+    let constraints = constraint
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::BracketOpen), just(Token::BracketClose))
+        .or_not()
+        .map(Option::unwrap_or_default);
+
     let ty = recursive(|ty| {
         let len = select! { Token::Int(value) => value }.try_map(|value, span: Span| {
             u32::try_from(value)
@@ -72,8 +97,12 @@ where
             .map(|item| TypeKind::Vec(Box::new(item)));
 
         let set_ty = just(Token::Ident("set"))
-            .ignore_then(arg)
+            .ignore_then(arg.clone())
             .map(|item| TypeKind::Set(Box::new(item)));
+
+        let option_ty = just(Token::Ident("option"))
+            .ignore_then(arg)
+            .map(|item| TypeKind::Option(Box::new(item)));
 
         let map_ty = just(Token::Ident("map"))
             .ignore_then(
@@ -103,50 +132,30 @@ where
         let named_ty = path
             .clone()
             .try_map(|path, span: Span| match path.segments[..] {
-                [(name, _)] if matches!(name, "vec" | "set" | "map" | "array") => Err(
+                [(name, _)] if matches!(name, "vec" | "set" | "map" | "array" | "option") => Err(
                     Rich::custom(span, format!("`{name}` requires type arguments")),
                 ),
                 _ => Ok(TypeKind::Named(path)),
             });
 
-        choice((vec_ty, set_ty, map_ty, array_ty, prim_ty, named_ty))
-            .map_with(|kind, e| Type {
-                kind,
-                span: e.span(),
-            })
-            .labelled("type")
-            .boxed()
+        choice((
+            vec_ty, set_ty, map_ty, array_ty, option_ty, prim_ty, named_ty,
+        ))
+        .then(constraints)
+        .map_with(|(kind, constraints), e| Type {
+            kind,
+            constraints,
+            span: e.span(),
+        })
+        .labelled("type")
+        .boxed()
     });
 
     let field = ident
         .then_ignore(just(Token::Colon))
-        .then(ty.clone())
-        .then(just(Token::Question).or_not())
-        .map(|((name, ty), question)| Field {
-            name,
-            ty,
-            optional: question.is_some(),
-        })
-        .boxed();
-
-    let value = select! {
-        Token::Bool(value) => Value::Bool(value),
-        Token::Int(value) => Value::Int(value),
-        Token::Float(value) => Value::Float(value),
-        Token::Str(value) => Value::Str(value),
-    }
-    .or(path.clone().map(Value::Path))
-    .map_with(|value, e| (value, e.span()))
-    .labelled("value");
-
-    let const_item = just(Token::Const)
-        .ignore_then(ident)
-        .then_ignore(just(Token::Colon))
         .then(ty)
-        .then_ignore(just(Token::Equal))
-        .then(value)
-        .then_ignore(just(Token::Semicolon))
-        .map(|((name, ty), value)| Item::Const(Const { name, ty, value }));
+        .map(|(name, ty)| Field { name, ty })
+        .boxed();
 
     let repr = just(Token::Colon)
         .ignore_then(
@@ -209,19 +218,29 @@ where
             .then(body.clone())
             .map(|(name, body)| Item::Struct(Struct { name, body }));
 
+        let direction = ident
+            .try_map(|(name, span), _: Span| match Direction::from_name(name) {
+                Some(direction) => Ok((direction, span)),
+                None => Err(Rich::custom(
+                    span,
+                    format!("`{name}` is not a direction; expected `in`, `out`, or `bi`"),
+                )),
+            })
+            .delimited_by(just(Token::BracketOpen), just(Token::BracketClose));
+
         let message_item = just(Token::Message)
-            .ignore_then(ident)
-            .then(just(Token::Arrow).ignore_then(path.clone()).or_not())
+            .ignore_then(direction)
+            .then(ident)
             .then(body)
-            .map(|((name, response), body)| {
+            .map(|((direction, name), body)| {
                 Item::Message(Message {
+                    direction,
                     name,
-                    response,
                     body,
                 })
             });
 
-        choice((const_item, enum_item, struct_item, message_item))
+        choice((enum_item, struct_item, message_item))
             .labelled("declaration")
             .boxed()
     });
@@ -314,10 +333,7 @@ mod tests {
             .expect("a body")
             .fields
             .iter()
-            .map(|field| {
-                let optional = if field.optional { "?" } else { "" };
-                format!("{}: {}{}", field.name.0, field.ty, optional)
-            })
+            .map(|field| format!("{}: {}", field.name.0, field.ty))
             .collect()
     }
 
@@ -329,18 +345,6 @@ mod tests {
         let schema = schema_of(SAMPLE1);
         assert_eq!(schema.namespace.to_string(), "foo.bar");
         assert!(schema.uses.is_empty());
-
-        let Item::Const(number_one) = item(&schema, "NumberOne") else {
-            panic!("expected a const");
-        };
-        assert_eq!(number_one.ty.to_string(), "i32");
-        assert_eq!(number_one.value.0, Value::Int(1));
-
-        let Item::Const(favorite) = item(&schema, "FavoriteColor") else {
-            panic!("expected a const");
-        };
-        assert_eq!(favorite.ty.to_string(), "Color");
-        assert_eq!(favorite.value.0.to_string(), "Color.Red");
 
         let Item::Enum(color) = item(&schema, "Color") else {
             panic!("expected an enum");
@@ -361,88 +365,178 @@ mod tests {
         assert!(numbers.repr.is_none(), "the repr defaults to u32");
 
         assert_eq!(item(&schema, "EmptyStruct").body(), Some(&Body::default()));
-        assert_eq!(fields(item(&schema, "Velocity")), ["x: f32", "y: f32"]);
+        assert_eq!(fields(item(&schema, "Position")), ["x: f32", "y: f32"]);
     }
 
     #[test]
     fn builtin_types_are_recognized() {
-        let schema = schema_of(SAMPLE1);
+        let names = [
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "i8",
+            "i16",
+            "i32",
+            "i64",
+            "bool",
+            "f32",
+            "f64",
+            "timestamp",
+            "interval",
+            "entity",
+            "uentity",
+            "uuid",
+            "string",
+            "bytes",
+        ];
+        let body: String = names
+            .iter()
+            .map(|name| format!("f_{name}: {name}, "))
+            .collect();
+        let src = format!("namespace a;\nmessage[in] M {{ {body} }}\n");
+        let schema = schema_of(&src);
         assert_eq!(
-            fields(item(&schema, "Scalars")),
-            [
-                "uint8: u8",
-                "uint16: u16",
-                "uint32: u32",
-                "uint64: u64",
-                "int8: i8",
-                "int16: i16",
-                "int32: i32",
-                "int64: i64",
-                "boolean: bool",
-                "float32: f32",
-                "float64: f64",
-                "ts: timestamp",
-                "it: interval",
-                "et: entity",
-                "uet: uentity",
-                "id: uuid",
-            ]
+            fields(item(&schema, "M")),
+            names.map(|name| format!("f_{name}: {name}"))
         );
+        let Some(Field { ty, .. }) = item(&schema, "M").body().unwrap().fields.first() else {
+            panic!("expected a field");
+        };
+        assert_eq!(ty.kind, TypeKind::Prim(Prim::U8));
     }
 
     #[test]
-    fn containers_nest_and_only_fields_are_optional() {
-        let schema = schema_of(SAMPLE1);
+    fn containers_and_options_nest() {
+        let src = concat!(
+            "namespace a;\n",
+            "message[bi] M {\n",
+            "    v: vec<i32>,\n",
+            "    s: set<i32>,\n",
+            "    m: map<i32, i32>,\n",
+            "    ar: array<i32, 4>,\n",
+            "    v2d: vec<vec<Position>>,\n",
+            "    m2: map<u8, vec<Position>>,\n",
+            "    o: option<i32>,\n",
+            "    op: option<foo.Position>,\n",
+            "}\n",
+        );
         assert_eq!(
-            fields(item(&schema, "NonScalars")),
+            fields(item(&schema_of(src), "M")),
             [
                 "v: vec<i32>",
                 "s: set<i32>",
                 "m: map<i32, i32>",
                 "ar: array<i32, 4>",
-                "v1: vec<Position>",
-                "v2: vec<Velocity>",
                 "v2d: vec<vec<Position>>",
-                "vs: vec<set<i32>>",
-                "vo: vec<i32>?",
-                "s1: set<Position>",
-                "m1: map<u32, Position>",
                 "m2: map<u8, vec<Position>>",
-                "str: string",
-                "b: bytes",
+                "o: option<i32>",
+                "op: option<foo.Position>",
             ]
-        );
-
-        assert_eq!(
-            errors_of("namespace a;\nstruct S { v: vec<i32?> }\n")[0].message,
-            "found '?' expected '>'"
         );
     }
 
     #[test]
-    fn messages_carry_a_response_and_nested_declarations() {
+    fn messages_carry_a_direction_and_nested_declarations() {
         let schema = schema_of(SAMPLE1);
 
-        let Item::Message(request) = item(&schema, "MyRequest") else {
-            panic!("expected a message");
+        let direction = |name: &str| {
+            let Item::Message(message) = item(&schema, name) else {
+                panic!("expected a message");
+            };
+            message.direction.0
         };
+        assert_eq!(direction("Ping"), Direction::Bi);
+        assert_eq!(direction("MyRequest"), Direction::In);
+        assert_eq!(direction("MyResponse"), Direction::Out);
         assert_eq!(
-            request.response.as_ref().map(Path::to_string),
-            Some("MyResponse".to_string())
+            fields(item(&schema, "MyRequest")),
+            [
+                "foo: i32[min=-100, max=100]",
+                "name: string[min_length=2, max_length=12]",
+                "addresses: vec<string[max_length=16]>[max_length=14]",
+            ]
         );
-        assert_eq!(fields(item(&schema, "MyRequest")), ["foo: i32"]);
+        assert_eq!(fields(item(&schema, "MyResponse")), ["result: Result"]);
 
         let Item::Message(response) = item(&schema, "MyResponse") else {
             panic!("expected a message");
         };
-        assert!(response.response.is_none());
-        assert_eq!(fields(item(&schema, "MyResponse")), ["result: Result"]);
-
         let [Item::Enum(result)] = &response.body.items[..] else {
             panic!("expected a nested enum");
         };
         assert_eq!(result.name.0, "Result");
         assert_eq!(result.variants.len(), 2);
+    }
+
+    #[test]
+    fn constraints_bind_to_the_type_they_follow() {
+        let src = concat!(
+            "namespace a;\n",
+            "message[in] M {\n",
+            "    foo: i32[min=-100, max=100],\n",
+            "    f: f32[infinite, min=0.5,],\n",
+            "    v: vec<string[max_length=14]>[min_length=1],\n",
+            "    o: option<u8[max=3]>,\n",
+            "}\n",
+        );
+        let schema = schema_of(src);
+        assert_eq!(
+            fields(item(&schema, "M")),
+            [
+                "foo: i32[min=-100, max=100]",
+                "f: f32[infinite, min=0.5]",
+                "v: vec<string[max_length=14]>[min_length=1]",
+                "o: option<u8[max=3]>",
+            ]
+        );
+
+        let field = &item(&schema, "M").body().unwrap().fields[2];
+        assert_eq!(
+            &src[field.ty.span.clone()],
+            "vec<string[max_length=14]>[min_length=1]"
+        );
+        assert_eq!(field.ty.constraints[0].name.0, "min_length");
+        let TypeKind::Vec(element) = &field.ty.kind else {
+            panic!("expected a vec");
+        };
+        assert_eq!(element.constraints[0].name.0, "max_length");
+        assert_eq!(
+            element.constraints[0].value.as_ref().map(|(v, _)| *v),
+            Some(Number::Int(14))
+        );
+    }
+
+    #[test]
+    fn malformed_constraints_are_reported() {
+        assert_eq!(
+            errors_of("namespace a;\nstruct S { x: i32[] }\n")[0].message,
+            "found ']' expected constraint"
+        );
+        assert_eq!(
+            errors_of("namespace a;\nstruct S { x: i32[min=] }\n")[0].message,
+            "found ']' expected number"
+        );
+    }
+
+    #[test]
+    fn a_direction_is_required() {
+        assert_eq!(
+            errors_of("namespace a;\nmessage M {}\n")[0].message,
+            "found 'M' expected '['"
+        );
+        assert_eq!(
+            errors_of("namespace a;\nmessage[up] M {}\n")[0].message,
+            "`up` is not a direction; expected `in`, `out`, or `bi`"
+        );
+    }
+
+    #[test]
+    fn constants_are_not_declarations() {
+        assert_eq!(
+            errors_of("namespace a;\nconst A: i32 = 1;\n")[0].message,
+            "found 'const' expected 'use', declaration, or end of input"
+        );
     }
 
     #[test]
@@ -455,7 +549,7 @@ mod tests {
         );
         assert_eq!(
             fields(item(&schema, "ExternalTypes")),
-            ["velocity: Velocity", "position: foo.bar.Position"]
+            ["color: Color", "position: foo.bar.Position"]
         );
     }
 
@@ -482,7 +576,7 @@ mod tests {
         }
         assert_eq!(
             errors_of("namespace a;\nstruct S { a: i32 b: i32 }\n")[0].message,
-            "found 'b' expected '?', ',', or '}'"
+            "found 'b' expected '[', ',', or '}'"
         );
     }
 
@@ -490,6 +584,10 @@ mod tests {
     fn malformed_types_are_reported() {
         assert_eq!(
             errors_of("namespace a;\nstruct S { v: vec }\n")[0].message,
+            "found '}' expected '<'"
+        );
+        assert_eq!(
+            errors_of("namespace a;\nstruct S { o: option }\n")[0].message,
             "found '}' expected '<'"
         );
         assert_eq!(

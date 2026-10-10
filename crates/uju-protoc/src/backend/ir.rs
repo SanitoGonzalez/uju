@@ -2,7 +2,7 @@
 //! qualified and every type spelled the way it is written in source.
 
 use crate::backend::{Backend, Error, GeneratedFile};
-use crate::ir::{self, DefKind, NamespaceId, Type, TypeId, Value};
+use crate::ir::{self, DefKind, NamespaceId, Type, TypeId, TypeKind};
 
 pub struct Ir;
 
@@ -31,14 +31,6 @@ fn namespace(schema: &ir::Schema, id: NamespaceId, name: &str) -> String {
             json.item();
             def_json(&mut json, schema, TypeId(index));
         }
-    }
-    json.end(']');
-
-    json.key("consts");
-    json.begin('[');
-    for konst in schema.consts.iter().filter(|konst| konst.namespace == id) {
-        json.item();
-        const_json(&mut json, schema, konst);
     }
     json.end(']');
 
@@ -86,10 +78,7 @@ fn def_json(json: &mut Json, schema: &ir::Schema, id: TypeId) {
         }
         DefKind::Message(item) => {
             json.entry("kind", "message");
-            match item.response {
-                Some(response) => json.entry("response", &qualified(schema, response)),
-                None => json.entry_null("response"),
-            }
+            json.entry("direction", item.direction.name());
             json.key("fields");
             json.begin('[');
             for field in &item.fields {
@@ -107,75 +96,41 @@ fn def_json(json: &mut Json, schema: &ir::Schema, id: TypeId) {
     json.end('}');
 }
 
-fn const_json(json: &mut Json, schema: &ir::Schema, konst: &ir::Const) {
-    json.begin('{');
-    json.entry("name", &konst.name);
-    json.entry("path", &qualified_const(schema, konst));
-    match konst.parent {
-        Some(parent) => json.entry("parent", &qualified(schema, parent)),
-        None => json.entry_null("parent"),
-    }
-    json.entry("type", &type_name(schema, &konst.ty));
-    json.key("value");
-    value_json(json, schema, &konst.value);
-    json.end('}');
-}
-
-fn value_json(json: &mut Json, schema: &ir::Schema, value: &Value) {
-    match value {
-        Value::Bool(value) => json.raw(if *value { "true" } else { "false" }),
-        Value::Int(value) => json.raw(&value.to_string()),
-        // Infinities and NaN have no JSON spelling; fall back to a string.
-        Value::Float(value) if value.is_finite() => json.raw(&format!("{value:?}")),
-        Value::Float(value) => json.quoted(&value.to_string()),
-        Value::Str(value) => json.quoted(value),
-        Value::EnumVariant(id, index) => {
-            let DefKind::Enum(item) = &schema.def(*id).kind else {
-                unreachable!("an enum variant constant names an enum");
-            };
-            json.quoted(&format!(
-                "{}.{}",
-                qualified(schema, *id),
-                item.variants[*index].name
-            ));
-        }
-    }
-}
-
-/// The type as it would be written in source, with named types qualified:
-/// `map<u32, vec<foo.bar.Position>>`.
+/// The type as it would be written in source, with named types qualified
+/// and constraints in canonical order: `vec<foo.bar.Position>[max_length=8]`.
 fn type_name(schema: &ir::Schema, ty: &Type) -> String {
-    match ty {
-        Type::I8 => "i8".to_string(),
-        Type::I16 => "i16".to_string(),
-        Type::I32 => "i32".to_string(),
-        Type::I64 => "i64".to_string(),
-        Type::U8 => "u8".to_string(),
-        Type::U16 => "u16".to_string(),
-        Type::U32 => "u32".to_string(),
-        Type::U64 => "u64".to_string(),
-        Type::F32 => "f32".to_string(),
-        Type::F64 => "f64".to_string(),
-        Type::Bool => "bool".to_string(),
-        Type::Timestamp => "timestamp".to_string(),
-        Type::Interval => "interval".to_string(),
-        Type::Entity => "entity".to_string(),
-        Type::UEntity => "uentity".to_string(),
-        Type::Uuid => "uuid".to_string(),
-        Type::String => "string".to_string(),
-        Type::Bytes => "bytes".to_string(),
-        Type::Array(item, len) => format!("array<{}, {len}>", type_name(schema, item)),
-        Type::Vec(item) => format!("vec<{}>", type_name(schema, item)),
-        Type::Set(item) => format!("set<{}>", type_name(schema, item)),
-        Type::Map(key, value) => {
+    let name = match &ty.kind {
+        TypeKind::I8 => "i8".to_string(),
+        TypeKind::I16 => "i16".to_string(),
+        TypeKind::I32 => "i32".to_string(),
+        TypeKind::I64 => "i64".to_string(),
+        TypeKind::U8 => "u8".to_string(),
+        TypeKind::U16 => "u16".to_string(),
+        TypeKind::U32 => "u32".to_string(),
+        TypeKind::U64 => "u64".to_string(),
+        TypeKind::F32 => "f32".to_string(),
+        TypeKind::F64 => "f64".to_string(),
+        TypeKind::Bool => "bool".to_string(),
+        TypeKind::Timestamp => "timestamp".to_string(),
+        TypeKind::Interval => "interval".to_string(),
+        TypeKind::Entity => "entity".to_string(),
+        TypeKind::UEntity => "uentity".to_string(),
+        TypeKind::Uuid => "uuid".to_string(),
+        TypeKind::String => "string".to_string(),
+        TypeKind::Bytes => "bytes".to_string(),
+        TypeKind::Array(item, len) => format!("array<{}, {len}>", type_name(schema, item)),
+        TypeKind::Vec(item) => format!("vec<{}>", type_name(schema, item)),
+        TypeKind::Set(item) => format!("set<{}>", type_name(schema, item)),
+        TypeKind::Map(key, value) => {
             format!(
                 "map<{}, {}>",
                 type_name(schema, key),
                 type_name(schema, value)
             )
         }
-        Type::Named(id) => qualified(schema, *id),
-    }
+        TypeKind::Named(id) => qualified(schema, *id),
+    };
+    format!("{name}{}", ty.constraints)
 }
 
 /// A declaration's namespace, the declarations it is nested in, and its own
@@ -186,16 +141,6 @@ fn qualified(schema: &ir::Schema, id: TypeId) -> String {
         name.push('.');
         name.push_str(segment);
     }
-    name
-}
-
-fn qualified_const(schema: &ir::Schema, konst: &ir::Const) -> String {
-    let mut name = match konst.parent {
-        Some(parent) => qualified(schema, parent),
-        None => schema.namespace(konst.namespace).name.join("."),
-    };
-    name.push('.');
-    name.push_str(&konst.name);
     name
 }
 
@@ -347,15 +292,33 @@ mod tests {
             contents.contains(r#""parent": "foo.bar.MyResponse""#),
             "{contents}"
         );
-        assert!(
-            contents.contains(r#""response": "foo.bar.MyResponse""#),
-            "{contents}"
-        );
+    }
+
+    #[test]
+    fn messages_carry_their_direction() {
+        let contents = only(&[SAMPLE1]);
+        for direction in ["in", "out", "bi"] {
+            assert!(
+                contents.contains(&format!(r#""direction": "{direction}""#)),
+                "{contents}"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_fields_are_flagged() {
+        let contents = only(&["namespace a;\nmessage[in] M { o: option<string> }\n"]);
+        assert!(contents.contains(r#""type": "string""#), "{contents}");
+        assert!(contents.contains(r#""optional": true"#), "{contents}");
     }
 
     #[test]
     fn types_are_spelled_out_and_qualified() {
-        let contents = only(&[SAMPLE1]);
+        let contents = only(&[concat!(
+            "namespace foo.bar;\n",
+            "struct Position { x: f32 }\n",
+            "message[in] M { m: map<u8, vec<Position>>, a: array<i32, 4> }\n",
+        )]);
         assert!(
             contents.contains(r#""type": "map<u8, vec<foo.bar.Position>>""#),
             "{contents}"
@@ -367,25 +330,28 @@ mod tests {
     }
 
     #[test]
-    fn constants_carry_their_evaluated_value() {
-        let contents = only(&[SAMPLE1]);
-        assert!(contents.contains(r#""value": 1"#), "{contents}");
+    fn constraints_follow_their_type() {
+        let contents = only(&[concat!(
+            "namespace a;\n",
+            "message[in] M {\n",
+            "    v: vec<string[max_length=14]>[max_length=10, min_length=1],\n",
+            "    f: f64[nan, infinite, max=1],\n",
+            "}\n",
+        )]);
         assert!(
-            contents.contains(r#""value": "foo.bar.Color.Red""#),
+            contents
+                .contains(r#""type": "vec<string[max_length=14]>[min_length=1, max_length=10]""#),
             "{contents}"
         );
-    }
-
-    #[test]
-    fn strings_are_escaped() {
-        let contents = only(&["namespace a;\nconst Q: string = \"a\\\"b\\n\";\n"]);
-        assert!(contents.contains(r#""value": "a\"b\n""#), "{contents}");
+        assert!(
+            contents.contains(r#""type": "f64[max=1.0, infinite, nan]""#),
+            "{contents}"
+        );
     }
 
     #[test]
     fn empty_containers_stay_on_one_line() {
         let contents = only(&["namespace a;\nstruct S {}\n"]);
         assert!(contents.contains(r#""fields": []"#), "{contents}");
-        assert!(contents.contains(r#""consts": []"#), "{contents}");
     }
 }

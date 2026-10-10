@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::fmt;
 
 use logos::Logos;
@@ -18,9 +17,6 @@ pub enum Token<'src> {
     #[token("use")]
     Use,
 
-    #[token("const")]
-    Const,
-
     #[token("enum")]
     Enum,
 
@@ -35,6 +31,12 @@ pub enum Token<'src> {
 
     #[token("}")]
     BraceClose,
+
+    #[token("[")]
+    BracketOpen,
+
+    #[token("]")]
+    BracketClose,
 
     #[token("<")]
     Lt,
@@ -57,18 +59,8 @@ pub enum Token<'src> {
     #[token("=")]
     Equal,
 
-    #[token("?")]
-    Question,
-
-    #[token("->")]
-    Arrow,
-
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice())]
     Ident(&'src str),
-
-    #[token("true", |_| true)]
-    #[token("false", |_| false)]
-    Bool(bool),
 
     #[regex(r"-?[0-9]+", int)]
     #[regex(r"-?[0-9]+(\.[0-9]+)?[A-Za-z_][0-9A-Za-z_]*", malformed_number)]
@@ -76,10 +68,6 @@ pub enum Token<'src> {
 
     #[regex(r"-?[0-9]+\.[0-9]+", float)]
     Float(f64),
-
-    #[regex(r#""([^"\\\n]|\\.)*""#, string)]
-    #[regex(r#""([^"\\\n]|\\.)*"#, unterminated_string)]
-    Str(&'src str),
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +76,6 @@ pub enum LexError {
     UnexpectedChar,
     IntOverflow,
     FloatOverflow,
-    UnterminatedString,
-    InvalidEscape,
     UnterminatedComment,
     MalformedNumber,
 }
@@ -116,33 +102,6 @@ pub fn lex(src: &str) -> (Vec<Spanned<Token<'_>>>, Vec<Spanned<LexError>>) {
     (tokens, errors)
 }
 
-/// Decode the escape sequences of a string literal's contents, as carried by
-/// [`Token::Str`].
-pub fn unescape(contents: &str) -> Cow<'_, str> {
-    if !contents.contains('\\') {
-        return Cow::Borrowed(contents);
-    }
-
-    let mut out = String::with_capacity(contents.len());
-    let mut chars = contents.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('0') => out.push('\0'),
-            // `\\` and `\"`; anything else is rejected while lexing
-            Some(c) => out.push(c),
-            None => {}
-        }
-    }
-    Cow::Owned(out)
-}
-
 type Callback<T> = Result<T, LexError>;
 
 fn int<'src>(lex: &mut logos::Lexer<'src, Token<'src>>) -> Callback<i128> {
@@ -154,24 +113,6 @@ fn float<'src>(lex: &mut logos::Lexer<'src, Token<'src>>) -> Callback<f64> {
         Ok(value) if value.is_finite() => Ok(value),
         _ => Err(LexError::FloatOverflow),
     }
-}
-
-fn string<'src>(lex: &mut logos::Lexer<'src, Token<'src>>) -> Callback<&'src str> {
-    let slice = lex.slice();
-    let contents = &slice[1..slice.len() - 1];
-
-    let mut chars = contents.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' && !matches!(chars.next(), Some('\\' | '"' | 'n' | 'r' | 't' | '0')) {
-            return Err(LexError::InvalidEscape);
-        }
-    }
-
-    Ok(contents)
-}
-
-fn unterminated_string<'src>(_: &mut logos::Lexer<'src, Token<'src>>) -> Callback<&'src str> {
-    Err(LexError::UnterminatedString)
 }
 
 fn malformed_number<'src>(_: &mut logos::Lexer<'src, Token<'src>>) -> Callback<i128> {
@@ -211,12 +152,13 @@ impl fmt::Display for Token<'_> {
         match self {
             Token::Namespace => f.write_str("namespace"),
             Token::Use => f.write_str("use"),
-            Token::Const => f.write_str("const"),
             Token::Enum => f.write_str("enum"),
             Token::Struct => f.write_str("struct"),
             Token::Message => f.write_str("message"),
             Token::BraceOpen => f.write_str("{"),
             Token::BraceClose => f.write_str("}"),
+            Token::BracketOpen => f.write_str("["),
+            Token::BracketClose => f.write_str("]"),
             Token::Lt => f.write_str("<"),
             Token::Gt => f.write_str(">"),
             Token::Colon => f.write_str(":"),
@@ -224,13 +166,9 @@ impl fmt::Display for Token<'_> {
             Token::Comma => f.write_str(","),
             Token::Dot => f.write_str("."),
             Token::Equal => f.write_str("="),
-            Token::Question => f.write_str("?"),
-            Token::Arrow => f.write_str("->"),
             Token::Ident(s) => f.write_str(s),
-            Token::Bool(b) => write!(f, "{b}"),
             Token::Int(x) => write!(f, "{x}"),
             Token::Float(x) => write!(f, "{x}"),
-            Token::Str(s) => write!(f, "\"{s}\""),
         }
     }
 }
@@ -241,8 +179,6 @@ impl fmt::Display for LexError {
             LexError::UnexpectedChar => f.write_str("unexpected character"),
             LexError::IntOverflow => f.write_str("integer literal out of range"),
             LexError::FloatOverflow => f.write_str("float literal out of range"),
-            LexError::UnterminatedString => f.write_str("unterminated string literal"),
-            LexError::InvalidEscape => f.write_str("unknown escape sequence"),
             LexError::UnterminatedComment => f.write_str("unterminated block comment"),
             LexError::MalformedNumber => f.write_str("malformed number literal"),
         }
@@ -270,21 +206,22 @@ mod tests {
     #[test]
     fn keywords_and_punctuation() {
         assert_eq!(
-            tokens("namespace use const enum struct message"),
+            tokens("namespace use enum struct message"),
             [
                 Token::Namespace,
                 Token::Use,
-                Token::Const,
                 Token::Enum,
                 Token::Struct,
                 Token::Message,
             ]
         );
         assert_eq!(
-            tokens("{ } < > : ; , . = ? ->"),
+            tokens("{ } [ ] < > : ; , . ="),
             [
                 Token::BraceOpen,
                 Token::BraceClose,
+                Token::BracketOpen,
+                Token::BracketClose,
                 Token::Lt,
                 Token::Gt,
                 Token::Colon,
@@ -292,8 +229,6 @@ mod tests {
                 Token::Comma,
                 Token::Dot,
                 Token::Equal,
-                Token::Question,
-                Token::Arrow,
             ]
         );
     }
@@ -332,16 +267,14 @@ mod tests {
     #[test]
     fn literals() {
         assert_eq!(
-            tokens(r#"0 42 -7 1.5 -0.25 true false "hi""#),
+            tokens("0 42 -7 1.5 -0.25 true"),
             [
                 Token::Int(0),
                 Token::Int(42),
                 Token::Int(-7),
                 Token::Float(1.5),
                 Token::Float(-0.25),
-                Token::Bool(true),
-                Token::Bool(false),
-                Token::Str("hi"),
+                Token::Ident("true"),
             ]
         );
     }
@@ -355,14 +288,32 @@ mod tests {
     }
 
     #[test]
-    fn arrow_is_not_a_negative_number() {
+    fn constraints() {
         assert_eq!(
-            tokens("message A -> B"),
+            tokens("i32[min=-100, infinite]"),
+            [
+                Token::Ident("i32"),
+                Token::BracketOpen,
+                Token::Ident("min"),
+                Token::Equal,
+                Token::Int(-100),
+                Token::Comma,
+                Token::Ident("infinite"),
+                Token::BracketClose,
+            ]
+        );
+    }
+
+    #[test]
+    fn direction_attributes() {
+        assert_eq!(
+            tokens("message[in] A"),
             [
                 Token::Message,
+                Token::BracketOpen,
+                Token::Ident("in"),
+                Token::BracketClose,
                 Token::Ident("A"),
-                Token::Arrow,
-                Token::Ident("B"),
             ]
         );
     }
@@ -383,17 +334,17 @@ mod tests {
 
     #[test]
     fn comments_and_whitespace_are_skipped() {
-        let src = "// leading\r\nconst A: i32 = 1; // trailing, no newline at eof";
+        let src = "// leading\r\nenum A { B = 1 } // trailing, no newline at eof";
         assert_eq!(
             tokens(src),
             [
-                Token::Const,
+                Token::Enum,
                 Token::Ident("A"),
-                Token::Colon,
-                Token::Ident("i32"),
+                Token::BraceOpen,
+                Token::Ident("B"),
                 Token::Equal,
                 Token::Int(1),
-                Token::Semicolon,
+                Token::BraceClose,
             ]
         );
     }
@@ -407,16 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn escapes_are_kept_raw_and_decoded_on_demand() {
-        let [Token::Str(contents)] = tokens(r#""a\nb\\c\"d""#)[..] else {
-            panic!("expected a single string token");
-        };
-        assert_eq!(contents, r#"a\nb\\c\"d"#);
-        assert_eq!(unescape(contents), "a\nb\\c\"d");
-        assert!(matches!(unescape("plain"), Cow::Borrowed("plain")));
-    }
-
-    #[test]
     fn unknown_characters_are_reported_as_one_run() {
         assert_eq!(errors("a $$$ b"), [(LexError::UnexpectedChar, 2..5)]);
         assert_eq!(
@@ -426,6 +367,15 @@ mod tests {
                 (LexError::UnexpectedChar, 4..5),
             ]
         );
+
+        // `?` and `->` are no longer part of the language.
+        assert_eq!(
+            errors("i32? -> B"),
+            [
+                (LexError::UnexpectedChar, 3..4),
+                (LexError::UnexpectedChar, 5..6),
+            ]
+        );
     }
 
     #[test]
@@ -433,15 +383,6 @@ mod tests {
         assert_eq!(
             errors("340282366920938463463374607431768211456"),
             [(LexError::IntOverflow, 0..39)]
-        );
-        assert_eq!(errors(r#""oops"#), [(LexError::UnterminatedString, 0..5)]);
-        assert_eq!(
-            errors("\"a\nb\"").first().unwrap().0,
-            LexError::UnterminatedString
-        );
-        assert_eq!(
-            errors(r#""bad \q escape""#),
-            [(LexError::InvalidEscape, 0..15)]
         );
     }
 
@@ -457,8 +398,8 @@ mod tests {
     #[test]
     fn block_comments_are_skipped() {
         assert_eq!(
-            tokens("/* leading */ const /* /* nested */ */ A /* trailing */"),
-            [Token::Const, Token::Ident("A")]
+            tokens("/* leading */ enum /* /* nested */ */ A /* trailing */"),
+            [Token::Enum, Token::Ident("A")]
         );
         assert_eq!(
             tokens("/* a\n * b\n */ A"),
@@ -501,23 +442,23 @@ mod tests {
 
     #[test]
     fn tokens_survive_errors() {
-        let (tokens, errors) = lex("const A: i32 = $ 1;");
+        let (tokens, errors) = lex("enum A { B = $ 1 }");
         assert_eq!(
             tokens
                 .into_iter()
                 .map(|(token, _)| token)
                 .collect::<Vec<_>>(),
             [
-                Token::Const,
+                Token::Enum,
                 Token::Ident("A"),
-                Token::Colon,
-                Token::Ident("i32"),
+                Token::BraceOpen,
+                Token::Ident("B"),
                 Token::Equal,
                 Token::Int(1),
-                Token::Semicolon,
+                Token::BraceClose,
             ]
         );
-        assert_eq!(errors, [(LexError::UnexpectedChar, 15..16)]);
+        assert_eq!(errors, [(LexError::UnexpectedChar, 13..14)]);
     }
 
     #[test]

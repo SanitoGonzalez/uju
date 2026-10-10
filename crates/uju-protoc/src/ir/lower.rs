@@ -2,9 +2,9 @@ use std::collections::HashSet;
 
 use crate::diagnostic::{Diagnostic, SourceId};
 use crate::ir::*;
-use crate::lexer::{Span, unescape};
+use crate::lexer::Span;
 use crate::parser::ast;
-use crate::resolve::{Resolution, Resolver, TypeSite};
+use crate::resolve::{Resolver, TypeSite};
 
 /// Lower parsed schemas into the IR, resolving every name and validating
 /// every declaration. `schemas` are compiled together and indexed by
@@ -14,7 +14,6 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
     let mut lowerer = Lowerer {
         resolver: &resolver,
         diagnostics,
-        consts: vec![ConstState::Todo; resolver.consts.len()],
     };
 
     let defs: Vec<Def> = resolver
@@ -24,10 +23,6 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
         .map(|(index, site)| lowerer.lower_def(TypeId(index), site))
         .collect();
 
-    for index in 0..resolver.consts.len() {
-        lowerer.const_value(ConstId(index));
-    }
-
     // Only meaningful once every type has resolved; unresolved fields carry
     // placeholder types that would produce nonsense cycles.
     if lowerer.diagnostics.is_empty() {
@@ -36,24 +31,6 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
     if !lowerer.diagnostics.is_empty() {
         return Err(lowerer.diagnostics);
     }
-
-    let consts = resolver
-        .consts
-        .iter()
-        .zip(lowerer.consts)
-        .map(|(site, state)| {
-            let ConstState::Done(Some((ty, value))) = state else {
-                unreachable!("a failed constant reports a diagnostic");
-            };
-            Const {
-                namespace: site.namespace,
-                parent: site.parent,
-                name: site.konst.name.0.to_string(),
-                ty,
-                value,
-            }
-        })
-        .collect();
 
     Ok(Schema {
         namespaces: (0..resolver.namespace_len())
@@ -66,21 +43,12 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
             })
             .collect(),
         defs,
-        consts,
     })
 }
 
 struct Lowerer<'a, 'src> {
     resolver: &'a Resolver<'a, 'src>,
     diagnostics: Vec<Diagnostic>,
-    consts: Vec<ConstState>,
-}
-
-#[derive(Clone)]
-enum ConstState {
-    Todo,
-    InProgress,
-    Done(Option<(Type, Value)>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -101,7 +69,6 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             ast::Item::Enum(item) => DefKind::Enum(self.lower_enum(site.source, item)),
             ast::Item::Struct(item) => DefKind::Struct(self.lower_struct(site.source, id, item)),
             ast::Item::Message(item) => DefKind::Message(self.lower_message(site.source, id, item)),
-            ast::Item::Const(_) => unreachable!("constants are collected separately"),
         };
         Def {
             namespace: site.namespace,
@@ -215,10 +182,40 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                         format!("duplicate field `{}`", field.name.0),
                     );
                 }
+                // `option` is unwrapped here, the one place it is allowed.
+                let (ty, optional) = match &field.ty.kind {
+                    ast::TypeKind::Option(item) => {
+                        if matches!(
+                            item.kind,
+                            ast::TypeKind::Array(..)
+                                | ast::TypeKind::Vec(_)
+                                | ast::TypeKind::Set(_)
+                                | ast::TypeKind::Map(..)
+                        ) {
+                            self.error(
+                                source,
+                                &item.span,
+                                format!("`{item}` is a collection; collections cannot be optional"),
+                            );
+                        }
+                        if let Some(constraint) = field.ty.constraints.first() {
+                            self.error(
+                                source,
+                                &constraint.span,
+                                format!(
+                                    "an `option` takes no constraints; constrain its value instead, as in `option<{}[{constraint}]>`",
+                                    item.kind
+                                ),
+                            );
+                        }
+                        (&**item, true)
+                    }
+                    _ => (&field.ty, false),
+                };
                 Field {
                     name: field.name.0.to_string(),
-                    ty: self.lower_type(source, Some(scope), &field.ty),
-                    optional: field.optional,
+                    ty: self.lower_type(source, Some(scope), ty),
+                    optional,
                 }
             })
             .collect()
@@ -227,7 +224,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
     fn lower_struct(&mut self, source: SourceId, id: TypeId, item: &ast::Struct<'src>) -> Struct {
         let fields = self.lower_fields(source, id, &item.body);
         for (field, ast_field) in fields.iter().zip(&item.body.fields) {
-            if ast_field.optional {
+            if field.optional {
                 self.diagnostics.push(Diagnostic::new(
                     source,
                     ast_field.name.1.clone(),
@@ -254,25 +251,13 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         id: TypeId,
         item: &ast::Message<'src>,
     ) -> Message {
-        let response = item.response.as_ref().and_then(|path| {
-            match self.resolver.resolve(source, Some(id), path) {
-                Ok(Resolution::Type(target))
-                    if matches!(self.resolver.types[target.0].item, ast::Item::Message(_)) =>
-                {
-                    Some(target)
-                }
-                Ok(_) => {
-                    self.error(source, &path.span, format!("`{path}` is not a message"));
-                    None
-                }
-                Err(diagnostic) => {
-                    self.diagnostics.push(diagnostic);
-                    None
-                }
-            }
-        });
+        let direction = match item.direction.0 {
+            ast::Direction::In => Direction::In,
+            ast::Direction::Out => Direction::Out,
+            ast::Direction::Bi => Direction::Bi,
+        };
         Message {
-            response,
+            direction,
             fields: self.lower_fields(source, id, &item.body),
         }
     }
@@ -283,7 +268,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         scope: Option<TypeId>,
         ty: &ast::Type<'src>,
     ) -> Type {
-        match &ty.kind {
+        let kind = match &ty.kind {
             ast::TypeKind::Prim(prim) => prim_type(*prim),
             ast::TypeKind::Array(item, (len, _)) => {
                 let item_ty = self.lower_type(source, scope, item);
@@ -294,36 +279,34 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                         format!("`{item}` is variable-size; an array item must be fixed-size"),
                     );
                 }
-                Type::Array(Box::new(item_ty), *len)
+                TypeKind::Array(Box::new(item_ty), *len)
             }
-            ast::TypeKind::Vec(item) => Type::Vec(Box::new(self.lower_type(source, scope, item))),
+            ast::TypeKind::Vec(item) => {
+                TypeKind::Vec(Box::new(self.lower_type(source, scope, item)))
+            }
             ast::TypeKind::Set(item) => {
                 let item_ty = self.lower_type(source, scope, item);
-                if !self.is_fixed(&item_ty) {
-                    self.error(
-                        source,
-                        &item.span,
-                        format!("`{item}` is variable-size; a set item must be fixed-size"),
-                    );
-                }
-                Type::Set(Box::new(item_ty))
+                self.check_key(source, scope, item, &item_ty, "a set item");
+                TypeKind::Set(Box::new(item_ty))
             }
             ast::TypeKind::Map(key, value) => {
                 let key_ty = self.lower_type(source, scope, key);
-                if !self.is_fixed(&key_ty) {
-                    self.error(
-                        source,
-                        &key.span,
-                        format!("`{key}` is variable-size; a map key must be fixed-size"),
-                    );
-                }
-                Type::Map(
+                self.check_key(source, scope, key, &key_ty, "a map key");
+                TypeKind::Map(
                     Box::new(key_ty),
                     Box::new(self.lower_type(source, scope, value)),
                 )
             }
+            ast::TypeKind::Option(item) => {
+                self.error(
+                    source,
+                    &ty.span,
+                    format!("`{ty}` is nested; `option` is only allowed as a field's own type"),
+                );
+                return self.lower_type(source, scope, item);
+            }
             ast::TypeKind::Named(path) => match self.resolver.resolve(source, scope, path) {
-                Ok(Resolution::Type(id)) => {
+                Ok(id) => {
                     if matches!(self.resolver.types[id.0].item, ast::Item::Message(_)) {
                         self.error(
                             source,
@@ -332,173 +315,279 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                                 "`{path}` is a message; messages are standalone and cannot be used as a type"
                             ),
                         );
-                        Type::Bool
+                        TypeKind::Bool
                     } else {
-                        Type::Named(id)
+                        TypeKind::Named(id)
                     }
                 }
-                Ok(_) => {
-                    self.error(source, &ty.span, format!("`{path}` is not a type"));
-                    Type::Bool
-                }
                 Err(diagnostic) => {
                     self.diagnostics.push(diagnostic);
-                    Type::Bool
+                    TypeKind::Bool
                 }
             },
-        }
-    }
-
-    fn is_fixed(&self, ty: &Type) -> bool {
-        match ty {
-            Type::String | Type::Bytes | Type::Vec(_) | Type::Set(_) | Type::Map(..) => false,
-            Type::Named(id) => matches!(
-                self.resolver.types[id.0].item,
-                ast::Item::Enum(_) | ast::Item::Struct(_)
-            ),
-            _ => true,
-        }
-    }
-
-    /// Evaluate a constant, memoizing so that constants referencing other
-    /// constants are computed once and cycles are caught.
-    fn const_value(&mut self, id: ConstId) -> Option<(Type, Value)> {
-        match &self.consts[id.0] {
-            ConstState::Done(result) => result.clone(),
-            ConstState::InProgress => {
-                let resolver = self.resolver;
-                let name = &resolver.consts[id.0].konst.name;
-                self.error(
-                    resolver.consts[id.0].source,
-                    &name.1.clone(),
-                    format!("constant `{}` is defined in terms of itself", name.0),
-                );
-                self.consts[id.0] = ConstState::Done(None);
-                None
-            }
-            ConstState::Todo => {
-                self.consts[id.0] = ConstState::InProgress;
-                let result = self.eval_const(id);
-                self.consts[id.0] = ConstState::Done(result.clone());
-                result
-            }
-        }
-    }
-
-    fn eval_const(&mut self, id: ConstId) -> Option<(Type, Value)> {
-        let resolver = self.resolver;
-        let site = &resolver.consts[id.0];
-        let konst = site.konst;
-
-        let before = self.diagnostics.len();
-        let ty = self.lower_type(site.source, site.parent, &konst.ty);
-        if self.diagnostics.len() > before {
-            return None;
-        }
-
-        let allowed = match &ty {
-            Type::Bool | Type::String | Type::F32 | Type::F64 => true,
-            Type::Named(target) => matches!(resolver.types[target.0].item, ast::Item::Enum(_)),
-            _ => int_bounds(&ty).is_some(),
         };
-        if !allowed {
+        let constraints = self.lower_constraints(source, ty, &kind);
+        Type { kind, constraints }
+    }
+
+    /// Set items and map keys must be fixed-size and comparable, which rules
+    /// out floats anywhere inline: `NaN != NaN` and `-0.0 == 0.0` break
+    /// lookup, and many targets (Rust among them) cannot hash or order
+    /// floats at all.
+    fn check_key(
+        &mut self,
+        source: SourceId,
+        scope: Option<TypeId>,
+        key: &ast::Type<'src>,
+        key_ty: &Type,
+        role: &str,
+    ) {
+        if !self.is_fixed(key_ty) {
             self.error(
-                site.source,
-                &konst.ty.span,
-                format!("`{}` cannot be the type of a constant", konst.ty),
+                source,
+                &key.span,
+                format!("`{key}` is variable-size; {role} must be fixed-size"),
             );
-            return None;
+        } else if let Some(path) = self.holds_float(source, scope, key, &mut Vec::new()) {
+            let through = if path.is_empty() {
+                String::new()
+            } else {
+                format!(" through field `{}`", path.join("."))
+            };
+            self.error(
+                source,
+                &key.span,
+                format!("`{key}` holds a float{through}; {role} cannot hold a float"),
+            );
         }
-
-        let (value, span) = &konst.value;
-        let value = match value {
-            ast::Value::Bool(value) => Value::Bool(*value),
-            ast::Value::Int(value) => Value::Int(*value),
-            ast::Value::Float(value) => Value::Float(*value),
-            ast::Value::Str(contents) => Value::Str(unescape(contents).into_owned()),
-            ast::Value::Path(path) => match resolver.resolve(site.source, site.parent, path) {
-                Ok(Resolution::Variant(target, variant)) => Value::EnumVariant(target, variant),
-                Ok(Resolution::Const(other)) => self.const_value(other)?.1,
-                Ok(Resolution::Type(_)) => {
-                    self.error(
-                        site.source,
-                        span,
-                        format!("`{path}` is a type, not a value"),
-                    );
-                    return None;
-                }
-                Err(diagnostic) => {
-                    self.diagnostics.push(diagnostic);
-                    return None;
-                }
-            },
-        };
-
-        let value = self.coerce(site.source, span, &konst.ty, &ty, value)?;
-        Some((ty, value))
     }
 
-    /// Check `value` against the constant's type, coercing integer literals
-    /// into floats. `expected_ast` is only used to word errors as written.
-    fn coerce(
+    /// The field path to a float that a value of `ty` stores inline,
+    /// directly (an empty path) or through a struct or array. `visiting`
+    /// guards against recursive structs, which are reported separately.
+    fn holds_float(
+        &self,
+        source: SourceId,
+        scope: Option<TypeId>,
+        ty: &ast::Type<'src>,
+        visiting: &mut Vec<TypeId>,
+    ) -> Option<Vec<&'src str>> {
+        match &ty.kind {
+            ast::TypeKind::Prim(ast::Prim::F32 | ast::Prim::F64) => Some(Vec::new()),
+            ast::TypeKind::Array(item, _) | ast::TypeKind::Option(item) => {
+                self.holds_float(source, scope, item, visiting)
+            }
+            ast::TypeKind::Named(path) => {
+                let id = self.resolver.resolve(source, scope, path).ok()?;
+                let site = &self.resolver.types[id.0];
+                let ast::Item::Struct(item) = site.item else {
+                    return None;
+                };
+                if visiting.contains(&id) {
+                    return None;
+                }
+                visiting.push(id);
+                item.body.fields.iter().find_map(|field| {
+                    let mut path = self.holds_float(site.source, Some(id), &field.ty, visiting)?;
+                    path.insert(0, field.name.0);
+                    Some(path)
+                })
+            }
+            ast::TypeKind::Prim(_)
+            | ast::TypeKind::Vec(_)
+            | ast::TypeKind::Set(_)
+            | ast::TypeKind::Map(..) => None,
+        }
+    }
+
+    /// Check the constraints written on `ty` against the type they constrain.
+    fn lower_constraints(
+        &mut self,
+        source: SourceId,
+        ty: &ast::Type<'src>,
+        kind: &TypeKind,
+    ) -> Constraints {
+        let mut out = Constraints::default();
+        if ty.constraints.is_empty() {
+            return out;
+        }
+
+        let class = constraint_class(kind);
+        let allowed: &[&str] = match class {
+            Class::Int(..) => &["min", "max"],
+            Class::Float(_) => &["min", "max", "infinite", "nan"],
+            Class::Length => &["min_length", "max_length"],
+            Class::None => &[],
+        };
+        let kind_name = &ty.kind;
+
+        let mut seen: Vec<&str> = Vec::new();
+        let mut max_span = None;
+        let mut max_length_span = None;
+        for constraint in &ty.constraints {
+            let (name, name_span) = &constraint.name;
+            if allowed.is_empty() {
+                self.error(
+                    source,
+                    name_span,
+                    format!("`{kind_name}` takes no constraints"),
+                );
+                continue;
+            }
+            if !allowed.contains(name) {
+                let expected = allowed
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.error(
+                    source,
+                    name_span,
+                    format!(
+                        "`{name}` is not a constraint of `{kind_name}`; expected one of {expected}"
+                    ),
+                );
+                continue;
+            }
+            if seen.contains(name) {
+                self.error(source, name_span, format!("duplicate constraint `{name}`"));
+                continue;
+            }
+            seen.push(name);
+
+            let Some((value, value_span)) = &constraint.value else {
+                if *name == "infinite" {
+                    out.infinite = true;
+                } else if *name == "nan" {
+                    out.nan = true;
+                } else {
+                    self.error(
+                        source,
+                        &constraint.span,
+                        format!("`{name}` needs a value, as in `{name}=0`"),
+                    );
+                }
+                continue;
+            };
+            match *name {
+                "infinite" | "nan" => {
+                    self.error(source, value_span, format!("`{name}` takes no value"));
+                }
+                "min" | "max" => {
+                    let Some(number) = self.bound(source, value_span, *value, &class, kind_name)
+                    else {
+                        continue;
+                    };
+                    if *name == "min" {
+                        out.min = Some(number);
+                    } else {
+                        out.max = Some(number);
+                        max_span = Some(value_span);
+                    }
+                }
+                _ => {
+                    let length = match *value {
+                        ast::Number::Int(length) => u64::try_from(length).ok(),
+                        ast::Number::Float(_) => None,
+                    };
+                    let Some(length) = length else {
+                        self.error(
+                            source,
+                            value_span,
+                            format!("`{name}` must be a non-negative integer"),
+                        );
+                        continue;
+                    };
+                    if *name == "min_length" {
+                        out.min_length = Some(length);
+                    } else {
+                        out.max_length = Some(length);
+                        max_length_span = Some(value_span);
+                    }
+                }
+            }
+        }
+
+        let inverted = match (out.min, out.max) {
+            (Some(Number::Int(min)), Some(Number::Int(max))) => min > max,
+            (Some(Number::Float(min)), Some(Number::Float(max))) => min > max,
+            _ => false,
+        };
+        if let (true, Some(span)) = (inverted, max_span) {
+            self.error(source, span, "`max` is less than `min`");
+        }
+        if let (Some(min), Some(max), Some(span)) =
+            (out.min_length, out.max_length, max_length_span)
+            && min > max
+        {
+            self.error(source, span, "`max_length` is less than `min_length`");
+        }
+
+        out
+    }
+
+    /// Check a `min`/`max` value against the number it bounds.
+    fn bound(
         &mut self,
         source: SourceId,
         span: &Span,
-        expected_ast: &ast::Type<'src>,
-        expected: &Type,
-        value: Value,
-    ) -> Option<Value> {
-        match (&value, expected) {
-            (Value::Bool(_), Type::Bool) => Some(value),
-            (Value::Str(_), Type::String) => Some(value),
-            (Value::Int(int), _) if int_bounds(expected).is_some() => {
-                let (min, max) = int_bounds(expected).unwrap();
-                if (min..=max).contains(int) {
-                    Some(value)
+        value: ast::Number,
+        class: &Class,
+        kind_name: &ast::TypeKind<'src>,
+    ) -> Option<Number> {
+        match (class, value) {
+            (Class::Int(min, max), ast::Number::Int(value)) => {
+                if (*min..=*max).contains(&value) {
+                    Some(Number::Int(value))
                 } else {
                     self.error(
                         source,
                         span,
-                        format!("`{int}` is out of range for `{expected_ast}`"),
+                        format!("`{value}` is out of range for `{kind_name}`"),
                     );
                     None
                 }
             }
-            (Value::Int(int), Type::F32 | Type::F64) => Some(Value::Float(*int as f64)),
-            (Value::Float(_), Type::F64) => Some(value),
-            (Value::Float(float), Type::F32) => {
-                if (*float as f32).is_finite() {
-                    Some(value)
-                } else {
-                    self.error(source, span, format!("`{float}` is out of range for `f32`"));
-                    None
-                }
-            }
-            (Value::EnumVariant(actual, _), Type::Named(target)) if actual == target => Some(value),
-            _ => {
-                let found = self.describe(&value);
+            (Class::Int(..), ast::Number::Float(value)) => {
                 self.error(
                     source,
                     span,
-                    format!("mismatched types: expected `{expected_ast}`, found {found}"),
+                    format!("`{value:?}` is not an integer; `{kind_name}` takes integer bounds"),
                 );
                 None
             }
+            (Class::Float(limit), value) => {
+                let value = match value {
+                    ast::Number::Int(value) => value as f64,
+                    ast::Number::Float(value) => value,
+                };
+                if value.abs() <= *limit {
+                    Some(Number::Float(value))
+                } else {
+                    self.error(
+                        source,
+                        span,
+                        format!("`{value:?}` is out of range for `{kind_name}`"),
+                    );
+                    None
+                }
+            }
+            (Class::Length | Class::None, _) => unreachable!("only numbers take `min`/`max`"),
         }
     }
 
-    fn describe(&self, value: &Value) -> String {
-        match value {
-            Value::Bool(_) => "a boolean".to_string(),
-            Value::Int(_) => "an integer".to_string(),
-            Value::Float(_) => "a float".to_string(),
-            Value::Str(_) => "a string".to_string(),
-            Value::EnumVariant(id, _) => {
-                format!(
-                    "a variant of enum `{}`",
-                    self.resolver.types[id.0].item.name().0
-                )
-            }
+    fn is_fixed(&self, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::String
+            | TypeKind::Bytes
+            | TypeKind::Vec(_)
+            | TypeKind::Set(_)
+            | TypeKind::Map(..) => false,
+            TypeKind::Named(id) => matches!(
+                self.resolver.types[id.0].item,
+                ast::Item::Enum(_) | ast::Item::Struct(_)
+            ),
+            _ => true,
         }
     }
 
@@ -553,49 +642,67 @@ impl<'a, 'src> Lowerer<'a, 'src> {
 /// The named types a value of `ty` stores inline, i.e. not behind a
 /// variable-size container.
 fn inline_refs(ty: &Type, out: &mut Vec<TypeId>) {
-    match ty {
-        Type::Named(id) => out.push(*id),
-        Type::Array(item, _) => inline_refs(item, out),
+    match &ty.kind {
+        TypeKind::Named(id) => out.push(*id),
+        TypeKind::Array(item, _) => inline_refs(item, out),
         // Scalars reference nothing; vec/set/map/string/bytes contents are
         // out of line.
         _ => {}
     }
 }
 
-fn int_bounds(ty: &Type) -> Option<(i128, i128)> {
-    Some(match ty {
-        Type::I8 => (i8::MIN as i128, i8::MAX as i128),
-        Type::I16 => (i16::MIN as i128, i16::MAX as i128),
-        Type::I32 => (i32::MIN as i128, i32::MAX as i128),
-        Type::I64 => (i64::MIN as i128, i64::MAX as i128),
-        Type::U8 => (0, u8::MAX as i128),
-        Type::U16 => (0, u16::MAX as i128),
-        Type::U32 => (0, u32::MAX as i128),
-        Type::U64 => (0, u64::MAX as i128),
-        _ => return None,
-    })
+/// Which constraints a type takes.
+enum Class {
+    /// Integers, with the inclusive range of the type.
+    Int(i128, i128),
+    /// Floats, with the largest finite magnitude of the type.
+    Float(f64),
+    /// Strings, bytes, and variable-size collections.
+    Length,
+    None,
 }
 
-fn prim_type(prim: ast::Prim) -> Type {
+fn constraint_class(kind: &TypeKind) -> Class {
+    match kind {
+        TypeKind::I8 => Class::Int(i8::MIN as i128, i8::MAX as i128),
+        TypeKind::I16 => Class::Int(i16::MIN as i128, i16::MAX as i128),
+        TypeKind::I32 => Class::Int(i32::MIN as i128, i32::MAX as i128),
+        TypeKind::I64 => Class::Int(i64::MIN as i128, i64::MAX as i128),
+        TypeKind::U8 => Class::Int(0, u8::MAX as i128),
+        TypeKind::U16 => Class::Int(0, u16::MAX as i128),
+        TypeKind::U32 => Class::Int(0, u32::MAX as i128),
+        TypeKind::U64 => Class::Int(0, u64::MAX as i128),
+        TypeKind::F32 => Class::Float(f32::MAX as f64),
+        TypeKind::F64 => Class::Float(f64::MAX),
+        TypeKind::String
+        | TypeKind::Bytes
+        | TypeKind::Vec(_)
+        | TypeKind::Set(_)
+        | TypeKind::Map(..) => Class::Length,
+        _ => Class::None,
+    }
+}
+
+fn prim_type(prim: ast::Prim) -> TypeKind {
     match prim {
-        ast::Prim::I8 => Type::I8,
-        ast::Prim::I16 => Type::I16,
-        ast::Prim::I32 => Type::I32,
-        ast::Prim::I64 => Type::I64,
-        ast::Prim::U8 => Type::U8,
-        ast::Prim::U16 => Type::U16,
-        ast::Prim::U32 => Type::U32,
-        ast::Prim::U64 => Type::U64,
-        ast::Prim::F32 => Type::F32,
-        ast::Prim::F64 => Type::F64,
-        ast::Prim::Bool => Type::Bool,
-        ast::Prim::Timestamp => Type::Timestamp,
-        ast::Prim::Interval => Type::Interval,
-        ast::Prim::Entity => Type::Entity,
-        ast::Prim::UEntity => Type::UEntity,
-        ast::Prim::Uuid => Type::Uuid,
-        ast::Prim::String => Type::String,
-        ast::Prim::Bytes => Type::Bytes,
+        ast::Prim::I8 => TypeKind::I8,
+        ast::Prim::I16 => TypeKind::I16,
+        ast::Prim::I32 => TypeKind::I32,
+        ast::Prim::I64 => TypeKind::I64,
+        ast::Prim::U8 => TypeKind::U8,
+        ast::Prim::U16 => TypeKind::U16,
+        ast::Prim::U32 => TypeKind::U32,
+        ast::Prim::U64 => TypeKind::U64,
+        ast::Prim::F32 => TypeKind::F32,
+        ast::Prim::F64 => TypeKind::F64,
+        ast::Prim::Bool => TypeKind::Bool,
+        ast::Prim::Timestamp => TypeKind::Timestamp,
+        ast::Prim::Interval => TypeKind::Interval,
+        ast::Prim::Entity => TypeKind::Entity,
+        ast::Prim::UEntity => TypeKind::UEntity,
+        ast::Prim::Uuid => TypeKind::Uuid,
+        ast::Prim::String => TypeKind::String,
+        ast::Prim::Bytes => TypeKind::Bytes,
     }
 }
 
@@ -628,14 +735,6 @@ mod tests {
         (TypeId(index), &schema.defs[index])
     }
 
-    fn konst<'a>(schema: &'a Schema, name: &str) -> &'a Const {
-        schema
-            .consts
-            .iter()
-            .find(|konst| konst.name == name)
-            .unwrap_or_else(|| panic!("no constant named `{name}`"))
-    }
-
     #[test]
     fn samples_lower() {
         let schema = compiled(&[SAMPLE1, SAMPLE2]);
@@ -648,7 +747,7 @@ mod tests {
             ["foo.bar", "hello"]
         );
 
-        let (color_id, color) = def(&schema, "Color");
+        let (_, color) = def(&schema, "Color");
         let DefKind::Enum(color) = &color.kind else {
             panic!("expected an enum");
         };
@@ -668,41 +767,44 @@ mod tests {
         };
         assert_eq!(numbers.repr, EnumRepr::U32, "the repr defaults to u32");
         assert_eq!(numbers.variants[2].value, 1_000_000_000);
-
-        assert_eq!(konst(&schema, "NumberOne").ty, Type::I32);
-        assert_eq!(konst(&schema, "NumberOne").value, Value::Int(1));
-        assert_eq!(konst(&schema, "FavoriteColor").ty, Type::Named(color_id));
-        assert_eq!(
-            konst(&schema, "FavoriteColor").value,
-            Value::EnumVariant(color_id, 0)
-        );
     }
 
     #[test]
-    fn messages_link_to_their_response() {
+    fn messages_carry_their_direction() {
         let schema = compiled(&[SAMPLE1]);
-        let (response_id, _) = def(&schema, "MyResponse");
-        let (_, request) = def(&schema, "MyRequest");
-        let DefKind::Message(request) = &request.kind else {
-            panic!("expected a message");
+        let message = |name: &str| {
+            let (_, def) = def(&schema, name);
+            let DefKind::Message(message) = &def.kind else {
+                panic!("expected a message");
+            };
+            message.clone()
         };
-        assert_eq!(request.response, Some(response_id));
+        assert_eq!(message("Ping").direction, Direction::Bi);
+        assert_eq!(message("MyRequest").direction, Direction::In);
 
+        let (response_id, _) = def(&schema, "MyResponse");
         let (result_id, result) = def(&schema, "Result");
         assert_eq!(result.parent, Some(response_id));
         assert_eq!(schema.path(result_id), ["MyResponse", "Result"]);
 
-        let (_, response) = def(&schema, "MyResponse");
-        let DefKind::Message(response) = &response.kind else {
-            panic!("expected a message");
-        };
-        assert_eq!(response.response, None);
-        assert_eq!(response.fields[0].ty, Type::Named(result_id));
+        let response = message("MyResponse");
+        assert_eq!(response.direction, Direction::Out);
+        assert_eq!(response.fields[0].ty.kind, TypeKind::Named(result_id));
     }
 
     #[test]
     fn container_types_lower() {
-        let schema = compiled(&[SAMPLE1]);
+        let schema = compiled(&[concat!(
+            "namespace a;\n",
+            "struct Position { x: f32 }\n",
+            "message[in] NonScalars {\n",
+            "    v: vec<i32>,\n",
+            "    ar: array<i32, 4>,\n",
+            "    m2: map<u8, vec<Position>>,\n",
+            "    o: option<i32>,\n",
+            "    os: option<string>,\n",
+            "}\n",
+        )]);
         let (position_id, _) = def(&schema, "Position");
         let (_, non_scalars) = def(&schema, "NonScalars");
         let DefKind::Message(non_scalars) = &non_scalars.kind else {
@@ -716,51 +818,52 @@ mod tests {
                 .unwrap_or_else(|| panic!("no field named `{name}`"))
         };
 
-        assert_eq!(field("ar").ty, Type::Array(Box::new(Type::I32), 4));
+        let ty = |kind: TypeKind| Box::new(Type::from(kind));
+        assert_eq!(field("ar").ty.kind, TypeKind::Array(ty(TypeKind::I32), 4));
         assert_eq!(
-            field("m2").ty,
-            Type::Map(
-                Box::new(Type::U8),
-                Box::new(Type::Vec(Box::new(Type::Named(position_id))))
+            field("m2").ty.kind,
+            TypeKind::Map(
+                ty(TypeKind::U8),
+                ty(TypeKind::Vec(ty(TypeKind::Named(position_id))))
             )
         );
-        assert!(field("vo").optional);
+        assert_eq!(field("o").ty.kind, TypeKind::I32);
+        assert!(field("o").optional);
+        assert_eq!(field("os").ty.kind, TypeKind::String);
+        assert!(field("os").optional);
         assert!(!field("v").optional);
     }
 
     #[test]
     fn imports_resolve_across_sources() {
         let schema = compiled(&[SAMPLE1, SAMPLE2]);
-        let (velocity_id, velocity) = def(&schema, "Velocity");
+        let (color_id, color) = def(&schema, "Color");
         let (position_id, _) = def(&schema, "Position");
-        assert_eq!(
-            schema.namespace(velocity.namespace).name.join("."),
-            "foo.bar"
-        );
+        assert_eq!(schema.namespace(color.namespace).name.join("."), "foo.bar");
 
         let (_, external) = def(&schema, "ExternalTypes");
         let DefKind::Message(external) = &external.kind else {
             panic!("expected a message");
         };
-        assert_eq!(external.fields[0].ty, Type::Named(velocity_id));
-        assert_eq!(external.fields[1].ty, Type::Named(position_id));
+        assert_eq!(external.fields[0].ty.kind, TypeKind::Named(color_id));
+        assert_eq!(external.fields[1].ty.kind, TypeKind::Named(position_id));
     }
 
     #[test]
     fn nested_declarations_shadow_outer_ones() {
-        let src = "namespace a;\nenum R { X }\nmessage M {\n    enum R { Y }\n    r: R,\n}\n";
+        let src = "namespace a;\nenum R { X }\nmessage[in] M {\n    enum R { Y }\n    r: R,\n}\n";
         let schema = compiled(&[src]);
         let (_, message) = def(&schema, "M");
         let DefKind::Message(message) = &message.kind else {
             panic!("expected a message");
         };
-        let Type::Named(id) = message.fields[0].ty else {
+        let TypeKind::Named(id) = message.fields[0].ty.kind else {
             panic!("expected a named type");
         };
         assert!(schema.def(id).parent.is_some(), "the nested enum wins");
 
         // The nested declaration is reachable from outside by its path.
-        compiled(&["namespace a;\nmessage M { enum R { Y } r: R, }\nstruct S { r: M.R }\n"]);
+        compiled(&["namespace a;\nmessage[in] M { enum R { Y } r: R, }\nstruct S { r: M.R }\n"]);
     }
 
     #[test]
@@ -779,6 +882,10 @@ mod tests {
                 "namespace b;\nuse a;\nstruct S { t: a.X }\n",
             ]),
             ["no `X` in namespace `a`"]
+        );
+        assert_eq!(
+            messages(&["namespace a;\nenum E { X }\nstruct S { e: E.X }\n"]),
+            ["`E` has no nested declaration `X`"]
         );
     }
 
@@ -847,66 +954,13 @@ mod tests {
     }
 
     #[test]
-    fn consts_evaluate() {
-        let schema = compiled(&[concat!(
-            "namespace a;\n",
-            "const A: i32 = 41;\n",
-            "const B: i64 = A;\n",
-            "const F: f32 = 1;\n",
-            "const S: string = \"a\\nb\";\n",
-            "const T: bool = true;\n",
-        )]);
-        assert_eq!(konst(&schema, "B").value, Value::Int(41));
-        assert_eq!(konst(&schema, "F").value, Value::Float(1.0));
-        assert_eq!(konst(&schema, "S").value, Value::Str("a\nb".into()));
-        assert_eq!(konst(&schema, "T").value, Value::Bool(true));
-    }
-
-    #[test]
-    fn consts_are_validated() {
-        assert_eq!(
-            messages(&["namespace a;\nconst C: u8 = 256;\n"]),
-            ["`256` is out of range for `u8`"]
-        );
-        assert_eq!(
-            messages(&["namespace a;\nconst C: i32 = \"hi\";\n"]),
-            ["mismatched types: expected `i32`, found a string"]
-        );
-        assert_eq!(
-            messages(&["namespace a;\nstruct S {}\nconst C: S = 1;\n"]),
-            ["`S` cannot be the type of a constant"]
-        );
-        assert_eq!(
-            messages(&["namespace a;\nconst C: vec<i32> = 1;\n"]),
-            ["`vec<i32>` cannot be the type of a constant"]
-        );
-        assert_eq!(
-            messages(&["namespace a;\nconst A: i32 = B;\nconst B: i32 = A;\n"]),
-            ["constant `A` is defined in terms of itself"]
-        );
-        assert_eq!(
-            messages(&["namespace a;\nenum E { X }\nenum F { Y }\nconst C: E = F.Y;\n"]),
-            ["mismatched types: expected `E`, found a variant of enum `F`"]
-        );
-        // Constants are not types, and types are not values.
-        assert_eq!(
-            messages(&["namespace a;\nconst C: i32 = 1;\nstruct S { x: C }\n"]),
-            ["`C` is not a type"]
-        );
-        assert_eq!(
-            messages(&["namespace a;\nstruct S {}\nconst C: i32 = S;\n"]),
-            ["`S` is a type, not a value"]
-        );
-    }
-
-    #[test]
     fn messages_are_standalone() {
         assert_eq!(
-            messages(&["namespace a;\nmessage M {}\nstruct S { m: M }\n"]),
+            messages(&["namespace a;\nmessage[in] M {}\nstruct S { m: M }\n"]),
             ["`M` is a message; messages are standalone and cannot be used as a type"]
         );
         assert_eq!(
-            messages(&["namespace a;\nmessage M {}\nmessage N { v: vec<M> }\n"]).len(),
+            messages(&["namespace a;\nmessage[in] M {}\nmessage[out] N { v: vec<M> }\n"]).len(),
             1
         );
     }
@@ -922,7 +976,7 @@ mod tests {
             ["`string` is variable-size; a struct field must be fixed-size"]
         );
         assert_eq!(
-            messages(&["namespace a;\nstruct S { x: i32? }\n"]),
+            messages(&["namespace a;\nstruct S { x: option<i32> }\n"]),
             ["a struct field cannot be optional"]
         );
     }
@@ -930,29 +984,223 @@ mod tests {
     #[test]
     fn containers_need_fixed_size_items() {
         assert_eq!(
-            messages(&["namespace a;\nmessage M { a: array<vec<i32>, 2> }\n"]),
+            messages(&["namespace a;\nmessage[in] M { a: array<vec<i32>, 2> }\n"]),
             ["`vec<i32>` is variable-size; an array item must be fixed-size"]
         );
         assert_eq!(
-            messages(&["namespace a;\nmessage M { s: set<string> }\n"]),
+            messages(&["namespace a;\nmessage[in] M { s: set<string> }\n"]),
             ["`string` is variable-size; a set item must be fixed-size"]
         );
         assert_eq!(
-            messages(&["namespace a;\nmessage M { m: map<string, i32> }\n"]),
+            messages(&["namespace a;\nmessage[in] M { m: map<string, i32> }\n"]),
             ["`string` is variable-size; a map key must be fixed-size"]
         );
         // Map values may be variable-size.
-        compiled(&["namespace a;\nmessage M { m: map<i32, vec<i32>> }\n"]);
+        compiled(&["namespace a;\nmessage[in] M { m: map<i32, vec<i32>> }\n"]);
     }
 
     #[test]
-    fn a_response_must_be_a_message() {
-        assert_eq!(
-            messages(&["namespace a;\nstruct S {}\nmessage M -> S {}\n"]),
-            ["`S` is not a message"]
+    fn collections_cannot_be_optional() {
+        for ty in ["vec<i32>", "set<i32>", "map<i32, i32>", "array<i32, 2>"] {
+            assert_eq!(
+                messages(&[&format!(
+                    "namespace a;\nmessage[in] M {{ o: option<{ty}> }}\n"
+                )]),
+                [format!(
+                    "`{ty}` is a collection; collections cannot be optional"
+                )]
+            );
+        }
+        // Variable-size scalars and user types may be.
+        compiled(&[concat!(
+            "namespace a;\n",
+            "struct P { x: f32 }\n",
+            "enum E { A }\n",
+            "message[in] M { s: option<string>, b: option<bytes>, p: option<P>, e: option<E> }\n",
+        )]);
+    }
+
+    #[test]
+    fn floats_cannot_be_keys() {
+        let prelude = concat!(
+            "namespace a;\n",
+            "struct Position { x: i32, y: f32 }\n",
+            "struct Outer { id: u8, p: array<Position, 2> }\n",
         );
-        // Responses may be declared after the message referencing them.
-        compiled(&["namespace a;\nmessage A -> B {}\nmessage B {}\n"]);
+        let cases = [
+            (
+                "s: set<f32>",
+                "`f32` holds a float; a set item cannot hold a float",
+            ),
+            (
+                "m: map<f64[infinite], i32>",
+                "`f64[infinite]` holds a float; a map key cannot hold a float",
+            ),
+            (
+                "m: map<array<f32, 2>, i32>",
+                "`array<f32, 2>` holds a float; a map key cannot hold a float",
+            ),
+            (
+                "s: set<Position>",
+                "`Position` holds a float through field `y`; a set item cannot hold a float",
+            ),
+            (
+                "s: set<Outer>",
+                "`Outer` holds a float through field `p.y`; a set item cannot hold a float",
+            ),
+        ];
+        for (field, expected) in cases {
+            let src = format!("{prelude}message[in] M {{ {field} }}\n");
+            assert_eq!(messages(&[&src]), [expected], "{field}");
+        }
+
+        // Floats are fine as map values, and float-free structs as keys.
+        compiled(&[concat!(
+            "namespace a;\n",
+            "struct Cell { x: i32, y: i32 }\n",
+            "message[in] M { m: map<Cell, f32[nan]>, s: set<Cell> }\n",
+        )]);
+    }
+
+    #[test]
+    fn constraints_lower_onto_the_type_they_follow() {
+        let schema = compiled(&[SAMPLE1]);
+        let (_, request) = def(&schema, "MyRequest");
+        let DefKind::Message(request) = &request.kind else {
+            panic!("expected a message");
+        };
+        let foo = &request.fields[0].ty.constraints;
+        assert_eq!(foo.min, Some(Number::Int(-100)));
+        assert_eq!(foo.max, Some(Number::Int(100)));
+        let addresses = &request.fields[2].ty;
+        assert_eq!(addresses.constraints.max_length, Some(14));
+        let TypeKind::Vec(element) = &addresses.kind else {
+            panic!("expected a vec");
+        };
+        assert_eq!(
+            element.constraints.max_length,
+            Some(16),
+            "each item carries its own constraints, apart from the vec's"
+        );
+
+        let (_, numbers) = def(&schema, "StrangeNumbers");
+        let DefKind::Struct(numbers) = &numbers.kind else {
+            panic!("expected a struct");
+        };
+        assert!(numbers.fields[0].ty.constraints.infinite);
+        assert!(!numbers.fields[0].ty.constraints.nan);
+        assert!(numbers.fields[1].ty.constraints.nan);
+        assert!(!numbers.fields[1].ty.constraints.infinite);
+
+        let schema = compiled(&[concat!(
+            "namespace a;\n",
+            "message[in] M {\n",
+            "    f: f32[min=0, max=1.5],\n",
+            "    o: option<string[max_length=3]>,\n",
+            "    m: map<u8[max=9], vec<i8[min=-1]>[min_length=1]>,\n",
+            "}\n",
+        )]);
+        let (_, message) = def(&schema, "M");
+        let DefKind::Message(message) = &message.kind else {
+            panic!("expected a message");
+        };
+        let f = &message.fields[0].ty.constraints;
+        assert_eq!(
+            f.min,
+            Some(Number::Float(0.0)),
+            "integer bounds widen to floats"
+        );
+        assert_eq!(f.max, Some(Number::Float(1.5)));
+        assert!(!f.infinite, "floats are finite by default");
+        assert!(!f.nan, "floats are not NaN by default");
+        assert!(message.fields[1].optional);
+        assert_eq!(message.fields[1].ty.constraints.max_length, Some(3));
+        let TypeKind::Map(key, value) = &message.fields[2].ty.kind else {
+            panic!("expected a map");
+        };
+        assert_eq!(key.constraints.max, Some(Number::Int(9)));
+        assert_eq!(value.constraints.min_length, Some(1));
+    }
+
+    #[test]
+    fn constraints_are_validated() {
+        let cases = [
+            ("bool[min=0]", "`bool` takes no constraints"),
+            (
+                "array<i32, 2>[max_length=2]",
+                "`array<i32, 2>` takes no constraints",
+            ),
+            (
+                "i32[max_length=2]",
+                "`max_length` is not a constraint of `i32`; expected one of `min`, `max`",
+            ),
+            (
+                "string[max=2]",
+                "`max` is not a constraint of `string`; expected one of `min_length`, `max_length`",
+            ),
+            (
+                "i32[infinite]",
+                "`infinite` is not a constraint of `i32`; expected one of `min`, `max`",
+            ),
+            ("i32[min=1, min=2]", "duplicate constraint `min`"),
+            ("i32[min]", "`min` needs a value, as in `min=0`"),
+            ("f32[infinite=1]", "`infinite` takes no value"),
+            ("f32[nan=1]", "`nan` takes no value"),
+            ("f32[nan, nan]", "duplicate constraint `nan`"),
+            (
+                "i32[nan]",
+                "`nan` is not a constraint of `i32`; expected one of `min`, `max`",
+            ),
+            ("u8[max=256]", "`256` is out of range for `u8`"),
+            ("u8[min=-1]", "`-1` is out of range for `u8`"),
+            (
+                "i32[min=0.5]",
+                "`0.5` is not an integer; `i32` takes integer bounds",
+            ),
+            (
+                "f32[max=1000000000000000000000000000000000000000.0]",
+                "`1e39` is out of range for `f32`",
+            ),
+            (
+                "vec<i32>[max_length=-1]",
+                "`max_length` must be a non-negative integer",
+            ),
+            (
+                "string[max_length=1.5]",
+                "`max_length` must be a non-negative integer",
+            ),
+            ("i32[min=2, max=1]", "`max` is less than `min`"),
+            ("f64[min=2.5, max=1]", "`max` is less than `min`"),
+            (
+                "bytes[min_length=2, max_length=1]",
+                "`max_length` is less than `min_length`",
+            ),
+            (
+                "option<i32>[min=0]",
+                "an `option` takes no constraints; constrain its value instead, as in `option<i32[min=0]>`",
+            ),
+        ];
+        for (ty, expected) in cases {
+            let src = format!("namespace a;\nmessage[in] M {{ x: {ty} }}\n");
+            assert_eq!(messages(&[&src]), [expected], "{ty}");
+        }
+        // User types take no constraints either.
+        assert_eq!(
+            messages(&["namespace a;\nenum E { A }\nmessage[in] M { e: E[max=1] }\n"]),
+            ["`E` takes no constraints"]
+        );
+    }
+
+    #[test]
+    fn options_only_wrap_a_field() {
+        assert_eq!(
+            messages(&["namespace a;\nmessage[in] M { v: vec<option<i32>> }\n"]),
+            ["`option<i32>` is nested; `option` is only allowed as a field's own type"]
+        );
+        assert_eq!(
+            messages(&["namespace a;\nmessage[in] M { o: option<option<i32>> }\n"]),
+            ["`option<i32>` is nested; `option` is only allowed as a field's own type"]
+        );
     }
 
     #[test]
@@ -968,6 +1216,6 @@ mod tests {
         );
 
         // Variable-size types break the cycle.
-        compiled(&["namespace a;\nstruct S { x: i32 }\nmessage M { v: vec<S> }\n"]);
+        compiled(&["namespace a;\nstruct S { x: i32 }\nmessage[in] M { v: vec<S> }\n"]);
     }
 }

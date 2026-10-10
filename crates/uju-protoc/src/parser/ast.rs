@@ -19,17 +19,9 @@ pub struct Path<'src> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item<'src> {
-    Const(Const<'src>),
     Enum(Enum<'src>),
     Struct(Struct<'src>),
     Message(Message<'src>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Const<'src> {
-    pub name: Ident<'src>,
-    pub ty: Type<'src>,
-    pub value: Spanned<Value<'src>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,9 +46,17 @@ pub struct Struct<'src> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message<'src> {
+    pub direction: Spanned<Direction>,
     pub name: Ident<'src>,
-    pub response: Option<Path<'src>>,
     pub body: Body<'src>,
+}
+
+/// Which way a message travels, as written in `message[in]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    In,
+    Out,
+    Bi,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -69,14 +69,30 @@ pub struct Body<'src> {
 pub struct Field<'src> {
     pub name: Ident<'src>,
     pub ty: Type<'src>,
-    /// Set by a trailing `?`, which is only allowed on a field's own type.
-    pub optional: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Type<'src> {
     pub kind: TypeKind<'src>,
+    /// The `[...]` written right after the type; they constrain this type
+    /// only, not the types nested in it.
+    pub constraints: Vec<Constraint<'src>>,
+    /// Covers the constraints too.
     pub span: Span,
+}
+
+/// `name` or `name=value`, as in `i32[min=0, max=10]` or `f32[infinite]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Constraint<'src> {
+    pub name: Ident<'src>,
+    pub value: Option<Spanned<Number>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Number {
+    Int(i128),
+    Float(f64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +102,8 @@ pub enum TypeKind<'src> {
     Vec(Box<Type<'src>>),
     Set(Box<Type<'src>>),
     Map(Box<Type<'src>>, Box<Type<'src>>),
+    /// Only allowed as a field's own type, around a non-collection.
+    Option(Box<Type<'src>>),
     Named(Path<'src>),
 }
 
@@ -111,17 +129,6 @@ pub enum Prim {
     Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value<'src> {
-    Bool(bool),
-    Int(i128),
-    Float(f64),
-    /// Raw literal contents; decode with [`crate::lexer::unescape`].
-    Str(&'src str),
-    /// An enum member such as `Color.Red`, or another constant by name.
-    Path(Path<'src>),
-}
-
 impl<'src> Path<'src> {
     pub fn name(&self) -> &Ident<'src> {
         self.segments
@@ -137,7 +144,6 @@ impl<'src> Path<'src> {
 impl<'src> Item<'src> {
     pub fn name(&self) -> &Ident<'src> {
         match self {
-            Item::Const(item) => &item.name,
             Item::Enum(item) => &item.name,
             Item::Struct(item) => &item.name,
             Item::Message(item) => &item.name,
@@ -146,7 +152,6 @@ impl<'src> Item<'src> {
 
     pub fn keyword(&self) -> &'static str {
         match self {
-            Item::Const(_) => "const",
             Item::Enum(_) => "enum",
             Item::Struct(_) => "struct",
             Item::Message(_) => "message",
@@ -157,7 +162,26 @@ impl<'src> Item<'src> {
         match self {
             Item::Struct(item) => Some(&item.body),
             Item::Message(item) => Some(&item.body),
-            Item::Const(_) | Item::Enum(_) => None,
+            Item::Enum(_) => None,
+        }
+    }
+}
+
+impl Direction {
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "in" => Direction::In,
+            "out" => Direction::Out,
+            "bi" => Direction::Bi,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Direction::In => "in",
+            Direction::Out => "out",
+            Direction::Bi => "bi",
         }
     }
 }
@@ -243,7 +267,37 @@ impl fmt::Display for Path<'_> {
 
 impl fmt::Display for Type<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.kind)
+        write!(f, "{}", self.kind)?;
+        if !self.constraints.is_empty() {
+            f.write_str("[")?;
+            for (index, constraint) in self.constraints.iter().enumerate() {
+                if index > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{constraint}")?;
+            }
+            f.write_str("]")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Constraint<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name.0)?;
+        if let Some((value, _)) = &self.value {
+            write!(f, "={value}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Number {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Number::Int(value) => write!(f, "{value}"),
+            Number::Float(value) => write!(f, "{value:?}"),
+        }
     }
 }
 
@@ -255,6 +309,7 @@ impl fmt::Display for TypeKind<'_> {
             TypeKind::Vec(item) => write!(f, "vec<{item}>"),
             TypeKind::Set(item) => write!(f, "set<{item}>"),
             TypeKind::Map(key, value) => write!(f, "map<{key}, {value}>"),
+            TypeKind::Option(item) => write!(f, "option<{item}>"),
             TypeKind::Named(path) => write!(f, "{path}"),
         }
     }
@@ -266,15 +321,9 @@ impl fmt::Display for Prim {
     }
 }
 
-impl fmt::Display for Value<'_> {
+impl fmt::Display for Direction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Bool(value) => write!(f, "{value}"),
-            Value::Int(value) => write!(f, "{value}"),
-            Value::Float(value) => write!(f, "{value}"),
-            Value::Str(value) => write!(f, "\"{value}\""),
-            Value::Path(path) => write!(f, "{path}"),
-        }
+        f.write_str(self.name())
     }
 }
 
@@ -304,7 +353,11 @@ mod tests {
     ];
 
     fn ty(kind: TypeKind<'_>) -> Type<'_> {
-        Type { kind, span: 0..0 }
+        Type {
+            kind,
+            constraints: Vec::new(),
+            span: 0..0,
+        }
     }
 
     fn path<'src>(segments: &[&'src str]) -> Path<'src> {
@@ -323,7 +376,9 @@ mod tests {
 
     #[test]
     fn containers_and_user_types_are_not_prims() {
-        for name in ["vec", "set", "map", "array", "Position", "u128", "int"] {
+        for name in [
+            "vec", "set", "map", "array", "option", "Position", "u128", "int",
+        ] {
             assert_eq!(Prim::from_name(name), None);
         }
     }
@@ -357,6 +412,23 @@ mod tests {
 
         let set = ty(TypeKind::Set(Box::new(ty(TypeKind::Prim(Prim::String)))));
         assert_eq!(set.to_string(), "set<string>");
+
+        let option = ty(TypeKind::Option(Box::new(ty(TypeKind::Prim(Prim::U8)))));
+        assert_eq!(option.to_string(), "option<u8>");
+
+        let constraint = |name, value: Option<Number>| Constraint {
+            name: (name, 0..0),
+            value: value.map(|value| (value, 0..0)),
+            span: 0..0,
+        };
+        let mut item = ty(TypeKind::Prim(Prim::F32));
+        item.constraints = vec![
+            constraint("min", Some(Number::Float(1.0))),
+            constraint("infinite", None),
+        ];
+        let mut vec = ty(TypeKind::Vec(Box::new(item)));
+        vec.constraints = vec![constraint("max_length", Some(Number::Int(4)))];
+        assert_eq!(vec.to_string(), "vec<f32[min=1.0, infinite]>[max_length=4]");
     }
 
     #[test]
@@ -374,20 +446,28 @@ mod tests {
     #[test]
     fn items_report_their_name_and_keyword() {
         let item = Item::Message(Message {
-            name: ("MyRequest", 8..17),
-            response: Some(path(&["MyResponse"])),
+            direction: (Direction::In, 8..10),
+            name: ("MyRequest", 12..21),
             body: Body::default(),
         });
-        assert_eq!(item.name(), &("MyRequest", 8..17));
+        assert_eq!(item.name(), &("MyRequest", 12..21));
         assert_eq!(item.keyword(), "message");
         assert_eq!(item.body(), Some(&Body::default()));
 
-        let konst = Item::Const(Const {
-            name: ("NumberOne", 6..15),
-            ty: ty(TypeKind::Prim(Prim::I32)),
-            value: (Value::Int(1), 20..21),
+        let item = Item::Enum(Enum {
+            name: ("Color", 5..10),
+            repr: None,
+            variants: Vec::new(),
         });
-        assert_eq!(konst.keyword(), "const");
-        assert_eq!(konst.body(), None);
+        assert_eq!(item.keyword(), "enum");
+        assert_eq!(item.body(), None);
+    }
+
+    #[test]
+    fn direction_names_round_trip() {
+        for direction in [Direction::In, Direction::Out, Direction::Bi] {
+            assert_eq!(Direction::from_name(direction.name()), Some(direction));
+        }
+        assert_eq!(Direction::from_name("inout"), None);
     }
 }

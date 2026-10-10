@@ -1,24 +1,24 @@
+// types
+// scalars: u8-64, i8-64, f32-64 (f16 TBA), bool, timestamp, interval, entity, uentity, uuid
+// variants: string, bytes
+// collections: vec<T>, set<T>, map<T>, array<T, N>
+// option<T>: collections cannot be optional
+
 namespace foo.bar;
 
-// comments
-
-const NumberOne: i32 = 1;
-
+// enum can only derive unsigned integers
 enum Color: u8 {
-    Red, // inline comments
+    Red,
     Green,
     Blue = 5,
 }
 
 // enum derives u32 by default
-// enum can only derive unsigned integers
 enum Numbers {
     Thousand = 1000,
     Million = 1000000,
     Billion = 1000000000,
 }
-
-const FavoriteColor: Color = Color.Red;
 
 struct EmptyStruct {}
 
@@ -27,62 +27,22 @@ struct Position {
     y: f32,
 }
 
-struct Velocity {
-    x: f32,
-    y: f32,
+struct StrangeNumbers {
+    // float is finite and non-NaN by default
+    a: f32[infinite],
+    b: f32[nan],
 }
 
-message Scalars {
-    uint8: u8,
-    uint16: u16,
-    uint32: u32,
-    uint64: u64,
-    int8: i8,
-    int16: i16,
-    int32: i32,
-    int64: i64,
-    boolean: bool,
-    float32: f32,
-    float64: f64,
+message[bi] Ping {}
 
-    ts: timestamp, // 64-bit microseconds resolution, UTC
-    it: interval, // 64-bit microseconds resolution
-
-    et: entity, // 64-bit local entity (index, generation)
-    uet: uentity, // 96-bit universal entity (node ID, shard ID, index, generation)
-
-    id: uuid,
+message[in] MyRequest {
+    foo: i32[min=-100, max=100],
+    name: string[min_length=2, max_length=12],
+    // distinguish collection-wide constraints and element-wide constraints
+    addresses: vec<string[max_length=16]>[max_length=14],
 }
 
-message NonScalars {
-    v: vec<i32>,
-    s: set<i32>,
-    m: map<i32, i32>,
-    ar: array<i32, 4>,
-
-    // complex
-    v1: vec<Position>,
-    v2: vec<Velocity>,
-    v2d: vec<vec<Position>>,
-    vs: vec<set<i32>>,
-    vo: vec<i32>?,
-    s1: set<Position>,
-    m1: map<u32, Position>,
-    m2: map<u8, vec<Position>>,
-
-    // invalid - item types cannot be optional
-    // vec<i32?>,
-
-    str: string,
-    b: bytes,
-}
-
-// message with a return type
-message MyRequest -> MyResponse {
-    foo: i32,
-}
-
-message MyResponse {
+message[out] MyResponse {
     enum Result {
         Ok,
         Error,
