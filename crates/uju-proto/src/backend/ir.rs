@@ -1,28 +1,25 @@
 //! Emits the compiled IR as JSON, one file per namespace: every name fully
-//! qualified, every type spelled the way it is written in source, and the
-//! wire layout folded in beside the declaration it belongs to.
+//! qualified and every type spelled the way it is written in source.
 
 use crate::backend::{Backend, Error, GeneratedFile};
-use crate::ir::wire::{DefWire, Wire};
 use crate::ir::{self, DefKind, NamespaceId, Type, TypeId, Value};
 
 pub struct Ir;
 
 impl Backend for Ir {
     fn generate(&self, schema: &ir::Schema) -> Result<Vec<GeneratedFile>, Error> {
-        let wire = Wire::new(schema);
         Ok((0..schema.namespaces.len())
             .map(|index| {
                 let id = NamespaceId(index);
                 let name = schema.namespace(id).name.join(".");
-                let contents = namespace(schema, &wire, id, &name);
+                let contents = namespace(schema, id, &name);
                 GeneratedFile::new(format!("{name}.json"), contents)
             })
             .collect())
     }
 }
 
-fn namespace(schema: &ir::Schema, wire: &Wire, id: NamespaceId, name: &str) -> String {
+fn namespace(schema: &ir::Schema, id: NamespaceId, name: &str) -> String {
     let mut json = Json::new();
     json.begin('{');
     json.entry("namespace", name);
@@ -32,7 +29,7 @@ fn namespace(schema: &ir::Schema, wire: &Wire, id: NamespaceId, name: &str) -> S
     for (index, def) in schema.defs.iter().enumerate() {
         if def.namespace == id {
             json.item();
-            def_json(&mut json, schema, wire, TypeId(index));
+            def_json(&mut json, schema, TypeId(index));
         }
     }
     json.end(']');
@@ -49,7 +46,7 @@ fn namespace(schema: &ir::Schema, wire: &Wire, id: NamespaceId, name: &str) -> S
     json.finish()
 }
 
-fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
+fn def_json(json: &mut Json, schema: &ir::Schema, id: TypeId) {
     let def = schema.def(id);
     json.begin('{');
     json.entry("name", &def.name);
@@ -59,12 +56,10 @@ fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
         None => json.entry_null("parent"),
     }
 
-    match (&def.kind, wire.def(id)) {
-        (DefKind::Enum(item), DefWire::Enum(layout)) => {
+    match &def.kind {
+        DefKind::Enum(item) => {
             json.entry("kind", "enum");
             json.entry("repr", item.repr.name());
-            json.entry_num("size", layout.size);
-            json.entry_num("align", layout.align);
             json.key("variants");
             json.begin('[');
             for variant in &item.variants {
@@ -76,25 +71,21 @@ fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
             }
             json.end(']');
         }
-        (DefKind::Struct(item), DefWire::Struct(item_wire)) => {
+        DefKind::Struct(item) => {
             json.entry("kind", "struct");
-            json.entry_num("size", item_wire.layout.size);
-            json.entry_num("align", item_wire.layout.align);
             json.key("fields");
             json.begin('[');
-            for (field, offset) in item.fields.iter().zip(&item_wire.offsets) {
+            for field in &item.fields {
                 json.item();
                 json.begin('{');
                 json.entry("name", &field.name);
                 json.entry("type", &type_name(schema, &field.ty));
-                json.entry_num("offset", offset);
                 json.end('}');
             }
             json.end(']');
         }
-        (DefKind::Union(item), DefWire::Union(item_wire)) => {
+        DefKind::Union(item) => {
             json.entry("kind", "union");
-            json.entry_num("payload_align", item_wire.payload_align);
             json.key("members");
             json.begin('[');
             for (tag, member) in item.members.iter().enumerate() {
@@ -107,35 +98,24 @@ fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
             }
             json.end(']');
         }
-        (DefKind::Message(item), DefWire::Message(item_wire)) => {
+        DefKind::Message(item) => {
             json.entry("kind", "message");
             match item.response {
                 Some(response) => json.entry("response", &qualified(schema, response)),
                 None => json.entry_null("response"),
             }
-            json.entry_num("align", item_wire.align);
-            json.entry_num("fixed_size", item_wire.fixed_size);
-            json.entry_num("presence_offset", item_wire.presence_offset);
-            json.entry_num("presence_bytes", item_wire.presence_bytes);
             json.key("fields");
             json.begin('[');
-            for (field, field_wire) in item.fields.iter().zip(&item_wire.fields) {
+            for field in &item.fields {
                 json.item();
                 json.begin('{');
                 json.entry("name", &field.name);
                 json.entry("type", &type_name(schema, &field.ty));
                 json.entry_bool("optional", field.optional);
-                json.entry_bool("fixed", wire.is_fixed(&field.ty));
-                json.entry_num("offset", field_wire.offset);
-                match field_wire.presence {
-                    Some(bit) => json.entry_num("presence", bit),
-                    None => json.entry_null("presence"),
-                }
                 json.end('}');
             }
             json.end(']');
         }
-        _ => unreachable!("the wire layout is parallel to the declarations"),
     }
 
     json.end('}');
@@ -363,14 +343,11 @@ mod tests {
     }
 
     #[test]
-    fn declarations_carry_qualified_names_and_layout() {
+    fn declarations_carry_qualified_names() {
         let contents = only(&["namespace a.b;\nstruct S { x: u8, y: u32 }\n"]);
         assert!(contents.contains(r#""path": "a.b.S""#), "{contents}");
-        assert!(contents.contains(r#""align": 4"#), "{contents}");
-        assert!(
-            contents.contains(r#""name": "x""#) && contents.contains(r#""offset": 4"#),
-            "{contents}"
-        );
+        assert!(contents.contains(r#""name": "x""#), "{contents}");
+        assert!(contents.contains(r#""type": "u32""#), "{contents}");
     }
 
     #[test]

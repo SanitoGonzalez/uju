@@ -1,5 +1,4 @@
 mod lower;
-pub mod wire;
 
 use std::fmt;
 
@@ -61,7 +60,7 @@ pub struct Variant {
     pub value: u64,
 }
 
-/// The unsigned integer type backing an enum on the wire.
+/// The unsigned integer type backing an enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnumRepr {
     U8,

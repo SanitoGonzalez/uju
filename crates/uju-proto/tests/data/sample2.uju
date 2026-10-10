@@ -1,4 +1,5 @@
 namespace hello;
+// namespace; // empty namespace is legal
 
 use foo.bar;
 

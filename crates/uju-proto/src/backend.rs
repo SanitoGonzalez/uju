@@ -1,15 +1,13 @@
 pub mod ir;
-pub mod rust;
 
 use std::fmt;
 use std::path::PathBuf;
 
 use crate::backend::ir::Ir;
-use crate::backend::rust::Rust;
 use crate::ir::Schema;
 
 /// Every name [`backend`] accepts, for listing in help and error messages.
-pub const BACKENDS: &[&str] = &["ir", "rust"];
+pub const BACKENDS: &[&str] = &["ir"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedFile {
@@ -56,7 +54,6 @@ impl std::error::Error for Error {}
 pub fn backend(name: &str) -> Option<Box<dyn Backend>> {
     match name {
         "ir" => Some(Box::new(Ir)),
-        "rust" => Some(Box::new(Rust)),
         _ => None,
     }
 }
