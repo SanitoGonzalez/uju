@@ -11,7 +11,7 @@ use crate::ecs::{
     world::World,
 };
 
-/// Marks a query term as mutable: `tx.query::<(Mut<Position>, Velocity)>()`
+/// Marks a query term as mutable: `Query::<(Mut<Position>, Velocity)>`
 /// yields `&mut Position` alongside `&Velocity`.
 pub struct Mut<C: Component>(PhantomData<C>);
 
@@ -308,14 +308,14 @@ impl_term!(
 /// term, held for the query's whole lifetime.
 ///
 /// Borrows are dynamic (`RefCell`); a term conflicting with any live borrow
-/// of the same component (another query, a point-access guard) panics at
-/// [`Tx::query`](crate::ecs::tx::Tx::query).
+/// of the same component (another query, a view) panics at
+/// [`Query::new`].
 pub struct Query<'w, Q: Term> {
     views: Q::View<'w>,
 }
 
 impl<'w, Q: Term> Query<'w, Q> {
-    pub(crate) fn new(world: &'w World) -> Self {
+    pub fn new(world: &'w World) -> Self {
         Self {
             views: Q::fetch(world),
         }
