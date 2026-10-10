@@ -100,7 +100,6 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         let kind = match site.item {
             ast::Item::Enum(item) => DefKind::Enum(self.lower_enum(site.source, item)),
             ast::Item::Struct(item) => DefKind::Struct(self.lower_struct(site.source, id, item)),
-            ast::Item::Union(item) => DefKind::Union(self.lower_union(site.source, id, item)),
             ast::Item::Message(item) => DefKind::Message(self.lower_message(site.source, id, item)),
             ast::Item::Const(_) => unreachable!("constants are collected separately"),
         };
@@ -247,28 +246,6 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             }
         }
         Struct { fields }
-    }
-
-    fn lower_union(&mut self, source: SourceId, id: TypeId, item: &ast::Union<'src>) -> Union {
-        if item.body.fields.is_empty() {
-            self.error(
-                source,
-                &item.name.1,
-                format!("union `{}` needs at least one member", item.name.0),
-            );
-        }
-        for field in &item.body.fields {
-            if field.optional {
-                self.diagnostics.push(Diagnostic::new(
-                    source,
-                    field.name.1.clone(),
-                    "a union member cannot be optional",
-                ));
-            }
-        }
-        Union {
-            members: self.lower_fields(source, id, &item.body),
-        }
     }
 
     fn lower_message(
@@ -526,8 +503,8 @@ impl<'a, 'src> Lowerer<'a, 'src> {
     }
 
     /// Report types whose fixed parts recursively contain themselves; such a
-    /// type has no finite wire size. Variable-size types (`vec`, `string`,
-    /// unions, ...) break a cycle, since their contents live out of line.
+    /// type has no finite size. Variable-size types (`vec`, `string`, ...)
+    /// break a cycle, since their contents live out of line.
     /// Optional fields do not: their data still sits inline behind a
     /// presence bit.
     fn check_cycles(&mut self, defs: &[Def]) {
@@ -542,7 +519,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
     fn visit(&mut self, defs: &[Def], marks: &mut [Mark], index: usize) {
         marks[index] = Mark::Grey;
         let fields = match &defs[index].kind {
-            DefKind::Enum(_) | DefKind::Union(_) => &[][..],
+            DefKind::Enum(_) => &[][..],
             DefKind::Struct(item) => &item.fields,
             DefKind::Message(item) => &item.fields,
         };
@@ -923,26 +900,10 @@ mod tests {
     }
 
     #[test]
-    fn unions_are_validated() {
-        assert_eq!(
-            messages(&["namespace a;\nunion U {}\n"]),
-            ["union `U` needs at least one member"]
-        );
-        assert_eq!(
-            messages(&["namespace a;\nunion U { a: i32? }\n"]),
-            ["a union member cannot be optional"]
-        );
-    }
-
-    #[test]
     fn messages_are_standalone() {
         assert_eq!(
-            messages(&["namespace a;\nmessage M {}\nunion U { m: M }\n"]),
+            messages(&["namespace a;\nmessage M {}\nstruct S { m: M }\n"]),
             ["`M` is a message; messages are standalone and cannot be used as a type"]
-        );
-        assert_eq!(
-            messages(&["namespace a;\nmessage M {}\nstruct S { m: M }\n"]).len(),
-            1
         );
         assert_eq!(
             messages(&["namespace a;\nmessage M {}\nmessage N { v: vec<M> }\n"]).len(),
@@ -959,10 +920,6 @@ mod tests {
         assert_eq!(
             messages(&["namespace a;\nstruct S { s: string }\n"]),
             ["`string` is variable-size; a struct field must be fixed-size"]
-        );
-        assert_eq!(
-            messages(&["namespace a;\nunion U { x: i32 }\nstruct S { u: U }\n"]),
-            ["`U` is variable-size; a struct field must be fixed-size"]
         );
         assert_eq!(
             messages(&["namespace a;\nstruct S { x: i32? }\n"]),
@@ -1012,6 +969,5 @@ mod tests {
 
         // Variable-size types break the cycle.
         compiled(&["namespace a;\nstruct S { x: i32 }\nmessage M { v: vec<S> }\n"]);
-        compiled(&["namespace a;\nunion U { u: U, x: i32 }\n"]);
     }
 }

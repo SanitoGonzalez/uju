@@ -1397,21 +1397,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "uju-proto"
-version = "0.1.0"
-dependencies = [
- "chumsky",
- "heck",
- "logos",
-]
-
-[[package]]
 name = "uju-protoc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chumsky",
  "clap",
- "uju-proto",
+ "logos",
 ]
 
 [[package]]

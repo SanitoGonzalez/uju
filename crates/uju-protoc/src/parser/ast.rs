@@ -22,7 +22,6 @@ pub enum Item<'src> {
     Const(Const<'src>),
     Enum(Enum<'src>),
     Struct(Struct<'src>),
-    Union(Union<'src>),
     Message(Message<'src>),
 }
 
@@ -49,12 +48,6 @@ pub struct Variant<'src> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Struct<'src> {
-    pub name: Ident<'src>,
-    pub body: Body<'src>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Union<'src> {
     pub name: Ident<'src>,
     pub body: Body<'src>,
 }
@@ -147,7 +140,6 @@ impl<'src> Item<'src> {
             Item::Const(item) => &item.name,
             Item::Enum(item) => &item.name,
             Item::Struct(item) => &item.name,
-            Item::Union(item) => &item.name,
             Item::Message(item) => &item.name,
         }
     }
@@ -157,7 +149,6 @@ impl<'src> Item<'src> {
             Item::Const(_) => "const",
             Item::Enum(_) => "enum",
             Item::Struct(_) => "struct",
-            Item::Union(_) => "union",
             Item::Message(_) => "message",
         }
     }
@@ -165,7 +156,6 @@ impl<'src> Item<'src> {
     pub fn body(&self) -> Option<&Body<'src>> {
         match self {
             Item::Struct(item) => Some(&item.body),
-            Item::Union(item) => Some(&item.body),
             Item::Message(item) => Some(&item.body),
             Item::Const(_) | Item::Enum(_) => None,
         }

@@ -27,9 +27,6 @@ pub enum Token<'src> {
     #[token("struct")]
     Struct,
 
-    #[token("union")]
-    Union,
-
     #[token("message")]
     Message,
 
@@ -217,7 +214,6 @@ impl fmt::Display for Token<'_> {
             Token::Const => f.write_str("const"),
             Token::Enum => f.write_str("enum"),
             Token::Struct => f.write_str("struct"),
-            Token::Union => f.write_str("union"),
             Token::Message => f.write_str("message"),
             Token::BraceOpen => f.write_str("{"),
             Token::BraceClose => f.write_str("}"),
@@ -274,14 +270,13 @@ mod tests {
     #[test]
     fn keywords_and_punctuation() {
         assert_eq!(
-            tokens("namespace use const enum struct union message"),
+            tokens("namespace use const enum struct message"),
             [
                 Token::Namespace,
                 Token::Use,
                 Token::Const,
                 Token::Enum,
                 Token::Struct,
-                Token::Union,
                 Token::Message,
             ]
         );

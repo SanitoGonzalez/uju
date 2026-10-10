@@ -44,7 +44,6 @@ pub struct Def {
 pub enum DefKind {
     Enum(Enum),
     Struct(Struct),
-    Union(Union),
     Message(Message),
 }
 
@@ -72,12 +71,6 @@ pub enum EnumRepr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Struct {
     pub fields: Vec<Field>,
-}
-
-/// A tagged choice; exactly one member is set at a time.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Union {
-    pub members: Vec<Field>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

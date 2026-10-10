@@ -209,11 +209,6 @@ where
             .then(body.clone())
             .map(|(name, body)| Item::Struct(Struct { name, body }));
 
-        let union_item = just(Token::Union)
-            .ignore_then(ident)
-            .then(body.clone())
-            .map(|(name, body)| Item::Union(Union { name, body }));
-
         let message_item = just(Token::Message)
             .ignore_then(ident)
             .then(just(Token::Arrow).ignore_then(path.clone()).or_not())
@@ -226,7 +221,7 @@ where
                 })
             });
 
-        choice((const_item, enum_item, struct_item, union_item, message_item))
+        choice((const_item, enum_item, struct_item, message_item))
             .labelled("declaration")
             .boxed()
     });
@@ -367,10 +362,6 @@ mod tests {
 
         assert_eq!(item(&schema, "EmptyStruct").body(), Some(&Body::default()));
         assert_eq!(fields(item(&schema, "Velocity")), ["x: f32", "y: f32"]);
-        assert_eq!(
-            fields(item(&schema, "SomeUnion")),
-            ["v: vec<i32>", "s: string", "vel: Velocity"]
-        );
     }
 
     #[test]

@@ -84,20 +84,6 @@ fn def_json(json: &mut Json, schema: &ir::Schema, id: TypeId) {
             }
             json.end(']');
         }
-        DefKind::Union(item) => {
-            json.entry("kind", "union");
-            json.key("members");
-            json.begin('[');
-            for (tag, member) in item.members.iter().enumerate() {
-                json.item();
-                json.begin('{');
-                json.entry("name", &member.name);
-                json.entry("type", &type_name(schema, &member.ty));
-                json.entry_num("tag", tag);
-                json.end('}');
-            }
-            json.end(']');
-        }
         DefKind::Message(item) => {
             json.entry("kind", "message");
             match item.response {
