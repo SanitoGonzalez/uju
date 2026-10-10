@@ -7,8 +7,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use clap::builder::PossibleValuesParser;
-use uju_schema::backend::{self, BACKENDS, GeneratedFile};
-use uju_schema::compile;
+use uju_proto::backend::{self, BACKENDS, GeneratedFile};
+use uju_proto::compile;
 
 /// The extension directories are searched for.
 const EXTENSION: &str = "uju";

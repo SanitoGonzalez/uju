@@ -1,5 +1,5 @@
 [package]
-name = "uju-schemac"
+name = "uju-protoc"
 version.workspace = true
 edition.workspace = true
 
@@ -8,7 +8,7 @@ name = "ujuc"
 path = "src/main.rs"
 
 [dependencies]
-uju-schema = { path = "../uju-schema" }
+uju-proto = { path = "../uju-proto" }
 
 anyhow.workspace = true
 clap.workspace = true

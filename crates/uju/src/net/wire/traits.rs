@@ -1,5 +1,5 @@
 //! The wire traits and the layout arithmetic shared by owned values, views,
-//! and generated code; the format itself is specified in `docs/schema/wire.md`.
+//! and generated code; the format itself is specified in `docs/proto/wire.md`.
 //!
 //! Offsets are absolute in the message buffer, because padding is measured
 //! from the start of the message: a value never moves relative to its

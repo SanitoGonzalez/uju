@@ -1397,7 +1397,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "uju-schema"
+name = "uju-proto"
 version = "0.1.0"
 dependencies = [
  "chumsky",
@@ -1406,12 +1406,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "uju-schemac"
+name = "uju-protoc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "uju-schema",
+ "uju-proto",
 ]
 
 [[package]]
