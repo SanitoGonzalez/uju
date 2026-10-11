@@ -1,16 +1,36 @@
+use std::mem::MaybeUninit;
 use std::thread::JoinHandle;
 
+use futures_util::{FutureExt, select};
 use tracing::{info, warn};
 
 use crate::cluster::shard;
 
 pub type Id = u16;
 
-static mut ID: Id = u16::MAX;
+static mut CURRENT: MaybeUninit<Node> = MaybeUninit::uninit();
 
-/// Get the current node ID
-pub fn current() -> Id {
-    unsafe { ID }
+pub struct Node {
+    id: Id,
+}
+
+impl Node {
+    /// Get the current node. Must be called after the node is initialized by [`Builder::run`].
+    #[inline(always)]
+    pub fn current() -> &'static Node {
+        unsafe { (*&raw const CURRENT).assume_init_ref() }
+    }
+
+    /// Borrow the current node within the closure. Same contract as [`Node::current`].
+    #[inline(always)]
+    pub fn with<R>(f: impl FnOnce(&Node) -> R) -> R {
+        f(Self::current())
+    }
+
+    #[inline(always)]
+    pub fn id(&self) -> Id {
+        self.id
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +53,7 @@ impl Builder {
     }
 
     pub fn run(self) -> std::io::Result<()> {
-        unsafe { ID = self.id }
+        unsafe { (*&raw mut CURRENT).write(Node { id: self.id }) };
 
         let runtime = compio::runtime::Runtime::new()?;
         runtime.block_on(async move {
@@ -67,6 +87,8 @@ impl Builder {
         }
 
         let (shutdown, token) = crossfire::mpmc::Null::new().new_async();
+        // closes once every shard thread has returned (or unwound), dropping its sender
+        let (done_tx, done_rx) = crossfire::mpsc::bounded_blocking_async::<()>(1);
 
         for (id, cpu) in allowed_cpus.drain(..).enumerate() {
             let shard_builder = self.shard_builder.clone();
@@ -78,9 +100,11 @@ impl Builder {
             cpuset.set(cpu)?;
 
             let token = token.clone();
+            let done_tx = done_tx.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("shard-{id}"))
                 .spawn(move || {
+                    let _done_tx = done_tx;
                     sched_setaffinity(Pid::from_raw(0), &cpuset)?;
                     info!("[shard-{id}] thread pinned on cpu {cpu}");
 
@@ -94,17 +118,21 @@ impl Builder {
 
         drop(senders);
         drop(receivers);
+        drop(done_tx);
 
-        compio::runtime::spawn(async move {
-            _ = compio::signal::ctrl_c().await;
-
-            drop(shutdown);
-        })
-        .detach();
+        select! {
+            result = compio::signal::ctrl_c().fuse() => if let Err(e) = result {
+                warn!("failed to listen for ctrl-c: {e}");
+            },
+            _ = done_rx.recv().fuse() => warn!("all shards exited"),
+        }
+        drop(shutdown);
 
         for (id, handle) in handles.into_iter().enumerate() {
-            if let Err(e) = handle.join() {
-                warn!("panicked to join shard-{id} thread: {e:?}");
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("shard-{id} thread exited with an error: {e}"),
+                Err(e) => warn!("panicked to join shard-{id} thread: {e:?}"),
             }
         }
 

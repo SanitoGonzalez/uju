@@ -1,6 +1,6 @@
 pub mod message;
 
-use std::cell::Cell;
+use std::cell::UnsafeCell;
 use std::net::SocketAddr;
 use std::num::NonZero;
 use std::rc::Rc;
@@ -10,7 +10,7 @@ use futures_util::{FutureExt, select};
 use tracing::{error, info};
 
 use crate::cluster::error::Result;
-use crate::cluster::node;
+use crate::cluster::node::Node;
 use crate::cluster::shard::message::Frame;
 use crate::ecs::world::World;
 use crate::net::transport::tcp;
@@ -18,13 +18,7 @@ use crate::util::stop::{StopSource, StopToken};
 
 pub type Id = u16;
 
-thread_local! { static ID: Cell<Id> = const { Cell::new(Id::MAX) } }
-
-/// Get the current shard ID
-#[inline(always)]
-pub fn current() -> Id {
-    ID.get()
-}
+thread_local! { static CURRENT: UnsafeCell<Option<Rc<Shard>>> = const { UnsafeCell::new(None) } }
 
 pub type FrameTx = crossfire::MTx<crossfire::mpsc::Array<Frame>>;
 pub type FrameRx = crossfire::AsyncRx<crossfire::mpsc::Array<Frame>>;
@@ -40,14 +34,31 @@ pub struct Shard {
 }
 
 impl Shard {
+    /// Get the current shard. Must be called on a shard thread, after the shard is initialized
+    /// by [`Builder::run`].
+    #[inline(always)]
+    pub fn current() -> Rc<Shard> {
+        CURRENT.with(|cell| unsafe { (*cell.get()).as_ref().unwrap_unchecked().clone() })
+    }
+
+    /// Borrow the current shard within the closure, without touching the refcount.
+    /// Same contract as [`Shard::current`].
+    #[inline(always)]
+    pub fn with<R>(f: impl FnOnce(&Shard) -> R) -> R {
+        CURRENT.with(|cell| f(unsafe { (*cell.get()).as_ref().unwrap_unchecked() }))
+    }
+
+    #[inline(always)]
+    pub fn id(&self) -> Id {
+        self.id
+    }
+
     async fn run(
         self: Rc<Self>,
         rx: FrameRx,
         tick_interval: Duration,
         shutdown: ShutdownRx,
     ) -> Result<()> {
-        ID.set(self.id);
-
         Self::spawn_recv_loop(self.clone(), rx);
         Self::spawn_tcp_server(self.clone())?;
         Self::spawn_tick(self.clone(), tick_interval); // todo: move tick interval into configs
@@ -111,7 +122,7 @@ impl Shard {
     }
 
     fn tick(self: &Rc<Self>, _dt: f32) {
-        info!("[shard-{}] ticking", self.id);
+        // info!("[shard-{}] ticking", self.id);
     }
 
     async fn process(self: &Rc<Self>, frame: Frame) {
@@ -171,14 +182,18 @@ impl Builder {
             tx,
             stop,
             token,
-            world: World::new(node::current(), id),
+            world: World::new(Node::current().id(), id),
         });
+        CURRENT.with(|cell| unsafe { *cell.get() = Some(shard.clone()) });
 
         runtime.block_on(async move {
             if let Err(e) = shard.run(rx, tick_interval, shutdown).await {
                 error!("[shard-{}] stopped with an error: {:?}", id, e);
             }
         });
+
+        // drop the shard while the runtime is still alive, rather than at thread exit
+        CURRENT.with(|cell| unsafe { *cell.get() = None });
 
         Ok(())
     }

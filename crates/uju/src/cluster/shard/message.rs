@@ -1,4 +1,5 @@
-use crate::cluster::{node, shard};
+use crate::cluster::node::{self, Node};
+use crate::cluster::shard::{self, Shard};
 
 pub struct Frame {
     pub node: node::Id,
@@ -10,8 +11,8 @@ pub struct Frame {
 impl Frame {
     pub fn with_current(msg: Message, result_tx: Option<shard::FrameTx>) -> Self {
         Self {
-            node: node::current(),
-            shard: shard::current(),
+            node: Node::with(|n| n.id()),
+            shard: Shard::with(|s| s.id()),
             msg,
             result_tx,
         }
