@@ -1,4 +1,5 @@
 mod lower;
+pub mod wire;
 
 use std::fmt;
 
@@ -133,9 +134,11 @@ pub struct Constraints {
     pub min: Option<Number>,
     /// Inclusive upper bound of a number.
     pub max: Option<Number>,
-    /// Inclusive lower bound on the length of a string, bytes, or collection.
+    /// Inclusive lower bound on the length of a string or bytes (in bytes) or
+    /// of a collection (in items).
     pub min_length: Option<u64>,
-    /// Inclusive upper bound on the length of a string, bytes, or collection.
+    /// Inclusive upper bound on the length of a string or bytes (in bytes) or
+    /// of a collection (in items).
     pub max_length: Option<u64>,
     /// Whether a float may be infinite; floats are finite by default.
     pub infinite: bool,
@@ -172,6 +175,84 @@ impl Schema {
         path.reverse();
         path
     }
+
+    /// A declaration's namespace, the declarations it is nested in, and its
+    /// own name, joined with `.`: `foo.bar.MyResponse.Result`.
+    pub fn qualified(&self, id: TypeId) -> String {
+        let mut name = self.namespace(self.def(id).namespace).name.join(".");
+        for segment in self.path(id) {
+            name.push('.');
+            name.push_str(segment);
+        }
+        name
+    }
+
+    /// The type as it would be written in source, with named types qualified
+    /// and constraints in canonical order: `vec<foo.bar.Position>[max_length=8]`.
+    pub fn type_name(&self, ty: &Type) -> String {
+        let name = match &ty.kind {
+            TypeKind::I8 => "i8".to_string(),
+            TypeKind::I16 => "i16".to_string(),
+            TypeKind::I32 => "i32".to_string(),
+            TypeKind::I64 => "i64".to_string(),
+            TypeKind::U8 => "u8".to_string(),
+            TypeKind::U16 => "u16".to_string(),
+            TypeKind::U32 => "u32".to_string(),
+            TypeKind::U64 => "u64".to_string(),
+            TypeKind::F32 => "f32".to_string(),
+            TypeKind::F64 => "f64".to_string(),
+            TypeKind::Bool => "bool".to_string(),
+            TypeKind::Timestamp => "timestamp".to_string(),
+            TypeKind::Interval => "interval".to_string(),
+            TypeKind::Entity => "entity".to_string(),
+            TypeKind::UEntity => "uentity".to_string(),
+            TypeKind::Uuid => "uuid".to_string(),
+            TypeKind::String => "string".to_string(),
+            TypeKind::Bytes => "bytes".to_string(),
+            TypeKind::Array(item, len) => format!("array<{}, {len}>", self.type_name(item)),
+            TypeKind::Vec(item) => format!("vec<{}>", self.type_name(item)),
+            TypeKind::Set(item) => format!("set<{}>", self.type_name(item)),
+            TypeKind::Map(key, value) => {
+                format!("map<{}, {}>", self.type_name(key), self.type_name(value))
+            }
+            TypeKind::Named(id) => self.qualified(*id),
+        };
+        format!("{name}{}", ty.constraints)
+    }
+
+    /// Whether every value of `ty` encodes to the same number of bytes. A
+    /// struct is fixed-size when all of its fields are, and none is optional
+    /// but an `option<bool>`, which takes two bits either way.
+    pub fn is_fixed(&self, ty: &Type) -> bool {
+        self.is_fixed_in(ty, &mut Vec::new())
+    }
+
+    /// `visiting` guards against recursive structs, which are reported
+    /// separately.
+    fn is_fixed_in(&self, ty: &Type, visiting: &mut Vec<TypeId>) -> bool {
+        match &ty.kind {
+            TypeKind::String | TypeKind::Bytes => ty.constraints.fixed_length().is_some(),
+            TypeKind::Vec(_) | TypeKind::Set(_) | TypeKind::Map(..) => false,
+            TypeKind::Array(item, _) => self.is_fixed_in(item, visiting),
+            TypeKind::Named(id) => match &self.def(*id).kind {
+                DefKind::Enum(_) => true,
+                DefKind::Message(_) => false,
+                DefKind::Struct(item) => {
+                    if visiting.contains(id) {
+                        return true;
+                    }
+                    visiting.push(*id);
+                    let fixed = item.fields.iter().all(|field| {
+                        (!field.optional || field.ty.kind == TypeKind::Bool)
+                            && self.is_fixed_in(&field.ty, visiting)
+                    });
+                    visiting.pop();
+                    fixed
+                }
+            },
+            _ => true,
+        }
+    }
 }
 
 impl From<TypeKind> for Type {
@@ -186,6 +267,12 @@ impl From<TypeKind> for Type {
 impl Constraints {
     pub fn is_empty(&self) -> bool {
         *self == Constraints::default()
+    }
+
+    /// The length every value has, when `min_length` and `max_length` agree:
+    /// `string[min_length=3, max_length=3]` is always 3 bytes.
+    pub fn fixed_length(&self) -> Option<u64> {
+        self.min_length.filter(|min| Some(*min) == self.max_length)
     }
 }
 

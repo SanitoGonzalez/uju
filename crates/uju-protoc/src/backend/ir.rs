@@ -2,7 +2,7 @@
 //! qualified and every type spelled the way it is written in source.
 
 use crate::backend::{Backend, Error, GeneratedFile};
-use crate::ir::{self, DefKind, NamespaceId, Type, TypeId, TypeKind};
+use crate::ir::{self, DefKind, NamespaceId, TypeId};
 
 pub struct Ir;
 
@@ -42,9 +42,9 @@ fn def_json(json: &mut Json, schema: &ir::Schema, id: TypeId) {
     let def = schema.def(id);
     json.begin('{');
     json.entry("name", &def.name);
-    json.entry("path", &qualified(schema, id));
+    json.entry("path", &schema.qualified(id));
     match def.parent {
-        Some(parent) => json.entry("parent", &qualified(schema, parent)),
+        Some(parent) => json.entry("parent", &schema.qualified(parent)),
         None => json.entry_null("parent"),
     }
 
@@ -71,7 +71,7 @@ fn def_json(json: &mut Json, schema: &ir::Schema, id: TypeId) {
                 json.item();
                 json.begin('{');
                 json.entry("name", &field.name);
-                json.entry("type", &type_name(schema, &field.ty));
+                json.entry("type", &schema.type_name(&field.ty));
                 json.end('}');
             }
             json.end(']');
@@ -85,7 +85,7 @@ fn def_json(json: &mut Json, schema: &ir::Schema, id: TypeId) {
                 json.item();
                 json.begin('{');
                 json.entry("name", &field.name);
-                json.entry("type", &type_name(schema, &field.ty));
+                json.entry("type", &schema.type_name(&field.ty));
                 json.entry_bool("optional", field.optional);
                 json.end('}');
             }
@@ -94,54 +94,6 @@ fn def_json(json: &mut Json, schema: &ir::Schema, id: TypeId) {
     }
 
     json.end('}');
-}
-
-/// The type as it would be written in source, with named types qualified
-/// and constraints in canonical order: `vec<foo.bar.Position>[max_length=8]`.
-fn type_name(schema: &ir::Schema, ty: &Type) -> String {
-    let name = match &ty.kind {
-        TypeKind::I8 => "i8".to_string(),
-        TypeKind::I16 => "i16".to_string(),
-        TypeKind::I32 => "i32".to_string(),
-        TypeKind::I64 => "i64".to_string(),
-        TypeKind::U8 => "u8".to_string(),
-        TypeKind::U16 => "u16".to_string(),
-        TypeKind::U32 => "u32".to_string(),
-        TypeKind::U64 => "u64".to_string(),
-        TypeKind::F32 => "f32".to_string(),
-        TypeKind::F64 => "f64".to_string(),
-        TypeKind::Bool => "bool".to_string(),
-        TypeKind::Timestamp => "timestamp".to_string(),
-        TypeKind::Interval => "interval".to_string(),
-        TypeKind::Entity => "entity".to_string(),
-        TypeKind::UEntity => "uentity".to_string(),
-        TypeKind::Uuid => "uuid".to_string(),
-        TypeKind::String => "string".to_string(),
-        TypeKind::Bytes => "bytes".to_string(),
-        TypeKind::Array(item, len) => format!("array<{}, {len}>", type_name(schema, item)),
-        TypeKind::Vec(item) => format!("vec<{}>", type_name(schema, item)),
-        TypeKind::Set(item) => format!("set<{}>", type_name(schema, item)),
-        TypeKind::Map(key, value) => {
-            format!(
-                "map<{}, {}>",
-                type_name(schema, key),
-                type_name(schema, value)
-            )
-        }
-        TypeKind::Named(id) => qualified(schema, *id),
-    };
-    format!("{name}{}", ty.constraints)
-}
-
-/// A declaration's namespace, the declarations it is nested in, and its own
-/// name, joined with `.`.
-fn qualified(schema: &ir::Schema, id: TypeId) -> String {
-    let mut name = schema.namespace(schema.def(id).namespace).name.join(".");
-    for segment in schema.path(id) {
-        name.push('.');
-        name.push_str(segment);
-    }
-    name
 }
 
 /// Just enough of a JSON writer for the shapes above, tracking commas and

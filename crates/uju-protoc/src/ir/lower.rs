@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::diagnostic::{Diagnostic, SourceId};
+use crate::ir::wire::{self, Wire};
 use crate::ir::*;
 use crate::lexer::Span;
 use crate::parser::ast;
@@ -14,6 +15,7 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
     let mut lowerer = Lowerer {
         resolver: &resolver,
         diagnostics,
+        fixed_checks: Vec::new(),
     };
 
     let defs: Vec<Def> = resolver
@@ -23,16 +25,7 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
         .map(|(index, site)| lowerer.lower_def(TypeId(index), site))
         .collect();
 
-    // Only meaningful once every type has resolved; unresolved fields carry
-    // placeholder types that would produce nonsense cycles.
-    if lowerer.diagnostics.is_empty() {
-        lowerer.check_cycles(&defs);
-    }
-    if !lowerer.diagnostics.is_empty() {
-        return Err(lowerer.diagnostics);
-    }
-
-    Ok(Schema {
+    let schema = Schema {
         namespaces: (0..resolver.namespace_len())
             .map(|index| Namespace {
                 name: resolver
@@ -43,12 +36,43 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
             })
             .collect(),
         defs,
-    })
+    };
+
+    // Whether a struct is fixed-size depends on its fields, so these wait
+    // until every declaration is lowered.
+    lowerer.check_fixed(&schema);
+    // Only meaningful once every type has resolved; unresolved fields carry
+    // placeholder types that would produce nonsense cycles.
+    if lowerer.diagnostics.is_empty() {
+        lowerer.check_cycles(&schema.defs);
+    }
+    // Sizes are only finite once cycles are ruled out.
+    if lowerer.diagnostics.is_empty() {
+        lowerer.check_wire(&schema);
+    }
+    if !lowerer.diagnostics.is_empty() {
+        return Err(lowerer.diagnostics);
+    }
+
+    Ok(schema)
 }
 
 struct Lowerer<'a, 'src> {
     resolver: &'a Resolver<'a, 'src>,
     diagnostics: Vec<Diagnostic>,
+    fixed_checks: Vec<FixedCheck>,
+}
+
+/// A type that must be fixed-size, checked once every declaration is
+/// lowered.
+struct FixedCheck {
+    source: SourceId,
+    span: Span,
+    /// The type as written.
+    written: String,
+    ty: Type,
+    /// What the type is, as in "a set item".
+    role: &'static str,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -222,27 +246,9 @@ impl<'a, 'src> Lowerer<'a, 'src> {
     }
 
     fn lower_struct(&mut self, source: SourceId, id: TypeId, item: &ast::Struct<'src>) -> Struct {
-        let fields = self.lower_fields(source, id, &item.body);
-        for (field, ast_field) in fields.iter().zip(&item.body.fields) {
-            if field.optional {
-                self.diagnostics.push(Diagnostic::new(
-                    source,
-                    ast_field.name.1.clone(),
-                    "a struct field cannot be optional",
-                ));
-            }
-            if !self.is_fixed(&field.ty) {
-                self.diagnostics.push(Diagnostic::new(
-                    source,
-                    ast_field.ty.span.clone(),
-                    format!(
-                        "`{}` is variable-size; a struct field must be fixed-size",
-                        ast_field.ty
-                    ),
-                ));
-            }
+        Struct {
+            fields: self.lower_fields(source, id, &item.body),
         }
-        Struct { fields }
     }
 
     fn lower_message(
@@ -272,13 +278,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             ast::TypeKind::Prim(prim) => prim_type(*prim),
             ast::TypeKind::Array(item, (len, _)) => {
                 let item_ty = self.lower_type(source, scope, item);
-                if !self.is_fixed(&item_ty) {
-                    self.error(
-                        source,
-                        &item.span,
-                        format!("`{item}` is variable-size; an array item must be fixed-size"),
-                    );
-                }
+                self.require_fixed(source, item, &item_ty, "an array item");
                 TypeKind::Array(Box::new(item_ty), *len)
             }
             ast::TypeKind::Vec(item) => {
@@ -330,6 +330,54 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         Type { kind, constraints }
     }
 
+    fn require_fixed(
+        &mut self,
+        source: SourceId,
+        written: &ast::Type<'src>,
+        ty: &Type,
+        role: &'static str,
+    ) {
+        self.fixed_checks.push(FixedCheck {
+            source,
+            span: written.span.clone(),
+            written: written.to_string(),
+            ty: ty.clone(),
+            role,
+        });
+    }
+
+    fn check_fixed(&mut self, schema: &Schema) {
+        for check in std::mem::take(&mut self.fixed_checks) {
+            if !schema.is_fixed(&check.ty) {
+                self.error(
+                    check.source,
+                    &check.span,
+                    format!(
+                        "`{}` is variable-size; {} must be fixed-size",
+                        check.written, check.role
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Report what the wire format cannot hold, such as a value larger than
+    /// any message.
+    fn check_wire(&mut self, schema: &Schema) {
+        let Err(errors) = Wire::new(schema) else {
+            return;
+        };
+        for error in errors {
+            let site = &self.resolver.types[error.def.0];
+            let span = match (error.field, site.item.body()) {
+                (Some(field), Some(body)) => body.fields[field].ty.span.clone(),
+                _ => site.item.name().1.clone(),
+            };
+            self.diagnostics
+                .push(Diagnostic::new(site.source, span, error.message));
+        }
+    }
+
     /// Set items and map keys must be fixed-size and comparable, which rules
     /// out floats anywhere inline: `NaN != NaN` and `-0.0 == 0.0` break
     /// lookup, and many targets (Rust among them) cannot hash or order
@@ -340,15 +388,10 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         scope: Option<TypeId>,
         key: &ast::Type<'src>,
         key_ty: &Type,
-        role: &str,
+        role: &'static str,
     ) {
-        if !self.is_fixed(key_ty) {
-            self.error(
-                source,
-                &key.span,
-                format!("`{key}` is variable-size; {role} must be fixed-size"),
-            );
-        } else if let Some(path) = self.holds_float(source, scope, key, &mut Vec::new()) {
+        self.require_fixed(source, key, key_ty, role);
+        if let Some(path) = self.holds_float(source, scope, key, &mut Vec::new()) {
             let through = if path.is_empty() {
                 String::new()
             } else {
@@ -498,6 +541,17 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                         );
                         continue;
                     };
+                    if length > wire::MAX_SIZE as u64 {
+                        self.error(
+                            source,
+                            value_span,
+                            format!(
+                                "`{name}` must be at most {}, the size of a message",
+                                wire::MAX_SIZE
+                            ),
+                        );
+                        continue;
+                    }
                     if *name == "min_length" {
                         out.min_length = Some(length);
                     } else {
@@ -573,21 +627,6 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                 }
             }
             (Class::Length | Class::None, _) => unreachable!("only numbers take `min`/`max`"),
-        }
-    }
-
-    fn is_fixed(&self, ty: &Type) -> bool {
-        match &ty.kind {
-            TypeKind::String
-            | TypeKind::Bytes
-            | TypeKind::Vec(_)
-            | TypeKind::Set(_)
-            | TypeKind::Map(..) => false,
-            TypeKind::Named(id) => matches!(
-                self.resolver.types[id.0].item,
-                ast::Item::Enum(_) | ast::Item::Struct(_)
-            ),
-            _ => true,
         }
     }
 
@@ -966,19 +1005,52 @@ mod tests {
     }
 
     #[test]
-    fn structs_are_fixed_size_pods() {
-        assert_eq!(
-            messages(&["namespace a;\nstruct S { v: vec<i32> }\n"]),
-            ["`vec<i32>` is variable-size; a struct field must be fixed-size"]
+    fn structs_can_hold_variable_size_and_optional_fields() {
+        compiled(&["namespace a;\nstruct S { v: vec<i32>, s: string, x: option<i32> }\n"]);
+    }
+
+    #[test]
+    fn fixed_size_depends_on_the_fields() {
+        let prelude = concat!(
+            "namespace a;\n",
+            "struct Var { s: string }\n",
+            "struct Optional { x: option<u8> }\n",
+            "struct Flags { a: option<bool> }\n",
+            "struct Code { c: string[min_length=2, max_length=2] }\n",
         );
+        let cases = [
+            (
+                "a: array<Var, 2>",
+                "`Var` is variable-size; an array item must be fixed-size",
+            ),
+            (
+                "s: set<Optional>",
+                "`Optional` is variable-size; a set item must be fixed-size",
+            ),
+            (
+                "m: map<string[max_length=2], u8>",
+                "`string[max_length=2]` is variable-size; a map key must be fixed-size",
+            ),
+        ];
+        for (field, expected) in cases {
+            let src = format!("{prelude}message[in] M {{ {field} }}\n");
+            assert_eq!(messages(&[&src]), [expected], "{field}");
+        }
+
+        // A fixed length makes strings fixed-size, and `option<bool>` stays
+        // in the bitmap.
+        compiled(&[&format!(
+            "{prelude}message[in] M {{ a: array<Flags, 2>, s: set<Code>, m: map<bytes[min_length=4, max_length=4], u8> }}\n"
+        )]);
+    }
+
+    #[test]
+    fn lengths_fit_a_message() {
         assert_eq!(
-            messages(&["namespace a;\nstruct S { s: string }\n"]),
-            ["`string` is variable-size; a struct field must be fixed-size"]
+            messages(&["namespace a;\nmessage[in] M { s: string[max_length=65536] }\n"]),
+            ["`max_length` must be at most 65535, the size of a message"]
         );
-        assert_eq!(
-            messages(&["namespace a;\nstruct S { x: option<i32> }\n"]),
-            ["a struct field cannot be optional"]
-        );
+        compiled(&["namespace a;\nmessage[in] M { s: vec<u8>[max_length=65535] }\n"]);
     }
 
     #[test]
