@@ -1,8 +1,10 @@
 use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
 
+use crate::cluster::{node, shard};
 use crate::ecs::{
     component::{self, Component},
+    entity::{Entity, Registry, UniversalAllocator, UniversalId},
     storage::{
         table::Table,
         view::{View, ViewMut},
@@ -11,13 +13,18 @@ use crate::ecs::{
 };
 
 pub struct World {
+    pub(crate) entities: RefCell<Registry>,
     pub(crate) tables: Vec<RefCell<Box<dyn Table>>>,
     pub(crate) uniques: Vec<RefCell<Option<Box<dyn Any>>>>,
 }
 
 impl World {
-    pub fn new() -> Self {
+    /// `node` and `shard` name the minter of this world's [`UniversalId`]s.
+    pub fn new(node: node::Id, shard: shard::Id) -> Self {
+        // todo: resume from the persisted serial high-water mark instead of 0
+        let universal = UniversalAllocator::new(node, shard, 0);
         let world = Self {
+            entities: RefCell::new(Registry::new(universal)),
             tables: component::registrations()
                 .into_iter()
                 .map(|registration| RefCell::new((registration.new_table)()))
@@ -27,6 +34,52 @@ impl World {
         world.insert_unique(Time::new());
 
         world
+    }
+
+    pub fn entities(&self) -> Ref<'_, Registry> {
+        self.entities.borrow()
+    }
+
+    pub fn spawn(&self) -> Entity {
+        self.entities.borrow_mut().spawn()
+    }
+
+    /// Frees `entity` and drops its components from every table.
+    ///
+    /// Panics if any view is borrowed at the time.
+    pub fn despawn(&self, entity: Entity) -> bool {
+        if !self.entities.borrow_mut().despawn(entity) {
+            return false;
+        }
+
+        for table in &self.tables {
+            table.borrow_mut().remove(entity);
+        }
+        true
+    }
+
+    pub fn is_alive(&self, entity: Entity) -> bool {
+        self.entities.borrow().is_alive(entity)
+    }
+
+    /// See [`Registry::universal`].
+    pub fn universal(&self, entity: Entity) -> Option<UniversalId> {
+        self.entities.borrow().universal(entity)
+    }
+
+    /// See [`Registry::promote`].
+    pub fn promote(&self, entity: Entity) -> Option<UniversalId> {
+        self.entities.borrow_mut().promote(entity)
+    }
+
+    /// See [`Registry::resolve`].
+    pub fn resolve(&self, uid: UniversalId) -> Option<Entity> {
+        self.entities.borrow().resolve(uid)
+    }
+
+    /// See [`Registry::adopt`].
+    pub fn adopt(&self, uid: UniversalId) -> Option<Entity> {
+        self.entities.borrow_mut().adopt(uid)
     }
 
     pub fn insert_unique<U: Unique>(&self, unique: U) -> Option<U> {
@@ -79,16 +132,9 @@ impl World {
     }
 }
 
-impl Default for World {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecs::entity::{Entity, EntityGeneration, EntityIndex};
     use crate::ecs::{Component, Unique};
 
     #[derive(Component, Debug, PartialEq)]
@@ -106,8 +152,8 @@ mod tests {
     #[test]
     fn world_tables() {
         crate::ecs::init();
-        let world = World::new();
-        let entity = Entity::new(EntityIndex::from_bits(0), EntityGeneration::from_bits(1));
+        let world = World::new(0, 0);
+        let entity = world.spawn();
 
         assert_ne!(Alpha::id(), Beta::id());
 
@@ -121,7 +167,7 @@ mod tests {
     #[test]
     fn world_uniques() {
         crate::ecs::init();
-        let world = World::new();
+        let world = World::new(0, 0);
 
         assert_ne!(Counter::id(), Config::id());
         assert!(world.get_unique::<Counter>().is_none());
@@ -145,10 +191,36 @@ mod tests {
     }
 
     #[test]
+    fn world_despawn_clears_tables() {
+        crate::ecs::init();
+        let world = World::new(0, 0);
+        let e0 = world.spawn();
+        let e1 = world.spawn();
+
+        world.view_mut::<Alpha>().insert(e0, Alpha(1));
+        world.view_mut::<Beta>().insert(e0, Beta(2));
+        world.view_mut::<Alpha>().insert(e1, Alpha(3));
+        let u0 = world.promote(e0).unwrap();
+
+        assert!(world.despawn(e0));
+        assert!(!world.despawn(e0));
+        assert!(!world.is_alive(e0));
+        assert_eq!(world.resolve(u0), None);
+        assert!(!world.view::<Alpha>().contains(e0));
+        assert!(!world.view::<Beta>().contains(e0));
+        assert_eq!(world.view::<Alpha>().get(e1), Some(&Alpha(3)));
+
+        // the recycled slot starts empty
+        let recycled = world.spawn();
+        assert_eq!(recycled.index(), e0.index());
+        assert_eq!(world.view::<Alpha>().get(recycled), None);
+    }
+
+    #[test]
     #[should_panic(expected = "unique not inserted")]
     fn world_unique_missing() {
         crate::ecs::init();
-        let world = World::new();
+        let world = World::new(0, 0);
         let _ = world.unique::<Counter>();
     }
 }

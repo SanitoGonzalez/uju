@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU32;
 
@@ -309,6 +310,120 @@ impl UniversalAllocator {
     }
 }
 
+/// Owns the shard's local entities and their mapping to [`UniversalId`]s.
+///
+/// A local [`Entity`] never leaves the shard; a [`UniversalId`] is minted lazily, only
+/// once the entity has to be addressed from outside (see [`promote`](Self::promote)).
+pub struct Registry {
+    local: Allocator,
+    universal: UniversalAllocator,
+    to_universal: Vec<Option<UniversalId>>,
+    to_local: HashMap<UniversalId, Entity>,
+}
+
+impl Registry {
+    pub fn new(universal: UniversalAllocator) -> Self {
+        Self {
+            local: Allocator::new(),
+            universal,
+            to_universal: Vec::new(),
+            to_local: HashMap::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.local.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.local.is_empty()
+    }
+
+    /// The serial high-water mark to persist - see [`UniversalAllocator::new`].
+    pub fn next_serial(&self) -> u64 {
+        self.universal.next_serial()
+    }
+
+    pub fn is_alive(&self, entity: Entity) -> bool {
+        self.local.is_alive(entity)
+    }
+
+    /// Allocates a local entity. It has no [`UniversalId`] until promoted.
+    pub fn spawn(&mut self) -> Entity {
+        self.local.alloc()
+    }
+
+    /// Frees `entity` and forgets its [`UniversalId`], if any.
+    pub fn despawn(&mut self, entity: Entity) -> bool {
+        if !self.local.dealloc(entity) {
+            return false;
+        }
+
+        // the slot will be recycled, so its mapping must not outlive the entity
+        if let Some(uid) = self
+            .to_universal
+            .get_mut(entity.index_sparse())
+            .and_then(Option::take)
+        {
+            self.to_local.remove(&uid);
+        }
+        true
+    }
+
+    /// The [`UniversalId`] of `entity`, if it is alive and has been promoted.
+    pub fn universal(&self, entity: Entity) -> Option<UniversalId> {
+        if !self.is_alive(entity) {
+            return None;
+        }
+        self.to_universal.get(entity.index_sparse()).copied().flatten()
+    }
+
+    /// The [`UniversalId`] of `entity`, minting one on first use. `None` if dead.
+    pub fn promote(&mut self, entity: Entity) -> Option<UniversalId> {
+        if !self.is_alive(entity) {
+            return None;
+        }
+
+        let index = entity.index_sparse();
+        if index >= self.to_universal.len() {
+            self.to_universal.resize(index + 1, None);
+        }
+
+        let slot = &mut self.to_universal[index];
+        if let Some(uid) = *slot {
+            return Some(uid);
+        }
+
+        let uid = self.universal.alloc();
+        *slot = Some(uid);
+        self.to_local.insert(uid, entity);
+        Some(uid)
+    }
+
+    /// The local entity carrying `uid`, if it lives on this shard.
+    pub fn resolve(&self, uid: UniversalId) -> Option<Entity> {
+        self.to_local.get(&uid).copied()
+    }
+
+    /// Spawns a local entity for an existing `uid`, e.g. one migrating in.
+    /// `None` if `uid` already has a local entity here.
+    pub fn adopt(&mut self, uid: UniversalId) -> Option<Entity> {
+        if self.to_local.contains_key(&uid) {
+            return None;
+        }
+
+        let entity = self.local.alloc();
+        let index = entity.index_sparse();
+        if index >= self.to_universal.len() {
+            self.to_universal.resize(index + 1, None);
+        }
+
+        self.to_universal[index] = Some(uid);
+        self.to_local.insert(uid, entity);
+        Some(entity)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +602,118 @@ mod tests {
         );
         assert_eq!(allocator.try_alloc(), None);
         assert_eq!(allocator.try_alloc(), None);
+    }
+
+    fn registry() -> Registry {
+        Registry::new(UniversalAllocator::new(3, 7, 0))
+    }
+
+    #[test]
+    fn registry_spawn_is_local_only() {
+        let mut registry = registry();
+        let e0 = registry.spawn();
+
+        assert!(registry.is_alive(e0));
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.universal(e0), None);
+        assert_eq!(registry.next_serial(), 0); // nothing minted yet
+    }
+
+    #[test]
+    fn registry_promote() {
+        let mut registry = registry();
+        let e0 = registry.spawn();
+        let e1 = registry.spawn();
+
+        let u1 = registry.promote(e1).unwrap();
+        assert_eq!(u1, UniversalId::new(3, 7, 0));
+        assert_eq!(registry.promote(e1), Some(u1)); // idempotent, no re-mint
+        assert_eq!(registry.next_serial(), 1);
+
+        assert_eq!(registry.universal(e1), Some(u1));
+        assert_eq!(registry.resolve(u1), Some(e1));
+        assert_eq!(registry.universal(e0), None);
+    }
+
+    #[test]
+    fn registry_promote_dead() {
+        let mut registry = registry();
+        let e0 = registry.spawn();
+        assert!(registry.despawn(e0));
+
+        assert_eq!(registry.promote(e0), None);
+        assert_eq!(registry.next_serial(), 0);
+    }
+
+    #[test]
+    fn registry_despawn_forgets_mapping() {
+        let mut registry = registry();
+        let e0 = registry.spawn();
+        let u0 = registry.promote(e0).unwrap();
+
+        assert!(registry.despawn(e0));
+        assert!(!registry.despawn(e0));
+        assert_eq!(registry.universal(e0), None);
+        assert_eq!(registry.resolve(u0), None);
+
+        // the recycled slot must not inherit the old id
+        let recycled = registry.spawn();
+        assert_eq!(recycled.index(), e0.index());
+        assert_eq!(registry.universal(recycled), None);
+
+        let u1 = registry.promote(recycled).unwrap();
+        assert_ne!(u1, u0); // serials are never reused
+        assert_eq!(registry.resolve(u1), Some(recycled));
+    }
+
+    #[test]
+    fn registry_stale_handle() {
+        let mut registry = registry();
+        let e0 = registry.spawn();
+        registry.despawn(e0);
+        let recycled = registry.spawn();
+        let u = registry.promote(recycled).unwrap();
+
+        // same index, old generation: must not see the new entity's id
+        assert_eq!(registry.universal(e0), None);
+        assert_eq!(registry.promote(e0), None);
+        assert!(!registry.despawn(e0));
+        assert_eq!(registry.resolve(u), Some(recycled));
+    }
+
+    #[test]
+    fn registry_adopt() {
+        let mut registry = registry();
+        let foreign = UniversalId::new(9, 1, 42);
+
+        let e0 = registry.adopt(foreign).unwrap();
+        assert!(registry.is_alive(e0));
+        assert_eq!(registry.universal(e0), Some(foreign));
+        assert_eq!(registry.promote(e0), Some(foreign)); // keeps the adopted id
+        assert_eq!(registry.resolve(foreign), Some(e0));
+        assert_eq!(registry.next_serial(), 0); // adopting never mints
+
+        assert_eq!(registry.adopt(foreign), None); // already lives here
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn registry_migrate_round_trip() {
+        let mut source = registry();
+        let mut target = Registry::new(UniversalAllocator::new(3, 8, 0));
+
+        let e = source.spawn();
+        let uid = source.promote(e).unwrap();
+        assert!(source.despawn(e));
+
+        let moved = target.adopt(uid).unwrap();
+        assert_eq!(target.resolve(uid), Some(moved));
+        assert_eq!(source.resolve(uid), None);
+
+        // and back again: the id survives, the local handle does not
+        assert!(target.despawn(moved));
+        let back = source.adopt(uid).unwrap();
+        assert_ne!(back, e);
+        assert_eq!(source.universal(back), Some(uid));
     }
 }

@@ -10,6 +10,7 @@ use futures_util::{FutureExt, select};
 use tracing::{error, info};
 
 use crate::cluster::error::Result;
+use crate::cluster::node;
 use crate::cluster::shard::message::Frame;
 use crate::ecs::world::World;
 use crate::net::transport::tcp;
@@ -170,7 +171,7 @@ impl Builder {
             tx,
             stop,
             token,
-            world: World::new(),
+            world: World::new(node::current(), id),
         });
 
         runtime.block_on(async move {

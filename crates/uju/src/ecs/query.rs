@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn query_terms() {
         crate::ecs::init();
-        let world = World::new();
+        let world = World::new(0, 0);
 
         for index in 0..3 {
             world
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn query_filters() {
         crate::ecs::init();
-        let world = World::new();
+        let world = World::new(0, 0);
 
         for index in 0..4 {
             world
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn query_with_drives() {
         crate::ecs::init();
-        let world = World::new();
+        let world = World::new(0, 0);
 
         for index in 0..3 {
             world
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn query_max_arity() {
         crate::ecs::init();
-        let world = World::new();
+        let world = World::new(0, 0);
 
         let target = entity(0);
         world.view_mut::<C0>().insert(target, C0(0));
@@ -521,7 +521,7 @@ mod tests {
     #[should_panic(expected = "cannot drive iteration")]
     fn query_without_alone_panics() {
         crate::ecs::init();
-        let world = World::new();
+        let world = World::new(0, 0);
 
         let _ = Query::<Without<Frozen>>::new(&world).iter();
     }

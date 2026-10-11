@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn view_join() {
         crate::ecs::init();
-        let world = World::new();
+        let world = World::new(0, 0);
 
         for index in 0..4 {
             world
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn view_mut_as_shared_term() {
         crate::ecs::init();
-        let world = World::new();
+        let world = World::new(0, 0);
 
         world.view_mut::<Position>().insert(entity(0), Position(5));
         world.view_mut::<Speed>().insert(entity(0), Speed(7));
@@ -189,7 +189,7 @@ mod tests {
     #[should_panic(expected = "already mutably borrowed")]
     fn view_conflict_panics() {
         crate::ecs::init();
-        let world = World::new();
+        let world = World::new(0, 0);
 
         let _positions = world.view_mut::<Position>();
         let _conflict = world.view::<Position>();
