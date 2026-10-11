@@ -1,7 +1,6 @@
 pub mod component;
 pub mod entity;
 pub mod query;
-pub mod replica;
 pub mod storage;
 pub mod unique;
 pub mod world;

@@ -1,7 +1,4 @@
-use smallvec::SmallVec;
-
 use crate::cluster::{node, shard};
-use crate::ecs::entity::UniversalEntity;
 
 pub struct Frame {
     pub node: node::Id,
@@ -21,21 +18,4 @@ impl Frame {
     }
 }
 
-pub enum Message {
-    Replication(Vec<ReplicationOp>),
-}
-
-pub enum ReplicationOp {
-    Upsert {
-        universal: UniversalEntity,
-        components: SmallVec<
-            [(
-                i32, /*todo: component id*/
-                i32, /*todo: erased component*/
-            ); 4],
-        >, // todo: erased component might be: `Box<dyn Any + Send>`
-    },
-    Remove {
-        universal: UniversalEntity,
-    }, // means "despawned at origin" or "left your AOI" -> unlink and despawn
-}
+pub enum Message {}

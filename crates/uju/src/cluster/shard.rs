@@ -10,7 +10,7 @@ use futures_util::{FutureExt, select};
 use tracing::{error, info};
 
 use crate::cluster::error::Result;
-use crate::cluster::shard::message::{Frame, Message, ReplicationOp};
+use crate::cluster::shard::message::Frame;
 use crate::ecs::world::World;
 use crate::net::transport::tcp;
 use crate::util::stop::{StopSource, StopToken};
@@ -114,47 +114,7 @@ impl Shard {
     }
 
     async fn process(self: &Rc<Self>, frame: Frame) {
-        let Frame {
-            node,
-            shard,
-            msg,
-            result_tx,
-        } = frame;
-
-        // todo: extract/refactor
-        match msg {
-            Message::Replication(ops) => {
-                for op in ops {
-                    match op {
-                        ReplicationOp::Upsert {
-                            universal,
-                            components,
-                        } => {
-                            let local = self
-                                .world
-                                .replicas
-                                .borrow()
-                                .local(universal)
-                                .unwrap_or_else(|| {
-                                    // let replica = world.spawn_replica();
-                                    // self.world.borrow().replicas.borrow().link(universal, replica);
-                                    // replica
-                                    todo!()
-                                });
-                            for (id, component) in components {
-                                todo!("apply replication")
-                            }
-                        }
-                        ReplicationOp::Remove { universal } => {
-                            // if let Some(replica) = self.world.borrow().replicas.borrow().unlink(universal) {
-                            //     self.world.despawn(replica);
-                            // }
-                            todo!()
-                        }
-                    }
-                }
-            }
-        }
+        match frame.msg {}
     }
 }
 

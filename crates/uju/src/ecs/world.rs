@@ -3,8 +3,6 @@ use std::cell::{Ref, RefCell, RefMut};
 
 use crate::ecs::{
     component::{self, Component},
-    entity::{self, Entity},
-    replica,
     storage::{
         table::Table,
         view::{View, ViewMut},
@@ -13,8 +11,6 @@ use crate::ecs::{
 };
 
 pub struct World {
-    pub(crate) entities: RefCell<entity::allocator::Allocator>,
-    pub(crate) replicas: RefCell<replica::Registry>,
     pub(crate) tables: Vec<RefCell<Box<dyn Table>>>,
     pub(crate) uniques: Vec<RefCell<Option<Box<dyn Any>>>>,
 }
@@ -22,8 +18,6 @@ pub struct World {
 impl World {
     pub fn new() -> Self {
         let world = Self {
-            entities: RefCell::new(entity::allocator::Allocator::new()),
-            replicas: RefCell::new(replica::Registry::new()),
             tables: component::registrations()
                 .into_iter()
                 .map(|registration| RefCell::new((registration.new_table)()))
@@ -83,26 +77,6 @@ impl World {
             |table| table.as_any_mut().downcast_mut().unwrap(),
         ))
     }
-
-    pub fn spawn(&self) -> Entity {
-        self.entities.borrow_mut().alloc()
-    }
-
-    // todo: despawning while table iteration causes `RefCell` panic - need deferred despawn
-    pub fn despawn(&self, entity: Entity) -> bool {
-        if !self.entities.borrow_mut().dealloc(entity) {
-            return false;
-        }
-        // todo: entity despawn is O(number of components) - optimization is needed
-        for table in &self.tables {
-            table.borrow_mut().remove(entity);
-        }
-        true
-    }
-
-    pub fn is_alive(&self, entity: Entity) -> bool {
-        self.entities.borrow().is_alive(entity)
-    }
 }
 
 impl Default for World {
@@ -133,7 +107,7 @@ mod tests {
     fn world_tables() {
         crate::ecs::init();
         let world = World::new();
-        let entity = Entity::new(EntityIndex::from_bits(0), EntityGeneration::from_bits(0));
+        let entity = Entity::new(EntityIndex::from_bits(0), EntityGeneration::from_bits(1));
 
         assert_ne!(Alpha::id(), Beta::id());
 
