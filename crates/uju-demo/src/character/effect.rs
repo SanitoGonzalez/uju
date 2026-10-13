@@ -4,7 +4,7 @@ use smallvec::SmallVec;
 use uju::ecs::component::transform3::Transform3;
 use uju::ecs::prelude::*;
 
-use super::{area_effect, resource, stat, status_effect};
+use super::{area_effect, native, resource, stat, status_effect};
 
 pub type VarId = usize;
 
@@ -42,7 +42,10 @@ pub enum Effect {
         value: Value,
         body: Box<Effect>,
     },
-    // Native { id: NativeId, args: Vec<Value> }, // native code execution
+    Native {
+        id: native::Id,
+        args: Vec<Value>,
+    },
     Damage {
         to: Role,
         amount: Value,
