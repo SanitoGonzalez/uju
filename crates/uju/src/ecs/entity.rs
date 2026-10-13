@@ -375,7 +375,10 @@ impl Registry {
         if !self.is_alive(entity) {
             return None;
         }
-        self.to_universal.get(entity.index_sparse()).copied().flatten()
+        self.to_universal
+            .get(entity.index_sparse())
+            .copied()
+            .flatten()
     }
 
     /// The [`UniversalId`] of `entity`, minting one on first use. `None` if dead.

@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use tracing_subscriber;
-
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     uju::init();

@@ -1,4 +1,4 @@
-use glam::Vec2;
+use parry2d::glamx::Vec2;
 
 use crate::ecs::Component;
 use crate::math::Radians;

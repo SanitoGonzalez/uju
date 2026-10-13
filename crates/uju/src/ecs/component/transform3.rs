@@ -1,4 +1,4 @@
-use glam::{Quat, Vec3};
+use parry3d::glamx::{Quat, Vec3};
 
 use crate::ecs::Component;
 

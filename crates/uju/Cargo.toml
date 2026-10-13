@@ -18,7 +18,8 @@ compio.workspace = true
 crossfire.workspace = true
 derive_more.workspace = true
 futures-util.workspace = true
-glam.workspace = true
+parry2d.workspace = true
+parry3d.workspace = true
 libc.workspace = true
 linkme = "0.3"
 nix = { version = "0.31", features = ["sched"] }
