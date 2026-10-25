@@ -1,5 +1,13 @@
+# Rust
 /target
 
-# IDE
+# IDEs
+.vs
 .vscode
 .idea
+
+# Obsidian
+docs/.obsidian/workspace*.json
+docs/.obsidian/cache
+docs/.obsidian/graph.json
+
