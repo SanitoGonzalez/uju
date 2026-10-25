@@ -1,0 +1,22 @@
+// The shared test schema's second namespace; see example1.uju.
+
+namespace hello;
+// namespace; // empty namespace is legal
+
+use foo.bar;
+
+message[in] ExternalTypes {
+    color: Color,
+    position: foo.bar.Position, // explicit type import
+}
+
+message[out] Spawn {
+    entity: entity,
+    tile: foo.bar.Tile,
+    patch: StatsPatch,
+}
+
+// `foo.bar` declares a `MyRequest` too.
+message[in] MyRequest {
+    text: string,
+}

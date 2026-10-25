@@ -337,12 +337,12 @@ mod tests {
             .collect()
     }
 
-    const SAMPLE1: &str = include_str!("../tests/data/sample1.uju");
-    const SAMPLE2: &str = include_str!("../tests/data/sample2.uju");
+    const EXAMPLE1: &str = include_str!("../tests/data/example1.uju");
+    const EXAMPLE2: &str = include_str!("../tests/data/example2.uju");
 
     #[test]
     fn declarations_of_every_kind_parse() {
-        let schema = schema_of(SAMPLE1);
+        let schema = schema_of(EXAMPLE1);
         assert_eq!(schema.namespace.to_string(), "foo.bar");
         assert!(schema.uses.is_empty());
 
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn messages_carry_a_direction_and_nested_declarations() {
-        let schema = schema_of(SAMPLE1);
+        let schema = schema_of(EXAMPLE1);
 
         let direction = |name: &str| {
             let Item::Message(message) = item(&schema, name) else {
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn imports_and_qualified_types_parse() {
-        let schema = schema_of(SAMPLE2);
+        let schema = schema_of(EXAMPLE2);
         assert_eq!(schema.namespace.to_string(), "hello");
         assert_eq!(
             schema.uses.iter().map(Path::to_string).collect::<Vec<_>>(),

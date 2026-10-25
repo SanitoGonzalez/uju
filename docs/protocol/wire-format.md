@@ -265,8 +265,8 @@ Every message has a `u16` id in each direction it travels:
 - **inbound** (the messages a server receives): `in` and `bi` messages;
 - **outbound** (the messages a server sends): `out` and `bi` messages.
 
-Each space is dense from `0`, ordered by fully qualified name
-(`namespace.Message`). A `bi` message has an id in both spaces, and the two may
+Each space is dense from `1`, ordered by fully qualified name
+(`namespace.Message`); `0` is never an id, so a zeroed id reads as no message. A `bi` message has an id in both spaces, and the two may
 differ.
 
 ## Fingerprint

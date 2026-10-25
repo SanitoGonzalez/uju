@@ -1,0 +1,138 @@
+// The shared test schema, with example2.uju: every declaration kind, type,
+// constraint, and layout the compiler handles.
+//
+// types
+// scalars: u8-64, i8-64, f32-64 (f16 TBA), bool, timestamp, interval, entity, uentity, uuid
+// variants: string, bytes
+// collections: vec<T>, set<T>, map<T>, array<T, N>
+// option<T>: collections cannot be optional
+//
+// `timestamp`, `interval`, `uentity`, and `uuid` are left out until the Rust
+// backend supports them.
+
+namespace foo.bar;
+
+// enum can only derive unsigned integers
+enum Color: u8 {
+    Red,
+    Green,
+    Blue = 5,
+}
+
+// enum derives u32 by default
+enum Numbers {
+    Thousand = 1000,
+    Million = 1000000,
+    Billion = 1000000000,
+}
+
+enum Big: u64 {
+    Small = 1,
+    Huge = 10000000000,
+}
+
+struct EmptyStruct {}
+
+struct Position {
+    x: f32,
+    y: f32,
+}
+
+struct StrangeNumbers {
+    // float is finite and non-NaN by default
+    a: f32[infinite],
+    b: f32[nan],
+}
+
+// Fixed-size, with checks: bits, a biased integer, an enum, and a fixed
+// string.
+struct Tile {
+    walkable: bool,
+    lit: option<bool>,
+    height: i32[min=-100, max=100],
+    color: Color,
+    tag: string[min_length=2, max_length=2],
+    corners: array<u16, 4>,
+}
+
+// Variable-size, so collections of it are prefixed.
+struct Named {
+    id: u32,
+    name: string[max_length=8],
+}
+
+// Only options: an absent field costs a bit.
+struct StatsPatch {
+    hp: option<u16>,
+    mp: option<u16>,
+    alive: option<bool>,
+    strength: option<u8>,
+}
+
+message[bi] Ping {}
+
+message[in] MyRequest {
+    foo: i32[min=-100, max=100],
+    name: string[min_length=2, max_length=12],
+    // distinguish collection-wide constraints and element-wide constraints
+    addresses: vec<string[max_length=16]>[max_length=14],
+}
+
+message[out] MyResponse {
+    enum Result {
+        Ok,
+        Error,
+    }
+
+    result: Result,
+}
+
+// Declarations nest more than one level deep.
+message[out] Status {
+    struct HTTPDetail {
+        enum Kind {
+            Client,
+            Server,
+        }
+
+        code: u16,
+        kind: Kind,
+        color: Color,
+    }
+
+    detail: option<HTTPDetail>,
+}
+
+message[in] Everything {
+    a: i8,
+    b: i16,
+    c: i64[min=0, max=70000],
+    d: u64,
+    e: u32[min=1000, max=1255],
+    f: f64[min=-1.5, max=1.5],
+    g: f32[nan, infinite],
+    flag: bool,
+    who: entity,
+    key: bytes[min_length=4, max_length=4],
+    big: Big,
+    tile: Tile,
+    position: Position,
+    nothing: EmptyStruct,
+    // keywords and generated method names make fine field names
+    type: u8[max=9],
+    decode: u16,
+    maybe_tile: option<Tile>,
+    maybe_count: option<u32>,
+    maybe_name: option<string[max_length=20]>,
+    blob: bytes,
+    raw: vec<u8>,
+    flags: vec<bool>[min_length=1, max_length=8],
+    points: vec<Position>,
+    empties: vec<EmptyStruct>[max_length=9],
+    colors: set<Color>,
+    names: vec<Named>[max_length=4],
+    tags: map<u8, string[max_length=3]>,
+    grid: map<u16, Position>,
+    matrix: array<array<i8, 2>, 2>,
+    bools: array<bool, 3>,
+}

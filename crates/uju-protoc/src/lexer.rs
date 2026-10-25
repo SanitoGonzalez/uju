@@ -462,10 +462,10 @@ mod tests {
     }
 
     #[test]
-    fn samples_lex_cleanly() {
+    fn examples_lex_cleanly() {
         for src in [
-            include_str!("../tests/data/sample1.uju"),
-            include_str!("../tests/data/sample2.uju"),
+            include_str!("../tests/data/example1.uju"),
+            include_str!("../tests/data/example2.uju"),
         ] {
             let (spanned, errors) = lex(src);
             assert!(errors.is_empty(), "{errors:?}");

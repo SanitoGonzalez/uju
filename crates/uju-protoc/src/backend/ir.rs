@@ -200,8 +200,8 @@ mod tests {
     use super::*;
     use crate::compile;
 
-    const SAMPLE1: &str = include_str!("../../tests/data/sample1.uju");
-    const SAMPLE2: &str = include_str!("../../tests/data/sample2.uju");
+    const EXAMPLE1: &str = include_str!("../../tests/data/example1.uju");
+    const EXAMPLE2: &str = include_str!("../../tests/data/example2.uju");
 
     fn generated(sources: &[&str]) -> Vec<GeneratedFile> {
         let schema =
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn one_file_per_namespace() {
-        let files = generated(&[SAMPLE1, SAMPLE2]);
+        let files = generated(&[EXAMPLE1, EXAMPLE2]);
         let paths: Vec<_> = files
             .iter()
             .map(|file| file.path.display().to_string())
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn nested_declarations_name_their_parent() {
-        let contents = only(&[SAMPLE1]);
+        let contents = only(&[EXAMPLE1]);
         assert!(
             contents.contains(r#""path": "foo.bar.MyResponse.Result""#),
             "{contents}"
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn messages_carry_their_direction() {
-        let contents = only(&[SAMPLE1]);
+        let contents = only(&[EXAMPLE1]);
         for direction in ["in", "out", "bi"] {
             assert!(
                 contents.contains(&format!(r#""direction": "{direction}""#)),

@@ -630,11 +630,9 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         }
     }
 
-    /// Report types whose fixed parts recursively contain themselves; such a
-    /// type has no finite size. Variable-size types (`vec`, `string`, ...)
-    /// break a cycle, since their contents live out of line.
-    /// Optional fields do not: their data still sits inline behind a
-    /// presence bit.
+    /// Report recursive types, through any field: inline, optional, or
+    /// inside a collection. Recursion would let a message nest as deep as
+    /// its size allows, and every decoder would have to bound its stack.
     fn check_cycles(&mut self, defs: &[Def]) {
         let mut marks = vec![Mark::White; defs.len()];
         for index in 0..defs.len() {
@@ -653,7 +651,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         };
         let mut targets = Vec::new();
         for field in fields {
-            inline_refs(&field.ty, &mut targets);
+            refs(&field.ty, &mut targets);
         }
         for target in targets {
             match marks[target.0] {
@@ -666,8 +664,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                         site.source,
                         name.1.clone(),
                         format!(
-                            "`{}` recursively contains itself and has no finite size; \
-                             break the cycle with `vec` or another variable-size container",
+                            "`{}` refers to itself; recursive types are not allowed",
                             name.0
                         ),
                     ));
@@ -678,14 +675,16 @@ impl<'a, 'src> Lowerer<'a, 'src> {
     }
 }
 
-/// The named types a value of `ty` stores inline, i.e. not behind a
-/// variable-size container.
-fn inline_refs(ty: &Type, out: &mut Vec<TypeId>) {
+/// The named types a value of `ty` refers to, directly or through a
+/// collection.
+fn refs(ty: &Type, out: &mut Vec<TypeId>) {
     match &ty.kind {
         TypeKind::Named(id) => out.push(*id),
-        TypeKind::Array(item, _) => inline_refs(item, out),
-        // Scalars reference nothing; vec/set/map/string/bytes contents are
-        // out of line.
+        TypeKind::Array(item, _) | TypeKind::Vec(item) | TypeKind::Set(item) => refs(item, out),
+        TypeKind::Map(key, value) => {
+            refs(key, out);
+            refs(value, out);
+        }
         _ => {}
     }
 }
@@ -750,8 +749,8 @@ mod tests {
     use super::*;
     use crate::compile;
 
-    const SAMPLE1: &str = include_str!("../../tests/data/sample1.uju");
-    const SAMPLE2: &str = include_str!("../../tests/data/sample2.uju");
+    const EXAMPLE1: &str = include_str!("../../tests/data/example1.uju");
+    const EXAMPLE2: &str = include_str!("../../tests/data/example2.uju");
 
     fn compiled(sources: &[&str]) -> Schema {
         compile(sources).unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"))
@@ -775,8 +774,8 @@ mod tests {
     }
 
     #[test]
-    fn samples_lower() {
-        let schema = compiled(&[SAMPLE1, SAMPLE2]);
+    fn examples_lower() {
+        let schema = compiled(&[EXAMPLE1, EXAMPLE2]);
         assert_eq!(
             schema
                 .namespaces
@@ -810,7 +809,7 @@ mod tests {
 
     #[test]
     fn messages_carry_their_direction() {
-        let schema = compiled(&[SAMPLE1]);
+        let schema = compiled(&[EXAMPLE1]);
         let message = |name: &str| {
             let (_, def) = def(&schema, name);
             let DefKind::Message(message) = &def.kind else {
@@ -875,7 +874,7 @@ mod tests {
 
     #[test]
     fn imports_resolve_across_sources() {
-        let schema = compiled(&[SAMPLE1, SAMPLE2]);
+        let schema = compiled(&[EXAMPLE1, EXAMPLE2]);
         let (color_id, color) = def(&schema, "Color");
         let (position_id, _) = def(&schema, "Position");
         assert_eq!(schema.namespace(color.namespace).name.join("."), "foo.bar");
@@ -1136,7 +1135,7 @@ mod tests {
 
     #[test]
     fn constraints_lower_onto_the_type_they_follow() {
-        let schema = compiled(&[SAMPLE1]);
+        let schema = compiled(&[EXAMPLE1]);
         let (_, request) = def(&schema, "MyRequest");
         let DefKind::Message(request) = &request.kind else {
             panic!("expected a message");
@@ -1276,18 +1275,30 @@ mod tests {
     }
 
     #[test]
-    fn infinite_recursion_is_reported() {
+    fn recursion_is_reported() {
+        let recursive = "`S` refers to itself; recursive types are not allowed";
         assert_eq!(
             messages(&["namespace a;\nstruct S { s: S }\n"]),
-            ["`S` recursively contains itself and has no finite size; \
-              break the cycle with `vec` or another variable-size container"]
+            [recursive]
+        );
+        // Collections and options don't make it acceptable.
+        assert_eq!(
+            messages(&["namespace a;\nstruct S { x: u8, s: vec<S> }\n"]),
+            [recursive]
+        );
+        assert_eq!(
+            messages(&["namespace a;\nstruct S { x: u8, s: map<u8, S> }\n"]),
+            [recursive]
         );
         assert_eq!(
             messages(&["namespace a;\nstruct A { b: B }\nstruct B { a: array<A, 2> }\n"]).len(),
             1
         );
+        assert_eq!(
+            messages(&["namespace a;\nstruct A { b: option<B> }\nstruct B { a: vec<A> }\n"]).len(),
+            1
+        );
 
-        // Variable-size types break the cycle.
         compiled(&["namespace a;\nstruct S { x: i32 }\nmessage[in] M { v: vec<S> }\n"]);
     }
 }

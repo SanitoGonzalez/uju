@@ -1,9 +1,0 @@
-namespace hello;
-// namespace; // empty namespace is legal
-
-use foo.bar;
-
-message[in] ExternalTypes {
-    color: Color,
-    position: foo.bar.Position, // explicit type import
-}

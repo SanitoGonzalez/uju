@@ -236,12 +236,13 @@ impl Wire {
         let mut outbound = Vec::new();
         for (_, id, direction) in messages {
             let mut assign = |space: &mut Vec<TypeId>, name: &str| {
-                let index = u16::try_from(space.len()).ok();
+                // From 1: a zeroed id is no message.
+                let index = u16::try_from(space.len() + 1).ok();
                 if index.is_none() {
                     builder.errors.push(Error {
                         def: id,
                         field: None,
-                        message: format!("more than {} {name} messages", u16::MAX as u32 + 1),
+                        message: format!("more than {} {name} messages", u16::MAX),
                     });
                 }
                 space.push(id);
@@ -292,12 +293,12 @@ impl Wire {
         self.ids[id.0]
     }
 
-    /// The messages a server receives, indexed by their inbound id.
+    /// The messages a server receives, in inbound id order from 1.
     pub fn inbound(&self) -> &[TypeId] {
         &self.inbound
     }
 
-    /// The messages a server sends, indexed by their outbound id.
+    /// The messages a server sends, in outbound id order from 1.
     pub fn outbound(&self) -> &[TypeId] {
         &self.outbound
     }
@@ -312,8 +313,8 @@ impl Wire {
 #[derive(Clone, Copy)]
 enum State {
     Todo,
-    /// Being laid out. Reached again only through a `vec` or `map`, as
-    /// lowering rejects types inlining themselves.
+    /// Being laid out. Never reached again, as lowering rejects recursive
+    /// types.
     Busy,
     Done(Size),
 }
@@ -329,9 +330,7 @@ impl Builder<'_> {
     fn def(&mut self, id: TypeId) -> Size {
         match self.states[id.0] {
             State::Done(size) => return size,
-            // Every type on a cycle reaches the `vec` or `map` closing it
-            // through fields stored inline, so it varies, without a bound.
-            State::Busy => return Size::Var { max: None },
+            State::Busy => unreachable!("lowering rejects recursive types"),
             State::Todo => {}
         }
         self.states[id.0] = State::Busy;
@@ -615,8 +614,8 @@ mod tests {
     use super::*;
     use crate::compile;
 
-    const SAMPLE1: &str = include_str!("../../tests/data/sample1.uju");
-    const SAMPLE2: &str = include_str!("../../tests/data/sample2.uju");
+    const EXAMPLE1: &str = include_str!("../../tests/data/example1.uju");
+    const EXAMPLE2: &str = include_str!("../../tests/data/example2.uju");
 
     fn compiled(sources: &[&str]) -> (Schema, Wire) {
         let schema =
@@ -743,14 +742,14 @@ mod tests {
 
     #[test]
     fn empty_declarations_take_no_bytes() {
-        let (schema, wire) = compiled(&[SAMPLE1]);
+        let (schema, wire) = compiled(&[EXAMPLE1]);
         assert_eq!(wire.layout(id(&schema, "EmptyStruct")).size, Size::Fixed(0));
         assert_eq!(wire.layout(id(&schema, "Ping")).size, Size::Fixed(0));
     }
 
     #[test]
     fn sample_request_lays_out_narrow() {
-        let (schema, wire) = compiled(&[SAMPLE1]);
+        let (schema, wire) = compiled(&[EXAMPLE1]);
         let request = id(&schema, "MyRequest");
         let layout = wire.layout(request);
         assert_eq!(
@@ -871,21 +870,6 @@ mod tests {
     }
 
     #[test]
-    fn recursive_structs_are_unbounded() {
-        let (schema, wire) =
-            compiled(&["namespace a;\nstruct Tree { value: u8, children: vec<Tree> }\n"]);
-        let tree = id(&schema, "Tree");
-        assert_eq!(wire.layout(tree).size, Size::Var { max: None });
-        assert_eq!(
-            wire.sequence(field(&schema, tree, "children")),
-            Some(Sequence::Prefixed {
-                count: Width::U16,
-                prefix: Width::U16,
-            })
-        );
-    }
-
-    #[test]
     fn sequences_pack_fixed_items() {
         let (schema, wire, m) = message(concat!(
             "struct P { x: f32, y: f32 }\n",
@@ -929,17 +913,22 @@ mod tests {
         assert_eq!(
             wire.ids(id(&schema, "B")),
             Ids {
-                inbound: Some(1),
-                outbound: Some(0),
+                inbound: Some(2),
+                outbound: Some(1),
             }
+        );
+        assert_eq!(
+            wire.ids(id(&schema, "A")).inbound,
+            Some(1),
+            "no message is 0"
         );
         assert_eq!(wire.ids(id(&schema, "D")).inbound, None);
     }
 
     #[test]
     fn fingerprints_ignore_source_order() {
-        let (_, forward) = compiled(&[SAMPLE1, SAMPLE2]);
-        let (_, backward) = compiled(&[SAMPLE2, SAMPLE1]);
+        let (_, forward) = compiled(&[EXAMPLE1, EXAMPLE2]);
+        let (_, backward) = compiled(&[EXAMPLE2, EXAMPLE1]);
         assert_eq!(forward.fingerprint(), backward.fingerprint());
     }
 
