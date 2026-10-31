@@ -27,7 +27,8 @@ enum Command {
     /// Generate the protocol: every type, with its encoder and decoder, and
     /// the message ids
     Protocol {
-        /// Target to generate; `ir` emits the compiled IR as JSON
+        /// Target to generate; `ir` emits the compiled IR and its wire
+        /// layout as JSON, for generators outside `ujuc`
         #[arg(
             value_name = "BACKEND",
             value_parser = PossibleValuesParser::new(PROTOCOLS.iter().copied()),

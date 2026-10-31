@@ -1639,6 +1639,7 @@ dependencies = [
  "chumsky",
  "clap",
  "logos",
+ "serde_json",
 ]
 
 [[package]]

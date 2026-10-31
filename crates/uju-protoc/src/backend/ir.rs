@@ -1,25 +1,64 @@
-//! Emits the compiled IR as JSON, one file per namespace: every name fully
-//! qualified and every type spelled the way it is written in source.
+//! Emits the compiled IR as JSON (`ujuc protocol ir`), with the wire layout
+//! of every declaration, for generators written outside `ujuc`. Each
+//! namespace gets `namespaces/<name>.json`; the fingerprint and the message
+//! id order, which change with any message, live in `schema.json`.
+//! `docs/protocol/ir.md` describes the format.
 
-use crate::backend::{Backend, Error, GeneratedFile};
-use crate::ir::{self, DefKind, NamespaceId, TypeId};
+use crate::backend::{self, Backend, Error, GeneratedFile};
+use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, Width, Wire};
+use crate::ir::{self, Constraints, DefKind, Field, NamespaceId, Number, Type, TypeId, TypeKind};
+
+/// The file holding what spans namespaces. Namespace files sit in their own
+/// directory, so no namespace name can collide with it.
+const ROOT: &str = "schema.json";
+/// The directory namespace files are emitted into.
+const NAMESPACES: &str = "namespaces";
 
 pub struct Ir;
 
 impl Backend for Ir {
     fn generate(&self, schema: &ir::Schema) -> Result<Vec<GeneratedFile>, Error> {
-        Ok((0..schema.namespaces.len())
-            .map(|index| {
-                let id = NamespaceId(index);
-                let name = schema.namespace(id).name.join(".");
-                let contents = namespace(schema, id, &name);
-                GeneratedFile::new(format!("{name}.json"), contents)
-            })
-            .collect())
+        let wire = backend::wire(schema)?;
+        let mut files = vec![GeneratedFile::new(ROOT, root(schema, &wire))];
+        files.extend((0..schema.namespaces.len()).map(|index| {
+            let id = NamespaceId(index);
+            let name = schema.namespace(id).name.join(".");
+            let contents = namespace(schema, &wire, id, &name);
+            GeneratedFile::new(format!("{NAMESPACES}/{name}.json"), contents)
+        }));
+        Ok(files)
     }
 }
 
-fn namespace(schema: &ir::Schema, id: NamespaceId, name: &str) -> String {
+fn root(schema: &ir::Schema, wire: &Wire) -> String {
+    let mut json = Json::new();
+    json.begin('{');
+    json.entry_num("fingerprint", wire.fingerprint());
+
+    json.key("namespaces");
+    json.begin('[');
+    for namespace in &schema.namespaces {
+        json.item();
+        json.quoted(&namespace.name.join("."));
+    }
+    json.end(']');
+
+    // Index `i` holds the message with id `i + 1`.
+    for (key, messages) in [("inbound", wire.inbound()), ("outbound", wire.outbound())] {
+        json.key(key);
+        json.begin('[');
+        for id in messages {
+            json.item();
+            json.quoted(&schema.qualified(*id));
+        }
+        json.end(']');
+    }
+
+    json.end('}');
+    json.finish()
+}
+
+fn namespace(schema: &ir::Schema, wire: &Wire, id: NamespaceId, name: &str) -> String {
     let mut json = Json::new();
     json.begin('{');
     json.entry("namespace", name);
@@ -29,7 +68,7 @@ fn namespace(schema: &ir::Schema, id: NamespaceId, name: &str) -> String {
     for (index, def) in schema.defs.iter().enumerate() {
         if def.namespace == id {
             json.item();
-            def_json(&mut json, schema, TypeId(index));
+            def_json(&mut json, schema, wire, TypeId(index));
         }
     }
     json.end(']');
@@ -38,7 +77,7 @@ fn namespace(schema: &ir::Schema, id: NamespaceId, name: &str) -> String {
     json.finish()
 }
 
-fn def_json(json: &mut Json, schema: &ir::Schema, id: TypeId) {
+fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
     let def = schema.def(id);
     json.begin('{');
     json.entry("name", &def.name);
@@ -65,34 +104,225 @@ fn def_json(json: &mut Json, schema: &ir::Schema, id: TypeId) {
         }
         DefKind::Struct(item) => {
             json.entry("kind", "struct");
-            json.key("fields");
-            json.begin('[');
-            for field in &item.fields {
-                json.item();
-                json.begin('{');
-                json.entry("name", &field.name);
-                json.entry("type", &schema.type_name(&field.ty));
-                json.end('}');
-            }
-            json.end(']');
+            object_json(json, schema, wire, id, &item.fields);
         }
         DefKind::Message(item) => {
             json.entry("kind", "message");
             json.entry("direction", item.direction.name());
-            json.key("fields");
-            json.begin('[');
-            for field in &item.fields {
-                json.item();
-                json.begin('{');
-                json.entry("name", &field.name);
-                json.entry("type", &schema.type_name(&field.ty));
-                json.entry_bool("optional", field.optional);
-                json.end('}');
-            }
-            json.end(']');
+            let ids = wire.ids(id);
+            json.key("ids");
+            json.begin('{');
+            json.entry_opt_num("inbound", ids.inbound);
+            json.entry_opt_num("outbound", ids.outbound);
+            json.end('}');
+            object_json(json, schema, wire, id, &item.fields);
         }
     }
 
+    json.end('}');
+}
+
+/// The layout and fields of a struct or message.
+fn object_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId, fields: &[Field]) {
+    let layout = wire.layout(id);
+    json.key("layout");
+    layout_json(json, layout);
+
+    json.key("fields");
+    json.begin('[');
+    for (field, slot) in fields.iter().zip(&layout.fields) {
+        json.item();
+        json.begin('{');
+        json.entry("name", &field.name);
+        json.key("type");
+        type_json(json, schema, wire, &field.ty);
+        json.entry_bool("optional", field.optional);
+        json.key("slot");
+        slot_json(json, *slot);
+        json.end('}');
+    }
+    json.end(']');
+}
+
+fn layout_json(json: &mut Json, layout: &Layout) {
+    json.begin('{');
+    json.key("size");
+    size_json(json, layout.size);
+    json.entry_num("bitmap", layout.bitmap);
+    json.entry_num("boundaries", layout.boundaries);
+    json.entry_width("boundary", layout.boundary);
+    json.entry_num("head", layout.head);
+    json.entry_num("vars", layout.vars);
+    json.end('}');
+}
+
+fn slot_json(json: &mut Json, slot: Slot) {
+    json.begin('{');
+    match slot {
+        Slot::Bit(bit) => {
+            json.entry("kind", "bit");
+            json.entry_num("bit", bit);
+        }
+        Slot::At(offset) => {
+            json.entry("kind", "at");
+            json.entry_num("offset", offset);
+        }
+        Slot::OptionalBit { presence, value } => {
+            json.entry("kind", "optional_bit");
+            json.entry_num("presence", presence);
+            json.entry_num("value", value);
+        }
+        Slot::Optional { presence } => {
+            json.entry("kind", "optional");
+            json.entry_num("presence", presence);
+        }
+        Slot::Var { slot, presence } => {
+            json.entry("kind", "var");
+            json.entry_num("slot", slot);
+            json.entry_opt_num("presence", presence);
+        }
+    }
+    json.end('}');
+}
+
+/// A type as a tree: its kind, what it holds, its constraints, and how it
+/// sits on the wire.
+fn type_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, ty: &Type) {
+    json.begin('{');
+    json.entry("kind", kind_name(&ty.kind));
+    match &ty.kind {
+        TypeKind::Array(item, length) => {
+            json.key("item");
+            type_json(json, schema, wire, item);
+            json.entry_num("length", length);
+        }
+        TypeKind::Vec(item) | TypeKind::Set(item) => {
+            json.key("item");
+            type_json(json, schema, wire, item);
+        }
+        TypeKind::Map(key, value) => {
+            json.key("key");
+            type_json(json, schema, wire, key);
+            json.key("value");
+            type_json(json, schema, wire, value);
+        }
+        TypeKind::Named(id) => json.entry("path", &schema.qualified(*id)),
+        _ => {}
+    }
+    json.key("constraints");
+    constraints_json(json, &ty.constraints);
+
+    json.key("wire");
+    json.begin('{');
+    json.key("size");
+    size_json(json, wire.size(ty));
+    if let Some(int) = Int::of(ty) {
+        json.key("int");
+        json.begin('{');
+        match int {
+            Int::Native(width) => {
+                json.entry("kind", "native");
+                json.entry_width("width", width);
+            }
+            Int::Biased { min, width } => {
+                json.entry("kind", "biased");
+                json.entry_num("min", min);
+                json.entry_width("width", width);
+            }
+        }
+        json.end('}');
+    }
+    if let Some(sequence) = wire.sequence(ty) {
+        json.key("sequence");
+        json.begin('{');
+        match sequence {
+            Sequence::Packed { item } => {
+                json.entry("kind", "packed");
+                json.entry_num("item", item);
+            }
+            Sequence::Counted { count } => {
+                json.entry("kind", "counted");
+                json.entry_width("count", count);
+            }
+            Sequence::Prefixed { count, prefix } => {
+                json.entry("kind", "prefixed");
+                json.entry_width("count", count);
+                json.entry_width("prefix", prefix);
+            }
+        }
+        json.end('}');
+    }
+    json.end('}');
+
+    json.end('}');
+}
+
+fn kind_name(kind: &TypeKind) -> &'static str {
+    match kind {
+        TypeKind::I8 => "i8",
+        TypeKind::I16 => "i16",
+        TypeKind::I32 => "i32",
+        TypeKind::I64 => "i64",
+        TypeKind::U8 => "u8",
+        TypeKind::U16 => "u16",
+        TypeKind::U32 => "u32",
+        TypeKind::U64 => "u64",
+        TypeKind::F32 => "f32",
+        TypeKind::F64 => "f64",
+        TypeKind::Bool => "bool",
+        TypeKind::Timestamp => "timestamp",
+        TypeKind::Interval => "interval",
+        TypeKind::Entity => "entity",
+        TypeKind::UEntity => "uentity",
+        TypeKind::Uuid => "uuid",
+        TypeKind::String => "string",
+        TypeKind::Bytes => "bytes",
+        TypeKind::Array(..) => "array",
+        TypeKind::Vec(_) => "vec",
+        TypeKind::Map(..) => "map",
+        TypeKind::Set(_) => "set",
+        TypeKind::Named(_) => "named",
+    }
+}
+
+/// Only the constraints that are set; `infinite` and `nan` when true.
+fn constraints_json(json: &mut Json, constraints: &Constraints) {
+    json.begin('{');
+    let number = |json: &mut Json, key: &str, value: Option<Number>| match value {
+        // `{:?}` keeps the fraction of whole floats: `1.0`, not `1`.
+        Some(Number::Float(value)) => json.entry_num(key, format!("{value:?}")),
+        Some(Number::Int(value)) => json.entry_num(key, value),
+        None => {}
+    };
+    number(json, "min", constraints.min);
+    number(json, "max", constraints.max);
+    if let Some(min_length) = constraints.min_length {
+        json.entry_num("min_length", min_length);
+    }
+    if let Some(max_length) = constraints.max_length {
+        json.entry_num("max_length", max_length);
+    }
+    if constraints.infinite {
+        json.entry_bool("infinite", true);
+    }
+    if constraints.nan {
+        json.entry_bool("nan", true);
+    }
+    json.end('}');
+}
+
+fn size_json(json: &mut Json, size: Size) {
+    json.begin('{');
+    match size {
+        Size::Fixed(bytes) => {
+            json.entry("kind", "fixed");
+            json.entry_num("bytes", bytes);
+        }
+        Size::Var { max } => {
+            json.entry("kind", "var");
+            json.entry_opt_num("max", max);
+        }
+    }
     json.end('}');
 }
 
@@ -158,6 +388,18 @@ impl Json {
         self.out.push_str(&value.to_string());
     }
 
+    fn entry_opt_num(&mut self, key: &str, value: Option<impl std::fmt::Display>) {
+        match value {
+            Some(value) => self.entry_num(key, value),
+            None => self.entry_null(key),
+        }
+    }
+
+    /// A width, in bytes.
+    fn entry_width(&mut self, key: &str, width: Width) {
+        self.entry_num(key, width.bytes());
+    }
+
     fn entry_bool(&mut self, key: &str, value: bool) {
         self.key(key);
         self.raw(if value { "true" } else { "false" });
@@ -197,6 +439,8 @@ impl Json {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
     use crate::compile;
 
@@ -206,104 +450,284 @@ mod tests {
     fn generated(sources: &[&str]) -> Vec<GeneratedFile> {
         let schema =
             compile(sources).unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"));
-        Ir.generate(&schema).expect("the IR always emits")
+        Ir.generate(&schema)
+            .expect("a lowered schema always lays out")
     }
 
-    fn only(sources: &[&str]) -> String {
+    fn parse(file: &GeneratedFile) -> Value {
+        serde_json::from_str(&file.contents)
+            .unwrap_or_else(|error| panic!("`{}`: {error}\n{}", file.path.display(), file.contents))
+    }
+
+    /// The file at `path`, parsed.
+    fn file(files: &[GeneratedFile], path: &str) -> Value {
+        let file = files
+            .iter()
+            .find(|file| file.path.to_str() == Some(path))
+            .unwrap_or_else(|| panic!("no file `{path}`"));
+        parse(file)
+    }
+
+    /// The declaration named `path` in a single-namespace schema.
+    fn def(sources: &[&str], path: &str) -> Value {
         let files = generated(sources);
-        assert_eq!(files.len(), 1, "expected a single namespace");
-        files.into_iter().next().unwrap().contents
+        assert_eq!(files.len(), 2, "expected the root and a single namespace");
+        let namespace = parse(&files[1]);
+        namespace["defs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|def| def["path"] == path)
+            .unwrap_or_else(|| panic!("no declaration `{path}`"))
+            .clone()
+    }
+
+    fn field(def: &Value, name: &str) -> Value {
+        def["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["name"] == name)
+            .unwrap_or_else(|| panic!("no field `{name}`"))
+            .clone()
     }
 
     #[test]
-    fn one_file_per_namespace() {
+    fn a_root_and_one_file_per_namespace() {
         let files = generated(&[EXAMPLE1, EXAMPLE2]);
         let paths: Vec<_> = files
             .iter()
             .map(|file| file.path.display().to_string())
             .collect();
-        assert_eq!(paths, ["foo.bar.json", "hello.json"]);
-    }
-
-    #[test]
-    fn declarations_carry_qualified_names() {
-        let contents = only(&["namespace a.b;\nstruct S { x: u8, y: u32 }\n"]);
-        assert!(contents.contains(r#""path": "a.b.S""#), "{contents}");
-        assert!(contents.contains(r#""name": "x""#), "{contents}");
-        assert!(contents.contains(r#""type": "u32""#), "{contents}");
-    }
-
-    #[test]
-    fn nested_declarations_name_their_parent() {
-        let contents = only(&[EXAMPLE1]);
-        assert!(
-            contents.contains(r#""path": "foo.bar.MyResponse.Result""#),
-            "{contents}"
+        assert_eq!(
+            paths,
+            [
+                "schema.json",
+                "namespaces/foo.bar.json",
+                "namespaces/hello.json"
+            ]
         );
-        assert!(
-            contents.contains(r#""parent": "foo.bar.MyResponse""#),
-            "{contents}"
-        );
-    }
-
-    #[test]
-    fn messages_carry_their_direction() {
-        let contents = only(&[EXAMPLE1]);
-        for direction in ["in", "out", "bi"] {
-            assert!(
-                contents.contains(&format!(r#""direction": "{direction}""#)),
-                "{contents}"
-            );
+        for file in &files {
+            parse(file);
         }
     }
 
     #[test]
-    fn optional_fields_are_flagged() {
-        let contents = only(&["namespace a;\nmessage[in] M { o: option<string> }\n"]);
-        assert!(contents.contains(r#""type": "string""#), "{contents}");
-        assert!(contents.contains(r#""optional": true"#), "{contents}");
+    fn the_root_holds_the_fingerprint_and_id_order() {
+        let schema = compile(&[EXAMPLE1, EXAMPLE2]).unwrap();
+        let wire = Wire::new(&schema).unwrap();
+        let files = Ir.generate(&schema).unwrap();
+        let root = file(&files, "schema.json");
+        assert_eq!(root["fingerprint"], wire.fingerprint());
+        assert_eq!(root["namespaces"], json!(["foo.bar", "hello"]));
+        let names = |ids: &[TypeId]| -> Vec<String> {
+            ids.iter().map(|id| schema.qualified(*id)).collect()
+        };
+        assert_eq!(root["inbound"], json!(names(wire.inbound())));
+        assert_eq!(root["outbound"], json!(names(wire.outbound())));
     }
 
     #[test]
-    fn types_are_spelled_out_and_qualified() {
-        let contents = only(&[concat!(
-            "namespace foo.bar;\n",
-            "struct Position { x: f32 }\n",
-            "message[in] M { m: map<u8, vec<Position>>, a: array<i32, 4> }\n",
-        )]);
-        assert!(
-            contents.contains(r#""type": "map<u8, vec<foo.bar.Position>>""#),
-            "{contents}"
-        );
-        assert!(
-            contents.contains(r#""type": "array<i32, 4>""#),
-            "{contents}"
-        );
+    fn a_namespace_named_like_the_root_does_not_collide() {
+        let files = generated(&["namespace schema;\nstruct S {}\n"]);
+        assert_eq!(files[0].path.to_str(), Some("schema.json"));
+        assert_eq!(files[1].path.to_str(), Some("namespaces/schema.json"));
     }
 
     #[test]
-    fn constraints_follow_their_type() {
-        let contents = only(&[concat!(
+    fn nested_declarations_name_their_parent() {
+        let files = generated(&[EXAMPLE1]);
+        let namespace = file(&files, "namespaces/foo.bar.json");
+        let result = namespace["defs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|def| def["path"] == "foo.bar.MyResponse.Result")
+            .expect("the nested enum");
+        assert_eq!(result["name"], "Result");
+        assert_eq!(result["parent"], "foo.bar.MyResponse");
+    }
+
+    #[test]
+    fn messages_carry_their_direction_and_ids() {
+        let sources = [concat!(
             "namespace a;\n",
-            "message[in] M {\n",
-            "    v: vec<string[max_length=14]>[max_length=10, min_length=1],\n",
-            "    f: f64[nan, infinite, max=1],\n",
-            "}\n",
-        )]);
-        assert!(
-            contents
-                .contains(r#""type": "vec<string[max_length=14]>[min_length=1, max_length=10]""#),
-            "{contents}"
+            "message[in] A {}\n",
+            "message[out] B {}\n",
+            "message[bi] C {}\n",
+        )];
+        let ids = |name: &str| {
+            let def = def(&sources, &format!("a.{name}"));
+            (def["direction"].clone(), def["ids"].clone())
+        };
+        assert_eq!(
+            ids("A"),
+            (json!("in"), json!({"inbound": 1, "outbound": null}))
         );
-        assert!(
-            contents.contains(r#""type": "f64[max=1.0, infinite, nan]""#),
-            "{contents}"
+        assert_eq!(
+            ids("B"),
+            (json!("out"), json!({"inbound": null, "outbound": 1}))
+        );
+        assert_eq!(
+            ids("C"),
+            (json!("bi"), json!({"inbound": 2, "outbound": 2}))
+        );
+    }
+
+    #[test]
+    fn struct_fields_are_flagged_optional_too() {
+        let def = def(
+            &["namespace a;\nstruct S { o: option<string>, v: u8 }\n"],
+            "a.S",
+        );
+        assert_eq!(field(&def, "o")["optional"], true);
+        assert_eq!(field(&def, "o")["type"]["kind"], "string");
+        assert_eq!(field(&def, "v")["optional"], false);
+    }
+
+    #[test]
+    fn objects_carry_their_layout_and_slots() {
+        let def = def(
+            &[concat!(
+                "namespace a;\n",
+                "struct S {\n",
+                "    flag: bool,\n",
+                "    maybe: option<bool>,\n",
+                "    x: u16,\n",
+                "    hp: option<u32>,\n",
+                "    name: string,\n",
+                "    nick: option<string>,\n",
+                "}\n",
+            )],
+            "a.S",
+        );
+        assert_eq!(
+            def["layout"],
+            json!({
+                "size": {"kind": "var", "max": null},
+                "bitmap": 1,
+                "boundaries": 3,
+                "boundary": 2,
+                "head": 5,
+                "vars": 2,
+            })
+        );
+        let slot = |name: &str| field(&def, name)["slot"].clone();
+        assert_eq!(slot("flag"), json!({"kind": "bit", "bit": 0}));
+        assert_eq!(
+            slot("maybe"),
+            json!({"kind": "optional_bit", "presence": 1, "value": 2})
+        );
+        assert_eq!(slot("x"), json!({"kind": "at", "offset": 1}));
+        assert_eq!(slot("hp"), json!({"kind": "optional", "presence": 3}));
+        assert_eq!(
+            slot("name"),
+            json!({"kind": "var", "slot": 0, "presence": null})
+        );
+        assert_eq!(
+            slot("nick"),
+            json!({"kind": "var", "slot": 1, "presence": 4})
+        );
+    }
+
+    #[test]
+    fn types_are_trees_with_qualified_names() {
+        let def = def(
+            &[concat!(
+                "namespace foo.bar;\n",
+                "struct Position { x: f32 }\n",
+                "message[in] M { m: map<u8, vec<Position>>, a: array<i32, 4> }\n",
+            )],
+            "foo.bar.M",
+        );
+        let m = &field(&def, "m")["type"];
+        assert_eq!(m["kind"], "map");
+        assert_eq!(m["key"]["kind"], "u8");
+        assert_eq!(m["value"]["kind"], "vec");
+        assert_eq!(m["value"]["item"]["kind"], "named");
+        assert_eq!(m["value"]["item"]["path"], "foo.bar.Position");
+
+        let a = &field(&def, "a")["type"];
+        assert_eq!(a["kind"], "array");
+        assert_eq!(a["length"], 4);
+        assert_eq!(a["item"]["kind"], "i32");
+        assert_eq!(a["wire"]["size"], json!({"kind": "fixed", "bytes": 16}));
+    }
+
+    #[test]
+    fn constraints_hold_only_what_is_set() {
+        let def = def(
+            &[concat!(
+                "namespace a;\n",
+                "message[in] M {\n",
+                "    v: vec<string[max_length=14]>[max_length=10, min_length=1],\n",
+                "    f: f64[nan, infinite, max=1],\n",
+                "    u: u8,\n",
+                "}\n",
+            )],
+            "a.M",
+        );
+        let v = &field(&def, "v")["type"];
+        assert_eq!(v["constraints"], json!({"min_length": 1, "max_length": 10}));
+        assert_eq!(v["item"]["constraints"], json!({"max_length": 14}));
+        assert_eq!(
+            field(&def, "f")["type"]["constraints"],
+            json!({"max": 1.0, "infinite": true, "nan": true})
+        );
+        assert_eq!(field(&def, "u")["type"]["constraints"], json!({}));
+        // Whole floats keep their fraction.
+        assert!(def.to_string().contains(r#""max":1.0"#), "{def}");
+    }
+
+    #[test]
+    fn integers_carry_their_encoding() {
+        let def = def(
+            &["namespace a;\nstruct S { n: i32, b: i32[min=-100, max=100] }\n"],
+            "a.S",
+        );
+        assert_eq!(
+            field(&def, "n")["type"]["wire"]["int"],
+            json!({"kind": "native", "width": 4})
+        );
+        let b = &field(&def, "b")["type"]["wire"];
+        assert_eq!(b["int"], json!({"kind": "biased", "min": -100, "width": 1}));
+        assert_eq!(b["size"], json!({"kind": "fixed", "bytes": 1}));
+    }
+
+    #[test]
+    fn collections_carry_their_sequence() {
+        let def = def(
+            &[concat!(
+                "namespace a;\n",
+                "struct E {}\n",
+                "struct S {\n",
+                "    packed: vec<u32>,\n",
+                "    counted: vec<E>[max_length=9],\n",
+                "    prefixed: vec<string[max_length=16]>[max_length=14],\n",
+                "}\n",
+            )],
+            "a.S",
+        );
+        let sequence = |name: &str| field(&def, name)["type"]["wire"]["sequence"].clone();
+        assert_eq!(sequence("packed"), json!({"kind": "packed", "item": 4}));
+        assert_eq!(sequence("counted"), json!({"kind": "counted", "count": 1}));
+        assert_eq!(
+            sequence("prefixed"),
+            json!({"kind": "prefixed", "count": 1, "prefix": 1})
+        );
+        assert_eq!(
+            field(&def, "prefixed")["type"]["wire"]["size"],
+            json!({"kind": "var", "max": 238})
         );
     }
 
     #[test]
     fn empty_containers_stay_on_one_line() {
-        let contents = only(&["namespace a;\nstruct S {}\n"]);
-        assert!(contents.contains(r#""fields": []"#), "{contents}");
+        let files = generated(&["namespace a;\nstruct S {}\n"]);
+        assert!(
+            files[1].contents.contains(r#""fields": []"#),
+            "{}",
+            files[1].contents
+        );
     }
 }
