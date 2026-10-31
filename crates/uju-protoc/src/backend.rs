@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::backend::ir::Ir;
 use crate::backend::rust::{Rust, RustDispatch};
+use crate::ir::wire::Wire;
 use crate::ir::{Direction, Schema};
 
 /// Every name [`protocol`] accepts, for listing in help and error messages.
@@ -66,6 +67,18 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Lays `schema` out for a backend. Lowering reports layout errors first, so
+/// this fails only on a schema that was not lowered from source.
+pub(crate) fn wire(schema: &Schema) -> Result<Wire, Error> {
+    Wire::new(schema).map_err(|errors| {
+        let messages: Vec<String> = errors
+            .into_iter()
+            .map(|error| format!("`{}`: {}", schema.qualified(error.def), error.message))
+            .collect();
+        Error::new(messages.join("\n"))
+    })
+}
 
 /// Look up a protocol backend, emitting the types with their encoders and
 /// decoders, by name; see [`PROTOCOLS`] for the accepted names.

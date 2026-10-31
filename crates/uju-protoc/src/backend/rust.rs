@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::backend::{Backend, Error, GeneratedFile};
+use crate::backend::{self, Backend, Error, GeneratedFile};
 use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, Width, Wire};
 use crate::ir::{Constraints, DefKind, Direction, Field, Number, Schema, Type, TypeId, TypeKind};
 
@@ -55,13 +55,7 @@ pub struct Rust {
 
 impl Backend for Rust {
     fn generate(&self, schema: &Schema) -> Result<Vec<GeneratedFile>, Error> {
-        let wire = Wire::new(schema).map_err(|errors| {
-            let messages: Vec<String> = errors
-                .into_iter()
-                .map(|error| format!("`{}`: {}", schema.qualified(error.def), error.message))
-                .collect();
-            Error::new(messages.join("\n"))
-        })?;
+        let wire = backend::wire(schema)?;
         let direction = self
             .direction
             .filter(|direction| *direction != Direction::Bi);
