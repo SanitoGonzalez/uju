@@ -2,7 +2,8 @@
 
 How a uju message is encoded. The compiler computes every layout described
 here (`crates/uju-protoc/src/ir/wire.rs`); backends read it from there instead
-of deriving it, so every target agrees byte for byte.
+of deriving it, so every target agrees byte for byte. Generators outside
+`ujuc` read it from [`ujuc protocol ir`](ir.md).
 
 ## Principles
 
