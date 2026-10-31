@@ -1,9 +1,10 @@
-use crate::cluster::node::{self, Node};
-use crate::cluster::shard::{self, Shard};
+use crate::runtime::node::Node;
+use crate::runtime::shard::{self, Shard};
+use crate::topology::{NodeId, ShardId};
 
 pub struct Frame {
-    pub node: node::Id,
-    pub shard: shard::Id,
+    pub node: NodeId,
+    pub shard: ShardId,
     pub msg: Message,
     pub result_tx: Option<shard::FrameTx>,
 }

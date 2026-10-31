@@ -16,9 +16,9 @@ client ─────────► edge ──┬──► sim node ── sh
 ## Roles
 
 - **Shard**: one thread pinned to one CPU, owning one ECS `World`
-  (`crates/uju/src/cluster/shard.rs`) and a dynamic set of placement units.
+  (`crates/uju/src/runtime/shard.rs`) and a dynamic set of placement units.
   It is the authority for everything in them.
-- **Sim node**: runs one shard per allowed CPU (`crates/uju/src/cluster/node.rs`).
+- **Sim node**: runs one shard per allowed CPU (`crates/uju/src/runtime/node.rs`).
   Its shards own **cells**, the squares of the world grid.
 - **Hub node**: the same runtime. Its shards own **slots**, hash buckets of
   the state that has no position: parties, guilds, friends, chat channels,
@@ -421,7 +421,7 @@ character in play, the edge serving it, and a generation number.
 | every node | atlas | load, crossing traffic |
 
 Shards on the same node talk over in-process channels
-(`crates/uju/src/cluster/node.rs`), and over TCP across nodes.
+(`crates/uju/src/runtime/node.rs`), and over TCP across nodes.
 
 **Edges and entry keep full meshes** to shards, opened once and kept. Only
 subscriptions are selective. For example, with 640 sim shards and 64 edge

@@ -10,7 +10,7 @@ default = ["3d"]
 3d = []
 
 [dependencies]
-uju-macros-ecs = { path = "macros/ecs" }
+uju-macros = { path = "../uju-macros" }
 
 bytes.workspace = true
 chrono.workspace = true

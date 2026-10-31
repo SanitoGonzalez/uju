@@ -1,7 +1,6 @@
 use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
 
-use crate::cluster::{node, shard};
 use crate::ecs::{
     component::{self, Component},
     entity::{Entity, Registry, UniversalAllocator, UniversalId},
@@ -11,6 +10,7 @@ use crate::ecs::{
     },
     unique::{self, Unique, time::Time},
 };
+use crate::topology::{NodeId, ShardId};
 
 pub struct World {
     pub(crate) entities: RefCell<Registry>,
@@ -20,7 +20,7 @@ pub struct World {
 
 impl World {
     /// `node` and `shard` name the minter of this world's [`UniversalId`]s.
-    pub fn new(node: node::Id, shard: shard::Id) -> Self {
+    pub fn new(node: NodeId, shard: ShardId) -> Self {
         // todo: resume from the persisted serial high-water mark instead of 0
         let universal = UniversalAllocator::new(node, shard, 0);
         let world = Self {

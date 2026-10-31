@@ -8,7 +8,8 @@ FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/uju crates/uju
-COPY crates/uju-worker crates/uju-worker
+COPY crates/uju-macros crates/uju-macros
+COPY crates/uju-atlas crates/uju-atlas
 RUN cargo chef prepare --recipe-path recipe.json
 
 
@@ -19,8 +20,9 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/uju crates/uju
-COPY crates/uju-worker crates/uju-worker
-RUN cargo build --release --bin uju-worker
+COPY crates/uju-macros crates/uju-macros
+COPY crates/uju-atlas crates/uju-atlas
+RUN cargo build --release --bin uju-atlas
 
 
 FROM debian:trixie-slim AS runtime
@@ -29,8 +31,8 @@ RUN groupadd server && \
     useradd -m -g server server
 
 WORKDIR /app
-COPY --from=builder /build/target/release/uju-worker /app/
+COPY --from=builder /build/target/release/uju-atlas /app/
 RUN chown -R server:server /app
 
 USER server
-CMD ["./uju-worker"]
+CMD ["./uju-atlas"]

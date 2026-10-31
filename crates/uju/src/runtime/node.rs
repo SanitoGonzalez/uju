@@ -4,14 +4,13 @@ use std::thread::JoinHandle;
 use futures_util::{FutureExt, select};
 use tracing::{info, warn};
 
-use crate::cluster::shard;
-
-pub type Id = u16;
+use crate::runtime::shard;
+use crate::topology::{NodeId, ShardId};
 
 static mut CURRENT: MaybeUninit<Node> = MaybeUninit::uninit();
 
 pub struct Node {
-    id: Id,
+    id: NodeId,
 }
 
 impl Node {
@@ -28,19 +27,19 @@ impl Node {
     }
 
     #[inline(always)]
-    pub fn id(&self) -> Id {
+    pub fn id(&self) -> NodeId {
         self.id
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Builder {
-    id: Id,
+    id: NodeId,
     shard_builder: shard::Builder,
 }
 
 impl Builder {
-    pub fn new(id: Id) -> Self {
+    pub fn new(id: NodeId) -> Self {
         Self {
             id,
             shard_builder: shard::Builder::new(),
@@ -108,7 +107,7 @@ impl Builder {
                     sched_setaffinity(Pid::from_raw(0), &cpuset)?;
                     info!("[shard-{id}] thread pinned on cpu {cpu}");
 
-                    shard_builder.run(id as shard::Id, cpu, senders, receiver, token)?;
+                    shard_builder.run(id as ShardId, cpu, senders, receiver, token)?;
                     Ok(())
                 })
                 .unwrap_or_else(|e| panic!("failed to spawn thread for shard-{id}: {e}"));

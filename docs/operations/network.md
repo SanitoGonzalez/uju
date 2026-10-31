@@ -6,13 +6,13 @@ None of this is needed for local development: the server listens on
 
 > **Status.** Most of this describes the planned layout. Today every pinned
 > thread is a `shard-N`, listening on `127.0.0.1:7000 + N` with the base
-> hardcoded (`crates/uju/src/cluster/shard.rs`). Node kinds, edge threads,
+> hardcoded (`crates/uju/src/runtime/shard.rs`). Node kinds, edge threads,
 > upstream ports and the client listener do not exist yet.
 
 ## Goal
 
 Every uju node runs one thread per CPU it may use, pinned to that CPU
-(`crates/uju/src/cluster/node.rs`): a shard on sim and hub nodes, an edge
+(`crates/uju/src/runtime/node.rs`): a shard on sim and hub nodes, an edge
 thread on edge nodes (see [Topology](../architectures/topology.md)). A
 packet's journey crosses three places that should all be the same CPU:
 

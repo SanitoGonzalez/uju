@@ -9,14 +9,13 @@ use std::time::{Duration, Instant};
 use futures_util::{FutureExt, select};
 use tracing::{error, info};
 
-use crate::cluster::error::Result;
-use crate::cluster::node::Node;
-use crate::cluster::shard::message::Frame;
 use crate::ecs::world::World;
 use crate::net::{self, transport::tcp};
+use crate::runtime::error::Result;
+use crate::runtime::node::Node;
+use crate::runtime::shard::message::Frame;
+use crate::topology::ShardId;
 use crate::util::stop::{StopSource, StopToken};
-
-pub type Id = u16;
 
 thread_local! { static CURRENT: UnsafeCell<Option<Rc<Shard>>> = const { UnsafeCell::new(None) } }
 
@@ -26,7 +25,7 @@ pub type ShutdownTx = crossfire::null::CloseHandle<crossfire::mpmc::Null>;
 pub type ShutdownRx = crossfire::MAsyncRx<crossfire::mpmc::Null>;
 
 pub struct Shard {
-    id: Id,
+    id: ShardId,
     cpu: usize,
     tx: Vec<FrameTx>,
     stop: StopSource,
@@ -50,7 +49,7 @@ impl Shard {
     }
 
     #[inline(always)]
-    pub fn id(&self) -> Id {
+    pub fn id(&self) -> ShardId {
         self.id
     }
 
@@ -171,7 +170,7 @@ impl Builder {
 
     pub fn run(
         self,
-        id: Id,
+        id: ShardId,
         cpu: usize,
         tx: Vec<FrameTx>,
         rx: FrameRx,

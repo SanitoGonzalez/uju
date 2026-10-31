@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU32;
 
-use crate::cluster::{node, shard};
+use crate::topology::{NodeId, ShardId};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]
@@ -229,15 +229,15 @@ impl Default for Allocator {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UniversalId {
     serial: u64,
-    node: node::Id,
-    shard: shard::Id,
+    node: NodeId,
+    shard: ShardId,
 }
 
 impl UniversalId {
     pub const BYTES: usize = 12;
 
     #[inline]
-    pub const fn new(node: node::Id, shard: shard::Id, serial: u64) -> Self {
+    pub const fn new(node: NodeId, shard: ShardId, serial: u64) -> Self {
         Self {
             serial,
             node,
@@ -251,12 +251,12 @@ impl UniversalId {
     }
 
     #[inline(always)]
-    pub const fn node(&self) -> node::Id {
+    pub const fn node(&self) -> NodeId {
         self.node
     }
 
     #[inline(always)]
-    pub const fn shard(&self) -> shard::Id {
+    pub const fn shard(&self) -> ShardId {
         self.shard
     }
 }
@@ -275,8 +275,8 @@ impl fmt::Display for UniversalId {
 
 /// Mints [`UniversalId`]s for one shard. Counters are never reused.
 pub struct UniversalAllocator {
-    node: node::Id,
-    shard: shard::Id,
+    node: NodeId,
+    shard: ShardId,
     next: u64,
 }
 
@@ -286,7 +286,7 @@ impl UniversalAllocator {
     /// Migrated entities can outlive their creator, so after a restart `start` must
     /// exceed every serial minted before - otherwise ids may alias live entities.
     /// Persist [`next_serial`](Self::next_serial) and pass it back here.
-    pub fn new(node: node::Id, shard: shard::Id, start: u64) -> Self {
+    pub fn new(node: NodeId, shard: ShardId, start: u64) -> Self {
         Self {
             node,
             shard,

@@ -5,10 +5,10 @@ pub mod storage;
 pub mod unique;
 pub mod world;
 
-pub use uju_macros_ecs::*;
+pub use uju_macros::*;
 
 pub mod prelude {
-    pub use uju_macros_ecs::{Component, Unique};
+    pub use uju_macros::{Component, Unique};
 
     pub use super::entity::Entity;
     pub use super::query::{Mut, Query, With, Without};
