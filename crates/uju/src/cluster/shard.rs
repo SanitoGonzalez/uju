@@ -27,6 +27,7 @@ pub type ShutdownRx = crossfire::MAsyncRx<crossfire::mpmc::Null>;
 
 pub struct Shard {
     id: Id,
+    cpu: usize,
     tx: Vec<FrameTx>,
     stop: StopSource,
     token: StopToken,
@@ -51,6 +52,12 @@ impl Shard {
     #[inline(always)]
     pub fn id(&self) -> Id {
         self.id
+    }
+
+    /// The cpu this shard's thread is pinned on.
+    #[inline(always)]
+    pub fn cpu(&self) -> usize {
+        self.cpu
     }
 
     async fn run(
@@ -111,7 +118,7 @@ impl Shard {
 
     fn spawn_tcp_server(shard: Rc<Self>) -> Result<()> {
         let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap(); // todo: accept config
-        let listener = tcp::listener::bind(addr)?;
+        let listener = tcp::listener::bind(addr, Some(shard.cpu))?;
         let token = shard.token.clone();
 
         compio::runtime::spawn(async move {
@@ -156,6 +163,7 @@ impl Builder {
     pub fn run(
         self,
         id: Id,
+        cpu: usize,
         tx: Vec<FrameTx>,
         rx: FrameRx,
         shutdown: ShutdownRx,
@@ -179,6 +187,7 @@ impl Builder {
         let (stop, token) = StopSource::new();
         let shard = Rc::new(Shard {
             id,
+            cpu,
             tx,
             stop,
             token,

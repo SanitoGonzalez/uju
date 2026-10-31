@@ -9,9 +9,14 @@ use crate::net::error::Result;
 use crate::net::transport::tcp::session::Session;
 use crate::util::stop::StopToken;
 
-pub fn bind(addr: SocketAddr) -> Result<TcpListener> {
+/// Binds a listener into the `SO_REUSEPORT` group of `addr`. With `cpu`, sets `SO_INCOMING_CPU`
+/// so the kernel prefers this listener for SYNs processed on that cpu, falling back to the hash.
+pub fn bind(addr: SocketAddr, cpu: Option<usize>) -> Result<TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_port(true)?;
+    if let Some(cpu) = cpu {
+        socket.set_cpu_affinity(cpu)?;
+    }
     // socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     socket.set_tcp_nodelay(true)?;
@@ -50,14 +55,21 @@ mod tests {
     #[compio::test]
     async fn test_listener_bind() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let listener1 = bind(addr).unwrap();
-        let _listener2 = bind(listener1.local_addr().unwrap()).unwrap();
+        let listener1 = bind(addr, None).unwrap();
+        let _listener2 = bind(listener1.local_addr().unwrap(), None).unwrap();
+    }
+
+    #[compio::test]
+    async fn test_listener_bind_incoming_cpu() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener = bind(addr, Some(0)).unwrap();
+        assert_eq!(socket2::SockRef::from(&listener).cpu_affinity().unwrap(), 0);
     }
 
     #[compio::test]
     async fn test_listener_accept() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let listener = bind(addr).unwrap();
+        let listener = bind(addr, None).unwrap();
         let addr = listener.local_addr().unwrap();
 
         let (stop, token) = StopSource::new();

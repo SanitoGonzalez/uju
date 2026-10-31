@@ -108,7 +108,7 @@ impl Builder {
                     sched_setaffinity(Pid::from_raw(0), &cpuset)?;
                     info!("[shard-{id}] thread pinned on cpu {cpu}");
 
-                    shard_builder.run(id as shard::Id, senders, receiver, token)?;
+                    shard_builder.run(id as shard::Id, cpu, senders, receiver, token)?;
                     Ok(())
                 })
                 .unwrap_or_else(|e| panic!("failed to spawn thread for shard-{id}: {e}"));
