@@ -459,6 +459,11 @@ The subscriber set is part of the cell's state and moves with it.
 Every cell carries `(epoch, seq)`. The epoch increments on each ownership
 change.
 
+> **TODO.** Deltas name components by the static ids the protocol compiler
+> assigns (see [Components](../protocol/schema.md#components)). The ids
+> `uju::ecs` assigns at startup differ between binaries that link different
+> components, such as a sim and an edge.
+
 ### Cell handoff
 
 Atlas decides that cell `c` moves from shard S to shard S′. Then:

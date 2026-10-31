@@ -297,4 +297,16 @@ because the id determines it.
   integer, possibly narrowed to any width from 1 to 8 bytes.
 - `struct[patch]` attribute: generate a patch struct (every field optional)
   with `diff` and `apply`, for replicating ECS components.
+- Component ids: the compiler assigns every component declared in the
+  schema a static id, as it does for messages, and replication names
+  components by it. The ids `uju::ecs::component` assigns at startup come
+  from sorting the names of the components a binary links, so they are only
+  valid inside that binary: a sim that links one component an edge does not
+  shifts every id after it. See [Components](schema.md#components).
+- Rust backend: mark the generated code `#[rustfmt::skip]`, so `cargo fmt`
+  leaves it alone and regenerating it changes nothing. Today the output is
+  not formatted as rustfmt would, and users have to exclude its directory
+  with rustfmt's `ignore`, which only nightly rustfmt supports. An inner
+  `#![rustfmt::skip]` is unstable too, so the attribute goes on each
+  generated item and on the root's `mod` declarations.
 - `f16`.
