@@ -13,7 +13,7 @@ use crate::cluster::error::Result;
 use crate::cluster::node::Node;
 use crate::cluster::shard::message::Frame;
 use crate::ecs::world::World;
-use crate::net::transport::tcp;
+use crate::net::{self, transport::tcp};
 use crate::util::stop::{StopSource, StopToken};
 
 pub type Id = u16;
@@ -117,8 +117,17 @@ impl Shard {
     }
 
     fn spawn_tcp_server(shard: Rc<Self>) -> Result<()> {
-        let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap(); // todo: accept config
-        let listener = tcp::listener::bind(addr, Some(shard.cpu))?;
+        const BASE_PORT: u16 = 7000; // todo: accept config
+
+        // each shard listens on its own port, so a peer picks the shard by address
+        let port = BASE_PORT.checked_add(shard.id).ok_or_else(|| {
+            net::error::Error::from(std::io::Error::other(format!(
+                "port for shard-{} overflows u16",
+                shard.id
+            )))
+        })?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = tcp::listener::bind(addr)?;
         let token = shard.token.clone();
 
         compio::runtime::spawn(async move {

@@ -23,7 +23,7 @@ parry3d.workspace = true
 libc.workspace = true
 linkme = "0.3"
 nix = { version = "0.31", features = ["sched"] }
-socket2 = { version = "0.6", features = ["all"] }
+socket2 = "0.6"
 smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
