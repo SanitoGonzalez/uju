@@ -164,7 +164,7 @@ variable-size struct in a slot or behind a length prefix.
 ### Example
 
 ```
-message[in] MyRequest {
+message(client -> sim) MyRequest {
     foo: i32[min=-100, max=100],
     name: string[min_length=2, max_length=12],
     addresses: vec<string[max_length=16]>[max_length=14],
@@ -329,38 +329,88 @@ represent a value outside its range.
 
 ## Message ids
 
-Every message has a `u16` id in each direction it travels:
+Every role pair a message travels, such as `client -> sim`, has an id
+space of its own. A message has a `u16` id in each pair it travels:
 
-- **inbound** (the messages a server receives): `in` and `bi` messages;
-- **outbound** (the messages a server sends): `out` and `bi` messages.
+- Each space is dense from `1`, ordered by fully qualified name
+  (`namespace.Message`). `0` is never an id, so a zeroed id reads as no
+  message.
+- A message's ids in different pairs may differ. `message(client <-> sim)`
+  has one id among the `client -> sim` messages and another among the
+  `sim -> client` ones.
+- Hub kinds share their role's spaces. Messages to `hub<Party>` and to
+  `hub<Guild>` are numbered together, as `client -> hub` or `sim -> hub`,
+  and a message's id implies the kind it goes to.
+- A space holds at most 65535 messages.
 
-Each space is dense from `1`, ordered by fully qualified name
-(`namespace.Message`); `0` is never an id, so a zeroed id reads as no message. A `bi` message has an id in both spaces, and the two may
-differ.
+So a receiver dispatches each pair's messages with a jump table over
+exactly those messages.
+
+### Hub kind ids
+
+Every hub kind has a `u16` id, dense from `1` over every kind, ordered by
+fully qualified name. With the object's key, it picks the object's slot,
+`hash(kind, key)`. A message to a hub never carries it, since the
+message's id implies it.
 
 ## Fingerprint
 
-The compiler emits a `u64` fingerprint of the schema. It is the 64-bit
-FNV-1a hash of a canonical text listing every declaration, sorted by fully
-qualified name, with every name included: enums with their repr and variant
-values, structs and messages with their fields in declaration order, unions
-with their variants and each variant's data in declaration order, `type`s
-with their target, each type spelled as in source, qualified, and with its
-constraints, and messages with their direction. A union is listed as
-`union a.U { A { x: u8, }, B(u8), C, }`, and a `type` as
-`type a.Level = u8[max=100]`. Consts follow, sorted the same way, with
-their type and value. They never go on the wire, but peers must agree on
-them too. A `duration` const is spelled in the largest unit that divides it
-exactly, as `const a.D: duration = 1s` for `1000ms`, and a `timestamp`
-const as RFC 3339 in UTC with no fraction when it is zero, else 3 digits
-when whole milliseconds and 6 otherwise, as
+The compiler emits two `u64` fingerprints of the schema:
+
+- `internal` covers every declaration and const.
+- `client` covers what clients see: every message with a link that has
+  `client` at either end, every declaration such a message reaches, the
+  key and name of every hub kind it names, with what the key reaches, and
+  every const.
+
+Changing a message between servers changes `internal` only, so clients
+built from the old schema still match.
+
+Each is the 64-bit FNV-1a hash of a canonical text listing its
+declarations, sorted by fully qualified name, with every name included:
+enums with their repr and variant values, structs, messages and hub kinds
+with their fields in declaration order, unions with their variants and each
+variant's data in declaration order, `type`s with their target, each type
+spelled as in source, qualified, and with its constraints, messages with
+their links, and hub kinds with their key. A union is listed
+as `union a.U { A { x: u8, }, B(u8), C, }`, a `type` as
+`type a.Level = u8[max=100]`, and a hub kind as
+`hub(a.GuildId) a.Guild { name: string[max_length=24], }`. Consts follow,
+sorted the same way, with their type and value. They never go on the wire,
+but peers must agree on them too. A `duration` const is spelled in the
+largest unit that divides it exactly, as `const a.D: duration = 1s` for
+`1000ms`, and a `timestamp` const as RFC 3339 in UTC with no fraction
+when it is zero, else 3 digits when whole milliseconds and 6 otherwise, as
 `const a.T: timestamp = 2026-11-07T12:00:00Z`. So every spelling of a value
 hashes the same.
 
+A message spells its links normalized, so every way of writing its
+endpoints hashes the same. Its role pairs are listed once each,
+comma-separated, sorted by sender then receiver in the order `client`,
+`entry`, `edge`, `sim`, `hub`. Kinds are qualified, and sending kinds are
+sorted by qualified name and joined by ` | `. Bare `hub` stays `hub`. Both
+`message(client <-> hub<Party>) M {}` and
+`message(hub<Party> <-> client) M {}` are listed as
+
+```
+message(client -> hub<a.Party>, hub<a.Party> -> client) a.M { }
+```
+
+and `message(hub<Party> | hub<Guild> -> client) Notice {}` as
+
+```
+message(hub<a.Guild> | hub<a.Party> -> client) a.Notice { }
+```
+
+The canonical text of `client` lists only a message's links with a client
+end. It lists a hub kind such a link names by its header alone, as
+`hub(a.GuildId) a.Guild`, so kinds' bodies are never part of it.
+
 Renaming anything, reordering fields or variants, or changing a constraint
-or a const changes the fingerprint. The order in which sources are compiled does not. FNV-1a is not
-collision-resistant against an attacker, and it doesn't need to be: it only
-catches peers built from different schemas.
+or a const changes the fingerprints that cover it. The order in which
+sources are compiled does not. FNV-1a is not collision-resistant against
+an attacker, and it doesn't need to be: it only catches peers built from
+different schemas.
 
 ## Envelope
 
@@ -368,6 +418,31 @@ The protocol doesn't frame messages. The application must send enough to
 decode one, typically the message id and the body's byte length, and may
 batch, compress, or fragment as it likes. Fixed-size messages need no length,
 because the id determines it.
+
+An id means something only within its [space](#message-ids), so an
+envelope must say which space it is in:
+
+- **Client connections** carry several pairs. A client's connection to its
+  edge carries `client -> edge`, `client -> sim` and `client -> hub` up,
+  and the reverse three down. So the envelope names the far role, the
+  destination upstream and the source downstream.
+- **Connections between servers** carry one pair each way, since edges
+  only relay there.
+- **Messages to a hub** carry the object's key after the id. The id implies
+  the kind, so an edge hashes `(kind, key)` to the slot and forwards the
+  message without reading its body. A hub's handler gets the key beside the
+  message.
+
+A client's message to a hub, for instance:
+
+```
+envelope := dest | message id | key | length | body
+```
+
+A relayed message keeps its id, and edges never renumber. The compiler
+gives edges what relaying needs per relayed pair: each message's size when
+fixed, and for a hub receiver the kind's id and the key's encoded size (see
+[Generation by role](schema.md#generation-by-role)).
 
 ## TODO
 

@@ -36,7 +36,9 @@ impl Generator<'_> {
             DefKind::Enum(_) => true,
             DefKind::Type(item) => self.wire.size(&item.target).fixed().is_some(),
             DefKind::Union(_) => false,
-            DefKind::Struct(_) | DefKind::Message(_) => self.wire.layout(id).size.fixed().is_some(),
+            DefKind::Struct(_) | DefKind::Message(_) | DefKind::Hub(_) => {
+                self.wire.layout(id).size.fixed().is_some()
+            }
         }
     }
 
@@ -123,7 +125,9 @@ impl Generator<'_> {
                     format!("__w::Typed<{}>", self.path(*id, module, &self.names[id.0]))
                 }
                 DefKind::Union(_) => unreachable!("a union is never fixed-size"),
-                DefKind::Struct(_) | DefKind::Message(_) => self.view_path(*id, module),
+                DefKind::Struct(_) | DefKind::Message(_) | DefKind::Hub(_) => {
+                    self.view_path(*id, module)
+                }
             },
             _ => unreachable!("only fixed-size types have cells"),
         }

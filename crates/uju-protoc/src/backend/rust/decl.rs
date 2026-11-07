@@ -347,7 +347,9 @@ impl Generator<'_> {
         out.line("}");
     }
 
-    pub(super) fn message(&self, out: &mut Out, id: TypeId) {
+    /// `Message`, and for a message to a hub this role sends, `ToHub`, with
+    /// `HubMessage` where the kind is generated.
+    pub(super) fn message(&self, out: &mut Out, id: TypeId, item: &Message) {
         let name = &self.names[id.0];
         out.line("");
         out.line(format!("impl __w::Message for {name} {{"));
@@ -356,49 +358,135 @@ impl Generator<'_> {
             self.schema.qualified(id)
         ));
         out.line("}");
+
+        // A message names one receiving kind.
+        let Some(kind) = item
+            .links
+            .iter()
+            .filter(|link| self.role.is_none_or(|role| role == link.from))
+            .find_map(|link| link.to_kind)
+        else {
+            return;
+        };
+        let DefKind::Hub(hub) = &self.schema.def(kind).kind else {
+            unreachable!("a message goes to a hub kind");
+        };
+        let module = &self.modules[id.0];
+        out.line("");
+        out.line(format!("impl __w::ToHub for {name} {{"));
+        out.line(format!("type Key = {};", self.owned(&hub.key, module)));
+        out.line("}");
+        if self.generated(kind) {
+            out.line("");
+            out.line(format!("impl __w::HubMessage for {name} {{"));
+            out.line(format!(
+                "type Kind = {};",
+                self.path(kind, module, &self.names[kind.0])
+            ));
+            out.line("}");
+        }
     }
 
-    /// Every message's ids, in the root: one message added or removed
-    /// renumbers those after it, whatever their namespace.
-    pub(super) fn ids(&self, out: &mut Out) {
-        for (way, messages, name) in [
-            (Direction::In, self.wire.inbound(), "Inbound"),
-            (Direction::Out, self.wire.outbound(), "Outbound"),
-        ] {
-            let constant = name.to_uppercase();
-            for id in messages {
+    /// Every message's `Link` per role pair this role is on, in the root:
+    /// one message added or removed renumbers those after it, whatever
+    /// their namespace.
+    pub(super) fn links(&self, out: &mut Out) {
+        for space in self.linked() {
+            let (from, to) = (space.from.pascal(), space.to.pascal());
+            for (index, id) in space.messages.iter().enumerate() {
                 let ty = self.path(*id, &[], &self.names[id.0]);
                 out.line("");
-                out.line(format!("impl {RUNTIME}::{name} for {ty} {{"));
                 out.line(format!(
-                    "const {constant}_ID: u16 = {};",
-                    self.message_id(*id, way)
+                    "impl __w::Link<__w::role::{from}, __w::role::{to}> for {ty} {{"
                 ));
+                out.line(format!("const ID: u16 = {};", index + 1));
                 out.line("}");
             }
         }
     }
 
-    /// The id of message `id` among those travelling `way`.
-    pub(super) fn message_id(&self, id: TypeId, way: Direction) -> u16 {
-        let ids = self.wire.ids(id);
-        match way {
-            Direction::In => ids.inbound,
-            _ => ids.outbound,
+    /// Every generated hub kind's `HubKind`, in the root: one kind added or
+    /// removed renumbers those after it, whatever their namespace.
+    pub(super) fn hub_kinds(&self, out: &mut Out) {
+        for id in self.wire.hubs() {
+            if !self.generated(*id) {
+                continue;
+            }
+            let DefKind::Hub(item) = &self.schema.def(*id).kind else {
+                unreachable!("a hub kind");
+            };
+            let ty = self.path(*id, &[], &self.names[id.0]);
+            out.line("");
+            out.line(format!("impl __w::HubKind for {ty} {{"));
+            out.line(format!("type Key = {};", self.owned(&item.key, &[])));
+            out.line(format!(
+                "const ID: u16 = {};",
+                self.wire.hub_id(*id).expect("a hub kind has an id")
+            ));
+            out.line(format!(
+                "const NAME: &'static str = {:?};",
+                self.schema.qualified(*id)
+            ));
+            out.line("}");
         }
-        .expect("a message travelling `way`")
     }
 
-    /// The enum of every message travelling `way`, decoded by id.
-    pub(super) fn dispatch(&self, out: &mut Out, way: Direction) {
-        let (name, messages, receiver) = match way {
-            Direction::In => ("InboundMessage", self.wire.inbound(), "server receives"),
-            _ => ("OutboundMessage", self.wire.outbound(), "client receives"),
-        };
+    /// The relay table of each role pair an edge relays, in the root, as
+    /// ids are: `CLIENT_TO_SIM_RELAYS[id - 1]` is how to relay message `id`.
+    pub(super) fn relays(&self, out: &mut Out) {
+        for space in self.relayed() {
+            out.line("");
+            out.line(format!(
+                "/// How an edge relays each `{} -> {}` message, at index `id - 1`.",
+                space.from, space.to
+            ));
+            out.line(format!(
+                "pub const {}: &[__w::Relay] = &[",
+                relay_name(space)
+            ));
+            for id in &space.messages {
+                let size = match self.wire.layout(*id).size.fixed() {
+                    Some(size) => format!("Some({size})"),
+                    None => "None".to_string(),
+                };
+                let DefKind::Message(item) = &self.schema.def(*id).kind else {
+                    unreachable!("a space holds messages");
+                };
+                let kind = item
+                    .links
+                    .iter()
+                    .find(|link| link.from == space.from && link.to == space.to)
+                    .and_then(|link| link.to_kind);
+                let hub = match kind {
+                    Some(kind) => {
+                        let DefKind::Hub(hub) = &self.schema.def(kind).kind else {
+                            unreachable!("a message goes to a hub kind");
+                        };
+                        format!(
+                            "Some(__w::HubRoute {{ kind: {}, key_size: {} }})",
+                            self.wire.hub_id(kind).expect("a hub kind has an id"),
+                            self.fixed_size(&hub.key)
+                        )
+                    }
+                    None => "None".to_string(),
+                };
+                out.line(format!("// {}", self.schema.qualified(*id)));
+                out.line(format!("__w::Relay {{ size: {size}, hub: {hub} }},"));
+            }
+            out.line("];");
+        }
+    }
+
+    /// The enum of every message linking `space`'s role pair, decoded by
+    /// id.
+    pub(super) fn dispatch(&self, out: &mut Out, space: &Space) {
+        let name = dispatch_name(space);
+        let messages = &space.messages;
         let variants = self.variants(messages);
         out.line("");
         out.line(format!(
-            "/// A message a {receiver}, decoded by its id and viewed in place."
+            "/// A `{} -> {}` message, decoded by its id and viewed in place.",
+            space.from, space.to
         ));
         out.line("#[derive(Debug, Clone, Copy)]");
         out.line(format!("pub enum {name}<'a> {{"));
@@ -412,11 +500,11 @@ impl Generator<'_> {
             "pub fn decode(id: u16, buf: &'a [u8]) -> {RESULT}<Self, {RUNTIME}::DecodeError> {{"
         ));
         out.line("match id {");
-        for (variant, id) in variants.iter().zip(messages) {
+        for (index, (variant, id)) in variants.iter().zip(messages).enumerate() {
             let view = self.path(*id, &[], &format!("{}View", self.names[id.0]));
             out.line(format!(
                 "{} => {view}::decode(buf).map(Self::{variant}),",
-                self.message_id(*id, way)
+                index + 1
             ));
         }
         out.line(format!("_ => Err({RUNTIME}::DecodeError::unknown(id)),"));
@@ -425,11 +513,8 @@ impl Generator<'_> {
         out.line("");
         out.line("pub fn id(&self) -> u16 {");
         out.line("match self {");
-        for (variant, id) in variants.iter().zip(messages) {
-            out.line(format!(
-                "Self::{variant}(_) => {},",
-                self.message_id(*id, way)
-            ));
+        for (index, variant) in variants.iter().enumerate() {
+            out.line(format!("Self::{variant}(_) => {},", index + 1));
         }
         out.line("}");
         out.line("}");

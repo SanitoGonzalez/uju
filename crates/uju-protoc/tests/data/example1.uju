@@ -9,6 +9,8 @@
 // consts: integers, floats, bool, string, duration, and timestamp
 // type: a scalar under a name of its own
 // union: one of several variants, each with fields, a value, or nothing
+// hub: a hub kind, keyed, with a struct's body
+// message: between roles, as `(client -> sim)`, `(sim <-> sim)`, or `(client -> hub<Kind>)`
 //
 // `uentity` and `uuid` are left out until the Rust backend supports them.
 
@@ -102,9 +104,36 @@ union PartyOp {
     Disband,
 }
 
-message[bi] Ping {}
+// A hub kind: objects found by their key, each holding the body as its
+// state, laid out as a struct. The key is fixed-size and holds no float.
+type GuildId = u64
 
-message[bi] Party {
+hub(GuildId) Guild {
+    enum Rank {
+        Member,
+        Officer,
+    }
+
+    name: string[max_length=24],
+    level: Level,
+    ranks: map<PartyId, Rank>,
+}
+
+hub(GuildId) GuildBank {
+    gold: u64,
+}
+
+// A hub kind is not a type: what others see of it is a struct of its own.
+struct GuildInfo {
+    name: string[max_length=24],
+    level: Level,
+}
+
+// A message names its endpoints: the roles sending it, an arrow, and the
+// roles receiving it. `<->` goes both ways, and `|` lists roles.
+message(client <-> entry | edge) Ping {}
+
+message(sim <-> sim) Party {
     leader: PartyId,
     members: vec<PartyId>[max_length=8],
     levels: map<PartyId, Level>,
@@ -113,7 +142,29 @@ message[bi] Party {
     pending: option<PartyOp>,
 }
 
-message[in] MyRequest {
+message(hub<Guild> -> sim) GuildChanged {
+    id: GuildId,
+    guild: GuildInfo,
+}
+
+// A hub kind takes messages from clients and sends to them too.
+message(client -> hub<Guild>) GetGuild {}
+
+message(hub<Guild> -> client) GuildState {
+    guild: GuildInfo,
+}
+
+// `hub<Kind>` names the kind a message goes to. As a sender, bare `hub`
+// is any kind, and `hub<A> | hub<B>` only those.
+message(client | sim -> hub<GuildBank>) Deposit {
+    amount: u64[min=1],
+}
+
+message(hub<Guild> | hub<GuildBank> -> client) GuildNotice {
+    text: string[max_length=64],
+}
+
+message(client -> sim) MyRequest {
     // A const nested in a message, like a nested type.
     const MaxAddresses: u8 = 14
 
@@ -123,7 +174,7 @@ message[in] MyRequest {
     addresses: vec<string[max_length=16]>[max_length=14],
 }
 
-message[out] MyResponse {
+message(sim -> client) MyResponse {
     enum Result {
         Ok,
         Error,
@@ -133,7 +184,7 @@ message[out] MyResponse {
 }
 
 // Declarations nest more than one level deep.
-message[out] Status {
+message(sim | hub -> client) Status {
     struct HTTPDetail {
         enum Kind {
             Client,
@@ -148,7 +199,7 @@ message[out] Status {
     detail: option<HTTPDetail>,
 }
 
-message[in] Everything {
+message(client -> sim) Everything {
     a: i8,
     b: i16,
     c: i64[min=0, max=70000],

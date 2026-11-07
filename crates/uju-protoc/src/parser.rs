@@ -225,8 +225,8 @@ where
     )
     .boxed();
 
-    // `type` and `union` are keywords only where a declaration starts, so
-    // they stay usable as names, as in a field `type: u8`.
+    // `type`, `union`, and `hub` are keywords only where a declaration
+    // starts, so they stay usable as names, as in a field `type: u8`.
     let type_item = just(Token::Ident("type"))
         .ignore_then(ident)
         .then_ignore(just(Token::Equal))
@@ -250,6 +250,7 @@ where
             span: e.span(),
         });
     let variant_type = ty
+        .clone()
         .delimited_by(just(Token::ParenOpen), just(Token::ParenClose))
         .map(VariantData::Type);
     let union_variant = without_attrs(
@@ -344,7 +345,18 @@ where
             .repeated()
             .collect::<Vec<_>>()
             .delimited_by(just(Token::BraceOpen), just(Token::BraceClose))
-            .validate(|members, _, emitter| collect_body(members, emitter))
+            .validate(|members, _, emitter| {
+                let body = collect_body(members, emitter);
+                for item in &body.items {
+                    if let Item::Hub(hub) = item {
+                        emitter.emit(Rich::custom(
+                            hub.name.1.clone(),
+                            "a hub kind must be declared at the top level of a namespace",
+                        ));
+                    }
+                }
+                body
+            })
             .boxed();
 
         let struct_item = just(Token::Struct)
@@ -358,24 +370,87 @@ where
                 })
             });
 
-        let direction = ident
-            .try_map(|(name, span), _: Span| match Direction::from_name(name) {
-                Some(direction) => Ok((direction, span)),
-                None => Err(Rich::custom(
-                    span,
-                    format!("`{name}` is not a direction; expected `in`, `out`, or `bi`"),
-                )),
-            })
-            .delimited_by(just(Token::BracketOpen), just(Token::BracketClose));
+        // `sim` or `hub<Kind>`. Role names are not keywords.
+        let endpoint = ident
+            .labelled("role")
+            .then(
+                path.clone()
+                    .delimited_by(just(Token::Lt), just(Token::Gt))
+                    .or_not(),
+            )
+            .try_map(|((name, name_span), kind), span: Span| {
+                let role = match Role::from_name(name) {
+                    Some(role) => role,
+                    None if name == "atlas" => {
+                        return Err(Rich::custom(
+                            name_span,
+                            "`atlas` cannot be an endpoint; atlas speaks only uju's own messages",
+                        ));
+                    }
+                    None => {
+                        return Err(Rich::custom(
+                            name_span,
+                            format!(
+                                "`{name}` is not a role; expected `client`, `entry`, `edge`, `sim`, or `hub`"
+                            ),
+                        ));
+                    }
+                };
+                if role != Role::Hub && kind.is_some() {
+                    return Err(Rich::custom(
+                        span,
+                        format!("only `hub` takes a kind, as `hub<Party>`; write `{name}`"),
+                    ));
+                }
+                Ok(Endpoint { role, kind, span })
+            });
+
+        let side = endpoint
+            .separated_by(just(Token::Pipe))
+            .at_least(1)
+            .collect::<Vec<_>>();
+
+        let endpoints = side
+            .clone()
+            .then(choice((
+                just(Token::Arrow).to(false),
+                just(Token::BiArrow).to(true),
+            )))
+            .then(side)
+            .delimited_by(just(Token::ParenOpen), just(Token::ParenClose))
+            .map_with(|((from, both), to), e| Endpoints {
+                from,
+                to,
+                both,
+                span: e.span(),
+            });
 
         let message_item = just(Token::Message)
-            .ignore_then(direction)
+            .ignore_then(endpoints)
             .then(ident)
-            .then(body)
-            .map(|((direction, name), body)| {
+            .then(body.clone())
+            .map(|((endpoints, name), body)| {
                 Item::Message(Message {
                     attrs: Vec::new(),
-                    direction,
+                    endpoints,
+                    name,
+                    body,
+                })
+            });
+
+        // `hub(Key) Name { ... }`. Parsed in any body, so that `body` can
+        // report one nested there.
+        let hub_item = just(Token::Ident("hub"))
+            .ignore_then(
+                ty.clone()
+                    .delimited_by(just(Token::ParenOpen), just(Token::ParenClose)),
+            )
+            .then(ident)
+            .then(body)
+            .map(|((key, name), body)| {
+                Item::Hub(Hub {
+                    attrs: Vec::new(),
+                    key,
                     name,
                     body,
                 })
@@ -385,6 +460,7 @@ where
             enum_item,
             struct_item,
             message_item,
+            hub_item,
             const_item,
             union_item.clone(),
             type_item.clone(),
@@ -639,7 +715,7 @@ mod tests {
             .iter()
             .map(|name| format!("f_{name}: {name}, "))
             .collect();
-        let src = format!("namespace a\nmessage[in] M {{ {body} }}\n");
+        let src = format!("namespace a\nmessage(client -> sim) M {{ {body} }}\n");
         let schema = schema_of(&src);
         assert_eq!(
             fields(item(&schema, "M")),
@@ -655,7 +731,7 @@ mod tests {
     fn containers_and_options_nest() {
         let src = concat!(
             "namespace a\n",
-            "message[bi] M {\n",
+            "message(client <-> sim) M {\n",
             "    v: vec<i32>,\n",
             "    s: set<i32>,\n",
             "    m: map<i32, i32>,\n",
@@ -682,18 +758,50 @@ mod tests {
     }
 
     #[test]
-    fn messages_carry_a_direction_and_nested_declarations() {
+    fn messages_carry_endpoints_and_nested_declarations() {
         let schema = schema_of(EXAMPLE1);
 
-        let direction = |name: &str| {
+        let endpoints = |name: &str| {
             let Item::Message(message) = item(&schema, name) else {
                 panic!("expected a message");
             };
-            message.direction.0
+            let side = |side: &[Endpoint<'_>]| -> Vec<String> {
+                side.iter().map(|endpoint| endpoint.to_string()).collect()
+            };
+            (
+                side(&message.endpoints.from),
+                message.endpoints.both,
+                side(&message.endpoints.to),
+            )
         };
-        assert_eq!(direction("Ping"), Direction::Bi);
-        assert_eq!(direction("MyRequest"), Direction::In);
-        assert_eq!(direction("MyResponse"), Direction::Out);
+        assert_eq!(
+            endpoints("Ping"),
+            (
+                vec!["client".into()],
+                true,
+                vec!["entry".into(), "edge".into()]
+            )
+        );
+        assert_eq!(
+            endpoints("MyRequest"),
+            (vec!["client".into()], false, vec!["sim".into()])
+        );
+        assert_eq!(
+            endpoints("Deposit"),
+            (
+                vec!["client".into(), "sim".into()],
+                false,
+                vec!["hub<GuildBank>".into()]
+            )
+        );
+        assert_eq!(
+            endpoints("GuildNotice"),
+            (
+                vec!["hub<Guild>".into(), "hub<GuildBank>".into()],
+                false,
+                vec!["client".into()]
+            )
+        );
         assert_eq!(
             fields(item(&schema, "MyRequest")),
             [
@@ -704,10 +812,10 @@ mod tests {
         );
         assert_eq!(fields(item(&schema, "MyResponse")), ["result: Result"]);
 
-        let Item::Message(response) = item(&schema, "MyResponse") else {
+        let Item::Message(my_response) = item(&schema, "MyResponse") else {
             panic!("expected a message");
         };
-        let [Item::Enum(result)] = &response.body.items[..] else {
+        let [Item::Enum(result)] = &my_response.body.items[..] else {
             panic!("expected a nested enum");
         };
         assert_eq!(result.name.0, "Result");
@@ -718,7 +826,7 @@ mod tests {
     fn constraints_bind_to_the_type_they_follow() {
         let src = concat!(
             "namespace a\n",
-            "message[in] M {\n",
+            "message(client -> sim) M {\n",
             "    foo: i32[min=-100, max=100],\n",
             "    f: f32[infinite, min=0.5,],\n",
             "    v: vec<string[max_length=14]>[min_length=1],\n",
@@ -765,14 +873,77 @@ mod tests {
     }
 
     #[test]
-    fn a_direction_is_required() {
+    fn endpoints_are_required() {
         assert_eq!(
             errors_of("namespace a\nmessage M {}\n")[0].message,
-            "found 'M' expected '['"
+            "found 'M' expected '('"
         );
         assert_eq!(
-            errors_of("namespace a\nmessage[up] M {}\n")[0].message,
-            "`up` is not a direction; expected `in`, `out`, or `bi`"
+            errors_of("namespace a\nmessage() M {}\n")[0].message,
+            "found ')' expected role"
+        );
+        assert_eq!(
+            errors_of("namespace a\nmessage(client) M {}\n")[0].message,
+            "found ')' expected '<', '|', '->', or '<->'"
+        );
+        assert_eq!(
+            errors_of("namespace a\nmessage(client ->) M {}\n")[0].message,
+            "found ')' expected role"
+        );
+        assert_eq!(
+            errors_of("namespace a\nmessage(client | -> sim) M {}\n")[0].message,
+            "found '->' expected role"
+        );
+    }
+
+    #[test]
+    fn endpoints_are_roles() {
+        assert_eq!(
+            errors_of("namespace a\nmessage(client -> server) M {}\n")[0].message,
+            "`server` is not a role; expected `client`, `entry`, `edge`, `sim`, or `hub`"
+        );
+        assert_eq!(
+            errors_of("namespace a\nmessage(atlas -> sim) M {}\n")[0].message,
+            "`atlas` cannot be an endpoint; atlas speaks only uju's own messages"
+        );
+        let src = "namespace a\nmessage(client -> sim<P>) M {}\n";
+        let error = &errors_of(src)[0];
+        assert_eq!(
+            error.message,
+            "only `hub` takes a kind, as `hub<Party>`; write `sim`"
+        );
+        assert_eq!(&src[error.span.clone()], "sim<P>");
+    }
+
+    #[test]
+    fn endpoints_list_roles_and_hub_kinds() {
+        let src = "namespace a\nmessage(client|hub<x.P> <-> hub | sim) M {}\n";
+        let schema = schema_of(src);
+        let Item::Message(message) = item(&schema, "M") else {
+            panic!("expected a message");
+        };
+        let endpoints = &message.endpoints;
+        assert_eq!(
+            &src[endpoints.span.clone()],
+            "(client|hub<x.P> <-> hub | sim)"
+        );
+        assert!(endpoints.both);
+        let roles = |side: &[Endpoint<'_>]| -> Vec<Role> {
+            side.iter().map(|endpoint| endpoint.role).collect()
+        };
+        assert_eq!(roles(&endpoints.from), [Role::Client, Role::Hub]);
+        assert_eq!(roles(&endpoints.to), [Role::Hub, Role::Sim]);
+        assert_eq!(&src[endpoints.from[1].span.clone()], "hub<x.P>");
+        assert_eq!(
+            endpoints.from[1].kind.as_ref().map(|kind| kind.to_string()),
+            Some("x.P".into())
+        );
+        assert_eq!(endpoints.to[0].kind, None);
+        // Role names are not keywords.
+        let schema = schema_of("namespace a\nstruct client { sim: u8, hub: u8, edge: u8 }\n");
+        assert_eq!(
+            fields(item(&schema, "client")),
+            ["sim: u8", "hub: u8", "edge: u8"]
         );
     }
 
@@ -795,7 +966,7 @@ mod tests {
             "const On: bool = true\n",
             "const Off: bool = false\n",
             "const Greeting: string = \"hi\\n\"\n",
-            "message[in] M {\n",
+            "message(client -> sim) M {\n",
             "    const Inner: u16 = 7\n",
             "    x: u8,\n",
             "    const Last: i8 = -1\n",
@@ -879,7 +1050,7 @@ mod tests {
             "    Clear,\n",
             "}\n",
             "union One { Only }\n",
-            "message[in] M {\n",
+            "message(client -> sim) M {\n",
             "    type Inner = PartyId\n",
             "    union Nested { A(Inner), }\n",
             "    x: Inner,\n",
@@ -944,7 +1115,7 @@ mod tests {
         let src = concat!(
             "namespace a\n",
             "struct S { type: u8, union: u8 }\n",
-            "message[in] M { type: u8, union: u8, }\n",
+            "message(client -> sim) M { type: u8, union: u8, }\n",
             "union U { A { type: u8, union: u8 } }\n",
             "type type = u8\n",
             "union union { union }\n",
@@ -958,6 +1129,129 @@ mod tests {
             panic!("expected a union");
         };
         assert_eq!(union.variants[0].name.0, "union");
+    }
+
+    #[test]
+    fn hub_kinds_parse() {
+        let src = concat!(
+            "namespace a\n",
+            "type GuildId = u64\n",
+            "@cached\n",
+            "hub(GuildId) Guild {\n",
+            "    const MaxMembers: u8 = 50\n",
+            "    enum Rank { Member, Officer }\n",
+            "    name: string[max_length=24],\n",
+            "    rank: Rank,\n",
+            "}\n",
+            "hub(array<u8, 4>) Plot {}\n",
+            "hub(b.Id) Party { leader: u64 }\n",
+        );
+        let schema = schema_of(src);
+
+        let Item::Hub(guild) = item(&schema, "Guild") else {
+            panic!("expected a hub kind");
+        };
+        assert_eq!(item(&schema, "Guild").keyword(), "hub");
+        assert_eq!(attrs(item(&schema, "Guild")), ["@cached"]);
+        assert_eq!(guild.key.to_string(), "GuildId");
+        assert_eq!(&src[guild.key.span.clone()], "GuildId");
+        assert_eq!(
+            fields(item(&schema, "Guild")),
+            ["name: string[max_length=24]", "rank: Rank"]
+        );
+        assert_eq!(
+            guild
+                .body
+                .items
+                .iter()
+                .map(Item::keyword)
+                .collect::<Vec<_>>(),
+            ["const", "enum"]
+        );
+
+        let Item::Hub(plot) = item(&schema, "Plot") else {
+            panic!("expected a hub kind");
+        };
+        assert_eq!(plot.key.to_string(), "array<u8, 4>");
+        assert_eq!(plot.body, Body::default());
+        let Item::Hub(party) = item(&schema, "Party") else {
+            panic!("expected a hub kind");
+        };
+        assert_eq!(party.key.to_string(), "b.Id");
+        assert_eq!(fields(item(&schema, "Party")), ["leader: u64"]);
+    }
+
+    #[test]
+    fn hub_is_a_keyword_only_where_a_declaration_starts() {
+        let src = concat!(
+            "namespace a\n",
+            "struct S { hub: u8 }\n",
+            "message(client -> sim) M { hub: u8, }\n",
+            "union U { hub { hub: u8 } }\n",
+            "struct hub {}\n",
+            "hub(hub) H { hub: hub }\n",
+        );
+        let schema = schema_of(src);
+        assert_eq!(fields(item(&schema, "S")), ["hub: u8"]);
+        assert_eq!(fields(item(&schema, "M")), ["hub: u8"]);
+        assert_eq!(item(&schema, "hub").keyword(), "struct");
+        let Item::Hub(hub) = item(&schema, "H") else {
+            panic!("expected a hub kind");
+        };
+        assert_eq!(hub.key.to_string(), "hub");
+        assert_eq!(fields(item(&schema, "H")), ["hub: hub"]);
+    }
+
+    #[test]
+    fn a_hub_kind_is_declared_only_at_the_top_level() {
+        let nested = "a hub kind must be declared at the top level of a namespace";
+        for src in [
+            "namespace a\nstruct S { hub(u64) Party {} }\n",
+            "namespace a\nmessage(client -> sim) M { x: u8, hub(u64) Party { y: u8 } }\n",
+            "namespace a\nhub(u64) Guild { hub(u64) Party {} }\n",
+        ] {
+            let (tokens, _) = lex(src);
+            let (schema, errors) = parse(src, &tokens);
+            assert!(schema.is_some(), "parsing goes on");
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(&src[errors[0].span.clone()], "Party");
+            assert_eq!(errors[0].message, nested);
+        }
+    }
+
+    #[test]
+    fn malformed_hub_kinds_are_reported() {
+        let error = |src: &str| {
+            let errors = errors_of(src);
+            (
+                src[errors[0].span.clone()].to_string(),
+                errors[0].message.clone(),
+            )
+        };
+        assert_eq!(
+            error("namespace a\nhub Guild {}\n"),
+            ("Guild".into(), "found 'Guild' expected '('".into())
+        );
+        assert_eq!(
+            error("namespace a\nhub() Guild {}\n"),
+            (")".into(), "found ')' expected type".into())
+        );
+        assert_eq!(
+            error("namespace a\nhub(u64, u32) Guild {}\n"),
+            (",".into(), "found ',' expected '[', or ')'".into())
+        );
+        assert_eq!(
+            error("namespace a\nhub(u64) {}\n"),
+            ("{".into(), "found '{' expected identifier".into())
+        );
+        assert_eq!(
+            error("namespace a\nhub(u64) Guild\n"),
+            ("".into(), "found end of input expected '{'".into())
+        );
+        assert_eq!(
+            error("namespace a\nhub(u64) Guild { x: u8 y: u8 }\n"),
+            ("y".into(), "found 'y' expected '[', ',', or '}'".into())
+        );
     }
 
     #[test]
@@ -1065,7 +1359,7 @@ mod tests {
             "    y: u8,\n",
             "}\n",
             "@large\n",
-            "message[in] M {}\n",
+            "message(client -> sim) M {}\n",
             "@lock(Inventory, Gold)\n",
             "enum E { A }\n",
             "@lock(Inventory, Gold,)\n",

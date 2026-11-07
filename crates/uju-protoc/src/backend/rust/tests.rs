@@ -7,11 +7,11 @@ use crate::compile;
 const EXAMPLE1: &str = include_str!("../../../tests/data/example1.uju");
 const EXAMPLE2: &str = include_str!("../../../tests/data/example2.uju");
 
-fn files(sources: &[&str], direction: Option<Direction>) -> Vec<GeneratedFile> {
+fn files(sources: &[&str], role: Option<Role>) -> Vec<GeneratedFile> {
     let schema = compile(sources)
         .unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"))
         .schema;
-    Rust { direction }
+    Rust { role }
         .generate(&schema)
         .unwrap_or_else(|error| panic!("{error}"))
 }
@@ -22,8 +22,8 @@ fn file<'a>(files: &'a [GeneratedFile], path: &str) -> &'a str {
 }
 
 /// Every file, concatenated.
-fn generated(sources: &[&str], direction: Option<Direction>) -> String {
-    files(sources, direction)
+fn generated(sources: &[&str], role: Option<Role>) -> String {
+    files(sources, role)
         .into_iter()
         .map(|file| file.contents)
         .collect()
@@ -51,7 +51,8 @@ fn each_namespace_gets_a_module_file() {
     let root = file(&files, "mod.rs");
     assert!(root.contains("pub mod foo;\n"));
     assert!(root.contains("pub mod hello;\n"));
-    assert!(root.contains("pub const FINGERPRINT"));
+    assert!(root.contains("pub const CLIENT_FINGERPRINT: u64 = 0x"));
+    assert!(root.contains("pub const INTERNAL_FINGERPRINT: u64 = 0x"));
     assert!(file(&files, "foo/mod.rs").contains("pub mod bar;\n"));
     // Nested types stay inline.
     assert!(file(&files, "foo/bar/mod.rs").contains("pub mod my_response {"));
@@ -61,14 +62,33 @@ fn each_namespace_gets_a_module_file() {
 fn ids_live_in_the_root() {
     let files = files(&[EXAMPLE1, EXAMPLE2], None);
     let root = file(&files, "mod.rs");
+    // `client -> sim`: `foo.bar.Everything`, `foo.bar.MyRequest`, ...
     assert!(root.contains(
-        "impl ::uju::net::wire::Inbound for self::foo::bar::MyRequest {\n    \
-         const INBOUND_ID: u16 = "
+        "impl __w::Link<__w::role::Client, __w::role::Sim> for self::foo::bar::MyRequest {\n    \
+         const ID: u16 = 2;\n}"
+    ));
+    // `sim -> sim` and `client -> hub` number from 1 on their own.
+    assert!(root.contains(
+        "impl __w::Link<__w::role::Sim, __w::role::Sim> for self::foo::bar::Party {\n    \
+         const ID: u16 = 1;\n}"
+    ));
+    assert!(root.contains(
+        "impl __w::Link<__w::role::Client, __w::role::Hub> for self::foo::bar::Deposit {\n    \
+         const ID: u16 = 1;\n}"
+    ));
+    // `<->` links both ways.
+    assert!(
+        root.contains(
+            "impl __w::Link<__w::role::Edge, __w::role::Client> for self::foo::bar::Ping {"
+        )
+    );
+    assert!(root.contains(
+        "impl __w::Link<__w::role::Client, __w::role::Entry> for self::foo::bar::Ping {"
     ));
     assert!(
         files[1..]
             .iter()
-            .all(|file| !file.contents.contains("_ID: u16"))
+            .all(|file| !file.contents.contains("const ID: u16"))
     );
 }
 
@@ -80,30 +100,88 @@ fn raw_namespaces_name_their_files_plainly() {
 }
 
 #[test]
-fn a_server_decodes_what_it_receives_and_encodes_what_it_sends() {
-    let server = generated(&[EXAMPLE1, EXAMPLE2], Some(Direction::In));
+fn a_role_decodes_what_it_receives_and_encodes_what_it_sends() {
+    let sim = generated(&[EXAMPLE1, EXAMPLE2], Some(Role::Sim));
     assert!(
-        server.contains("pub struct MyRequestView<'a>"),
-        "in: viewed"
+        sim.contains("pub struct MyRequestView<'a>"),
+        "received: viewed"
     );
     assert!(
-        !server.contains("impl __w::Encode for MyRequest "),
-        "in: not encoded"
+        !sim.contains("impl __w::Encode for MyRequest "),
+        "received: not encoded"
     );
     assert!(
-        server.contains("impl __w::Encode for MyResponse "),
-        "out: encoded"
+        sim.contains("impl __w::Encode for MyResponse "),
+        "sent: encoded"
     );
-    assert!(!server.contains("MyResponseView"), "out: not viewed");
-    assert!(server.contains("pub struct PingView"), "bi: both");
-    assert!(server.contains("impl __w::Encode for Ping "), "bi: both");
-    assert!(server.contains("pub enum InboundMessage<'a>"));
-    assert!(!server.contains("OutboundMessage"));
+    assert!(!sim.contains("MyResponseView"), "sent: not viewed");
+    assert!(sim.contains("pub struct PartyView"), "`sim <-> sim`: both");
+    assert!(
+        sim.contains("impl __w::Encode for Party "),
+        "`sim <-> sim`: both"
+    );
+    assert!(!sim.contains("struct Ping "), "not on any of its links");
+    assert!(!sim.contains("for self::foo::bar::Ping "));
+    assert!(sim.contains("pub enum ClientToSimMessage<'a>"));
+    assert!(sim.contains("pub enum SimToSimMessage<'a>"));
+    assert!(sim.contains("pub enum HubToSimMessage<'a>"));
+    assert!(
+        !sim.contains("SimToClientMessage"),
+        "dispatches only what it receives"
+    );
+    assert!(sim.contains("impl __w::Link<__w::role::Sim, __w::role::Client> for "));
+    assert!(!sim.contains("impl __w::Link<__w::role::Hub, __w::role::Client> for "));
+    assert!(sim.contains("pub const INTERNAL_FINGERPRINT"));
 
-    let client = generated(&[EXAMPLE1, EXAMPLE2], Some(Direction::Out));
-    assert!(client.contains("pub enum OutboundMessage<'a>"));
+    let client = generated(&[EXAMPLE1, EXAMPLE2], Some(Role::Client));
+    for name in [
+        "EntryToClientMessage",
+        "EdgeToClientMessage",
+        "SimToClientMessage",
+        "HubToClientMessage",
+    ] {
+        assert!(client.contains(&format!("pub enum {name}<'a>")), "{name}");
+    }
     assert!(client.contains("impl __w::Encode for MyRequest "));
-    assert!(!client.contains("InboundMessage"));
+    assert!(client.contains("impl __w::Encode for Deposit "));
+    assert!(!client.contains("ClientToSimMessage"));
+    assert!(!client.contains("SimToSimMessage"));
+    assert!(!client.contains("GuildExp"), "a server message");
+    assert!(client.contains("pub const CLIENT_FINGERPRINT"));
+    assert!(!client.contains("INTERNAL_FINGERPRINT"));
+
+    // An edge gets only its own messages with clients.
+    let edge = generated(&[EXAMPLE1, EXAMPLE2], Some(Role::Edge));
+    assert!(edge.contains("pub enum ClientToEdgeMessage<'a>"));
+    assert!(edge.contains("impl __w::Encode for Ping "));
+    assert!(edge.contains("pub struct PingView"));
+    assert!(!edge.contains("struct MyRequest"), "relayed: no types");
+    assert!(!edge.contains("ClientToSimMessage"));
+}
+
+#[test]
+fn hub_kinds_are_generated_for_hubs_and_sims_only() {
+    for role in [Role::Hub, Role::Sim] {
+        let contents = generated(&[EXAMPLE1, EXAMPLE2], Some(role));
+        assert!(
+            contents.contains("impl __w::Encode for GuildBank "),
+            "{role}"
+        );
+        assert!(contents.contains("pub struct GuildBankView"), "{role}");
+        assert!(contents.contains("impl __w::HubKind for self::foo::bar::GuildBank {"));
+    }
+    for role in [Role::Client, Role::Entry, Role::Edge] {
+        let contents = generated(&[EXAMPLE1, EXAMPLE2], Some(role));
+        assert!(!contents.contains("GuildBank {"), "{role}");
+        assert!(!contents.contains("HubKind"), "{role}");
+    }
+    // A sender names the object by the kind's key.
+    let client = generated(
+        &["namespace a\ntype K = u64\nhub(K) P {}\nmessage(client -> hub<P>) M {}\n"],
+        Some(Role::Client),
+    );
+    assert!(client.contains("pub struct K(pub u64);"));
+    assert!(!client.contains("pub struct P "));
 }
 
 #[test]
@@ -133,7 +211,7 @@ fn colliding_names_are_reported() {
     let schema = compile(&["namespace a\nstruct B {}\nstruct BView {}\n"])
         .unwrap()
         .schema;
-    let error = Rust { direction: None }.generate(&schema).unwrap_err();
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
     assert_eq!(error.message, "`a.B` and `a.BView` both generate `BView`");
 }
 
@@ -157,8 +235,8 @@ fn nested_types_get_a_module_named_after_their_parent() {
 fn qualified_variants_are_pascal_case() {
     let contents = generated(
         &[
-            "namespace my_ns\nmessage[in] M {}\n",
-            "namespace other\nmessage[in] M {}\n",
+            "namespace my_ns\nmessage(client -> sim) M {}\n",
+            "namespace other\nmessage(client -> sim) M {}\n",
         ],
         None,
     );
@@ -169,19 +247,19 @@ fn qualified_variants_are_pascal_case() {
 #[test]
 fn colliding_variants_are_reported() {
     let schema = compile(&[
-        "namespace aB.c\nmessage[in] M {}\n",
-        "namespace a.bC\nmessage[in] M {}\n",
+        "namespace aB.c\nmessage(client -> sim) M {}\n",
+        "namespace a.bC\nmessage(client -> sim) M {}\n",
     ])
     .unwrap()
     .schema;
-    let error = Rust { direction: None }.generate(&schema).unwrap_err();
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
-        "`a.bC.M` and `aB.c.M` both generate `InboundMessage::ABCM`"
+        "`a.bC.M` and `aB.c.M` both generate `ClientToSimMessage::ABCM`"
     );
-    // A peer that never decodes them has no dispatch enum to collide in.
+    // A role that never decodes them has no dispatch enum to collide in.
     let generated = Rust {
-        direction: Some(Direction::Out),
+        role: Some(Role::Client),
     }
     .generate(&schema);
     assert!(generated.is_ok());
@@ -189,11 +267,12 @@ fn colliding_variants_are_reported() {
 
 #[test]
 fn unsupported_types_are_reported() {
-    let schema =
-        compile(&["namespace a\nmessage[in] M { id: uuid, ids: vec<uuid>, u: option<uentity> }\n"])
-            .unwrap()
-            .schema;
-    let error = Rust { direction: None }.generate(&schema).unwrap_err();
+    let schema = compile(&[
+        "namespace a\nmessage(client -> sim) M { id: uuid, ids: vec<uuid>, u: option<uentity> }\n",
+    ])
+    .unwrap()
+    .schema;
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`a.M.id`: the Rust backend does not support `uuid` yet\n\
@@ -210,7 +289,7 @@ fn nested_modules_collide_with_namespaces() {
     ])
     .unwrap()
     .schema;
-    let error = Rust { direction: None }.generate(&schema).unwrap_err();
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`namespace a.foo` and `declarations nested in a.Foo` both generate `foo`"
@@ -223,7 +302,7 @@ fn nested_modules_collide_with_namespaces() {
     ])
     .unwrap()
     .schema;
-    let error = Rust { direction: None }.generate(&schema).unwrap_err();
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`namespace a.foo` and `declarations nested in a.Foo` both generate `foo`"
@@ -243,7 +322,7 @@ fn consts_are_shouty_beside_their_scope() {
             "const Whole: f64 = 2\n",
             "const On: bool = false\n",
             "const Text: string = \"say \\\"hi\\\"\\n\\u{7}é\"\n",
-            "message[in] SetName {\n",
+            "message(client -> sim) SetName {\n",
             "    const MaxLength: u8 = 16\n",
             "    name: string,\n",
             "}\n",
@@ -299,7 +378,7 @@ fn colliding_consts_are_reported() {
     let schema = compile(&["namespace a\nconst MaxHp: u8 = 1\nconst MAXHp: u8 = 2\n"])
         .unwrap()
         .schema;
-    let error = Rust { direction: None }.generate(&schema).unwrap_err();
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`a.MaxHp` and `a.MAXHp` both generate `MAX_HP`"
@@ -311,12 +390,12 @@ fn colliding_consts_are_reported() {
     let schema = compile(&["namespace a\nconst _: u8 = 1\nconst _1: u8 = 2\n"])
         .unwrap()
         .schema;
-    let error = Rust { direction: None }.generate(&schema).unwrap_err();
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
     assert_eq!(error.message, "`a._` has no words to name a Rust constant");
     let schema = compile(&["namespace a\nconst _1: u8 = 2\n"])
         .unwrap()
         .schema;
-    let files = Rust { direction: None }.generate(&schema).unwrap();
+    let files = Rust { role: None }.generate(&schema).unwrap();
     assert!(file(&files, "a/mod.rs").contains("pub const _1: u8 = 2;"));
 }
 
@@ -333,7 +412,7 @@ fn types_are_newtypes_read_by_value() {
     let contents = generated(
         &["namespace a\n\
            type PartyId = u64\n\
-           message[in] M { id: PartyId, ids: vec<PartyId>, owners: map<PartyId, u8>, opt: option<PartyId> }\n"],
+           message(client -> sim) M { id: PartyId, ids: vec<PartyId>, owners: map<PartyId, u8>, opt: option<PartyId> }\n"],
         None,
     );
     for line in [
@@ -359,10 +438,10 @@ fn types_are_newtypes_read_by_value() {
     }
     assert!(!contents.contains("PartyIdView"), "a type is its own view");
 
-    // Only a peer that decodes a type reads it through a cell.
+    // Only a role that decodes a type reads it through a cell.
     let server = generated(
-        &["namespace a\ntype Id = u64\nmessage[out] M { id: Id }\n"],
-        Some(Direction::In),
+        &["namespace a\ntype Id = u64\nmessage(sim -> client) M { id: Id }\n"],
+        Some(Role::Sim),
     );
     assert!(server.contains("pub struct Id(pub u64);"));
     assert!(!server.contains("Newtype"));
@@ -496,7 +575,7 @@ fn unsupported_types_behind_a_type_or_in_a_union_are_reported() {
          union U { A, B(uuid), C { at: uentity } }\nstruct S { owner: Owner }\n"])
     .unwrap()
     .schema;
-    let error = Rust { direction: None }.generate(&schema).unwrap_err();
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`a.Owner`: the Rust backend does not support `uentity` yet\n\
@@ -712,9 +791,9 @@ fn unions_follow_the_peers_roles() {
     let source = "namespace a\n\
         union In { A { x: u8 }, B }\n\
         union Out { A { x: u8 }, B }\n\
-        message[in] Req { u: In }\n\
-        message[out] Resp { u: Out }\n";
-    let server = generated(&[source], Some(Direction::In));
+        message(client -> sim) Req { u: In }\n\
+        message(sim -> client) Resp { u: Out }\n";
+    let server = generated(&[source], Some(Role::Sim));
     assert!(server.contains("pub enum InView<'a> {"));
     assert!(server.contains("pub mod r#in {"));
     assert!(!server.contains("impl __w::Encode for In {"));
@@ -731,7 +810,7 @@ fn variant_modules_collide_with_namespaces() {
     ])
     .unwrap()
     .schema;
-    let error = Rust { direction: None }.generate(&schema).unwrap_err();
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`namespace a.foo` and `the variant views of a.Foo` both generate `foo`"
@@ -748,6 +827,228 @@ fn variant_modules_collide_with_namespaces() {
     let schema = compile(&["namespace a\nunion U { A }\nstruct UView {}\n"])
         .unwrap()
         .schema;
-    let error = Rust { direction: None }.generate(&schema).unwrap_err();
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
     assert_eq!(error.message, "`a.U` and `a.UView` both generate `UView`");
+}
+
+#[test]
+fn hub_kinds_are_structs_with_a_kind_in_the_root() {
+    let files = files(&[EXAMPLE1, EXAMPLE2], None);
+    let namespace = file(&files, "foo/bar/mod.rs");
+    for line in [
+        "pub struct Guild {",
+        "pub name: ::std::string::String,",
+        "pub ranks: ::std::collections::HashMap<PartyId, self::guild::Rank>,",
+        "impl __w::Encode for Guild {",
+        "pub struct GuildView<'a>",
+        "pub mod guild {",
+        "pub struct GuildBank {",
+    ] {
+        assert!(namespace.contains(line), "no `{line}` in\n{namespace}");
+    }
+    let root = file(&files, "mod.rs");
+    assert!(root.contains("\nuse ::uju::net::wire as __w;\n"));
+    assert!(
+        root.contains(
+            "impl __w::HubKind for self::foo::bar::Guild {\n    \
+             type Key = self::foo::bar::GuildId;\n    \
+             const ID: u16 = 1;\n    \
+             const NAME: &'static str = \"foo.bar.Guild\";\n\
+             }\n"
+        ),
+        "{root}"
+    );
+    assert!(root.contains("impl __w::HubKind for self::foo::bar::GuildBank {"));
+    assert!(root.contains("const ID: u16 = 2;"));
+    assert!(
+        files[1..]
+            .iter()
+            .all(|file| !file.contents.contains("HubKind"))
+    );
+
+    // Without hub kinds, the root has no use for the runtime.
+    let root = generated(&["namespace a\nstruct S {}\n"], None);
+    assert!(!root.contains("HubKind"));
+    assert_eq!(root.matches("use ::uju::net::wire as __w;").count(), 1);
+}
+
+#[test]
+fn hub_keys_are_owned_rust_types() {
+    let root = files(
+        &[concat!(
+            "namespace a\n",
+            "struct Pair { a: u32, b: u8 }\n",
+            "hub(entity) E {}\n",
+            "hub(array<u8, 4>) F {}\n",
+            "hub(u64[max=9]) G {}\n",
+            "hub(Pair) H {}\n",
+            "hub(bool) I {}\n",
+        )],
+        None,
+    )
+    .swap_remove(0)
+    .contents;
+    for line in [
+        "type Key = __w::Entity;",
+        "type Key = [u8; 4];",
+        "type Key = u64;",
+        "type Key = self::a::Pair;",
+        "type Key = bool;",
+    ] {
+        assert!(root.contains(line), "no `{line}` in\n{root}");
+    }
+}
+
+#[test]
+fn hub_kinds_claim_their_names() {
+    let schema = compile(&["namespace a\nhub(u8) B {}\nstruct BView {}\n"])
+        .unwrap()
+        .schema;
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    assert_eq!(error.message, "`a.B` and `a.BView` both generate `BView`");
+
+    let schema = compile(&[
+        "namespace a\nhub(u8) Foo { enum E { X } e: E }\n",
+        "namespace a.foo\nstruct Bar {}\n",
+    ])
+    .unwrap()
+    .schema;
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    assert_eq!(
+        error.message,
+        "`namespace a.foo` and `declarations nested in a.Foo` both generate `foo`"
+    );
+}
+
+#[test]
+fn unsupported_hub_keys_are_reported() {
+    let schema = compile(&["namespace a\nhub(uuid) H { u: uuid }\n"])
+        .unwrap()
+        .schema;
+    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    assert_eq!(
+        error.message,
+        "`a.H`: the Rust backend does not support `uuid` yet\n\
+         `a.H.u`: the Rust backend does not support `uuid` yet"
+    );
+}
+
+#[test]
+fn messages_to_hubs_carry_the_key_where_sent() {
+    let sources = [
+        concat!(
+            "namespace a\n",
+            "type K = u64\n",
+            "hub(K) P {}\n",
+            "message(client | sim -> hub<P>) M {}\n",
+            "message(hub<P> -> client) N {}\n",
+        ),
+        "namespace b\nuse a\nmessage(sim -> hub<P>) O {}\n",
+    ];
+    let to_hub = "impl __w::ToHub for M {\n    type Key = K;\n}\n";
+    let hub_message = "impl __w::HubMessage for M {\n    type Kind = P;\n}\n";
+    // Clients send it but have no kinds.
+    let client = generated(&sources, Some(Role::Client));
+    assert!(client.contains(to_hub), "{client}");
+    assert!(!client.contains("HubMessage"));
+    // Sims send it and cache kinds.
+    for role in [None, Some(Role::Sim)] {
+        let contents = generated(&sources, role);
+        assert!(contents.contains(to_hub), "{role:?}");
+        assert!(contents.contains(hub_message), "{role:?}");
+        assert!(
+            contents.contains(
+                "impl __w::ToHub for O {\n    type Key = super::a::K;\n}\n\n\
+                 impl __w::HubMessage for O {\n    type Kind = super::a::P;\n}\n"
+            ),
+            "{role:?}"
+        );
+    }
+    // Hubs receive it, and no message from a hub goes to one.
+    let hub = generated(&sources, Some(Role::Hub));
+    assert!(hub.contains("impl __w::Message for M {"));
+    assert!(!hub.contains("__w::ToHub"));
+    assert!(!hub.contains("__w::HubMessage"));
+    assert!(!generated(&sources, Some(Role::Edge)).contains("__w::ToHub"));
+    // Nor does a message to anything else.
+    assert!(!generated(&sources, None).contains("impl __w::ToHub for N "));
+}
+
+#[test]
+fn edges_get_a_relay_table_per_relayed_pair() {
+    let sources = [concat!(
+        "namespace a\n",
+        "type K = u32\n",
+        "hub(K) P {}\n",
+        "hub(u64) Q {}\n",
+        "message(client -> sim | hub<Q>) A { x: u16 }\n",
+        "message(client -> sim) B { s: string }\n",
+        "message(client -> hub<P>) C {}\n",
+        "message(sim | hub -> client) D { s: string }\n",
+        "message(client <-> edge) E {}\n",
+        "message(sim <-> sim) F {}\n",
+    )];
+    for role in [None, Some(Role::Edge)] {
+        let root = files(&sources, role).swap_remove(0).contents;
+        for table in [
+            "/// How an edge relays each `client -> sim` message, at index `id - 1`.\n\
+             pub const CLIENT_TO_SIM_RELAYS: &[__w::Relay] = &[\n    \
+             // a.A\n    \
+             __w::Relay { size: Some(2), hub: None },\n    \
+             // a.B\n    \
+             __w::Relay { size: None, hub: None },\n\
+             ];\n",
+            "pub const CLIENT_TO_HUB_RELAYS: &[__w::Relay] = &[\n    \
+             // a.A\n    \
+             __w::Relay { size: Some(2), hub: Some(__w::HubRoute { kind: 2, key_size: 8 }) },\n    \
+             // a.C\n    \
+             __w::Relay { size: Some(0), hub: Some(__w::HubRoute { kind: 1, key_size: 4 }) },\n\
+             ];\n",
+            "pub const SIM_TO_CLIENT_RELAYS: &[__w::Relay] = &[\n    \
+             // a.D\n    \
+             __w::Relay { size: None, hub: None },\n\
+             ];\n",
+            "pub const HUB_TO_CLIENT_RELAYS: &[__w::Relay] = &[\n    \
+             // a.D\n    \
+             __w::Relay { size: None, hub: None },\n\
+             ];\n",
+        ] {
+            assert!(root.contains(table), "{role:?}: no\n{table}\nin\n{root}");
+        }
+        assert_eq!(root.matches("_RELAYS: ").count(), 4, "{role:?}");
+    }
+    for role in [Role::Client, Role::Entry, Role::Sim, Role::Hub] {
+        assert!(!generated(&sources, Some(role)).contains("Relay"), "{role}");
+    }
+    // Relaying needs the runtime even with nothing of the edge's own.
+    let files = files(
+        &["namespace a\nmessage(client -> sim) M {}\n"],
+        Some(Role::Edge),
+    );
+    let root = file(&files, "mod.rs");
+    assert!(root.contains("\nuse ::uju::net::wire as __w;\n"));
+    assert!(root.contains("pub const CLIENT_TO_SIM_RELAYS"));
+    assert!(
+        !file(&files, "a/mod.rs").contains("M"),
+        "no types for relayed messages"
+    );
+}
+
+#[test]
+fn relay_tables_claim_their_names() {
+    let schema = compile(&[
+        "namespace a\nmessage(client -> sim) M {}\n",
+        "namespace CLIENT_TO_SIM_RELAYS\nstruct S {}\n",
+    ])
+    .unwrap()
+    .schema;
+    let error = Rust {
+        role: Some(Role::Edge),
+    }
+    .generate(&schema)
+    .unwrap_err();
+    assert_eq!(
+        error.message,
+        "`namespace CLIENT_TO_SIM_RELAYS` and `the generated `CLIENT_TO_SIM_RELAYS`` both generate `CLIENT_TO_SIM_RELAYS`"
+    );
 }

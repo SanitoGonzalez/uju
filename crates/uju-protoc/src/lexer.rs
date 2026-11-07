@@ -70,6 +70,15 @@ pub enum Token<'src> {
     #[token("@")]
     At,
 
+    #[token("|")]
+    Pipe,
+
+    #[token("->")]
+    Arrow,
+
+    #[token("<->")]
+    BiArrow,
+
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice())]
     Ident(&'src str),
 
@@ -407,6 +416,9 @@ impl fmt::Display for Token<'_> {
             Token::Dot => f.write_str("."),
             Token::Equal => f.write_str("="),
             Token::At => f.write_str("@"),
+            Token::Pipe => f.write_str("|"),
+            Token::Arrow => f.write_str("->"),
+            Token::BiArrow => f.write_str("<->"),
             Token::Ident(s) => f.write_str(s),
             Token::Int(x) => write!(f, "{x}"),
             Token::Float(x) => write!(f, "{x}"),
@@ -479,7 +491,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            tokens("{ } [ ] ( ) < > : , . = @"),
+            tokens("{ } [ ] ( ) < > : , . = @ | -> <->"),
             [
                 Token::BraceOpen,
                 Token::BraceClose,
@@ -494,6 +506,9 @@ mod tests {
                 Token::Dot,
                 Token::Equal,
                 Token::At,
+                Token::Pipe,
+                Token::Arrow,
+                Token::BiArrow,
             ]
         );
     }
@@ -616,15 +631,29 @@ mod tests {
     }
 
     #[test]
-    fn direction_attributes() {
+    fn message_endpoints() {
         assert_eq!(
-            tokens("message[in] A"),
+            tokens("message(client|hub<a.P>->sim) A (sim<->sim)"),
             [
                 Token::Message,
-                Token::BracketOpen,
-                Token::Ident("in"),
-                Token::BracketClose,
+                Token::ParenOpen,
+                Token::Ident("client"),
+                Token::Pipe,
+                Token::Ident("hub"),
+                Token::Lt,
+                Token::Ident("a"),
+                Token::Dot,
+                Token::Ident("P"),
+                Token::Gt,
+                Token::Arrow,
+                Token::Ident("sim"),
+                Token::ParenClose,
                 Token::Ident("A"),
+                Token::ParenOpen,
+                Token::Ident("sim"),
+                Token::BiArrow,
+                Token::Ident("sim"),
+                Token::ParenClose,
             ]
         );
     }
@@ -700,9 +729,8 @@ mod tests {
             ]
         );
 
-        // `?` and `->` are no longer part of the language.
         assert_eq!(
-            errors("i32? -> B"),
+            errors("i32? ~ B"),
             [
                 (LexError::UnexpectedChar, 3..4),
                 (LexError::UnexpectedChar, 5..6),

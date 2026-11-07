@@ -47,6 +47,10 @@ fn item_naming(source: SourceId, item: &ast::Item<'_>, out: &mut Vec<Diagnostic>
             }
         }
         ast::Item::Type(item) => expect(source, "type", &item.name, Style::Pascal, out),
+        ast::Item::Hub(item) => {
+            expect(source, "hub kind", &item.name, Style::Pascal, out);
+            body_naming(source, &item.body, out);
+        }
     }
 }
 
@@ -124,10 +128,11 @@ mod tests {
         let warnings = warnings(&["namespace Game.my_ns\n\
              enum color { light_red }\n\
              struct Foo_Bar { HitPoints: u8 }\n\
-             message[in] spawn { struct inner { _: u8 } const max_len: u8 = 1 }\n\
+             message(client -> sim) spawn { struct inner { _: u8 } const max_len: u8 = 1 }\n\
              const HTTP_PORT: u16 = 80\n\
              type party_id = u64\n\
-             union op { add_item { SlotIndex: u8 }, remove(u8) }\n"]);
+             union op { add_item { SlotIndex: u8 }, remove(u8) }\n\
+             hub(u64) party_hub { enum role { tank } LeaderId: u64 }\n"]);
         assert_eq!(
             warnings,
             [
@@ -146,6 +151,10 @@ mod tests {
                 "variant `add_item` should be PascalCase, like `AddItem`",
                 "field `SlotIndex` should be snake_case, like `slot_index`",
                 "variant `remove` should be PascalCase, like `Remove`",
+                "hub kind `party_hub` should be PascalCase, like `PartyHub`",
+                "field `LeaderId` should be snake_case, like `leader_id`",
+                "enum `role` should be PascalCase, like `Role`",
+                "variant `tank` should be PascalCase, like `Tank`",
             ]
         );
     }

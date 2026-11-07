@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::diagnostic::{Diagnostic, SourceId};
 use crate::ir::wire::{self, Wire};
@@ -30,7 +30,7 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
         .map(|site| lowerer.lower_const(site))
         .collect();
 
-    let schema = Schema {
+    let mut schema = Schema {
         namespaces: (0..resolver.namespace_len())
             .map(|index| Namespace {
                 name: resolver
@@ -43,6 +43,21 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
         defs,
         consts,
     };
+
+    let qualified: Vec<String> = (0..schema.defs.len())
+        .map(|index| schema.qualified(TypeId(index)))
+        .collect();
+    for def in &mut schema.defs {
+        if let DefKind::Message(item) = &mut def.kind {
+            for kinds in item
+                .links
+                .iter_mut()
+                .filter_map(|link| link.from_kinds.as_mut())
+            {
+                kinds.sort_by(|left, right| qualified[left.0].cmp(&qualified[right.0]));
+            }
+        }
+    }
 
     // Whether a struct is fixed-size depends on its fields, so these wait
     // until every declaration is lowered.
@@ -61,6 +76,17 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
     }
 
     Ok(schema)
+}
+
+/// One side of a message's endpoints, with its hub endpoints merged into
+/// one [`Role::Hub`].
+struct Side {
+    /// Each role once.
+    roles: Vec<Role>,
+    /// Where bare `hub` is written, if it is.
+    bare_hub: Option<Span>,
+    /// The kinds of `hub<K>`, each once, where they are written.
+    kinds: Vec<(TypeId, Span)>,
 }
 
 struct Lowerer<'a, 'src> {
@@ -102,6 +128,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             ast::Item::Message(item) => DefKind::Message(self.lower_message(site.source, id, item)),
             ast::Item::Union(item) => DefKind::Union(self.lower_union(site.source, id, item)),
             ast::Item::Type(item) => DefKind::Type(self.lower_type_def(site.source, id, item)),
+            ast::Item::Hub(item) => DefKind::Hub(self.lower_hub(site.source, id, item)),
             ast::Item::Const(_) => unreachable!("consts are not type sites"),
         };
         Def {
@@ -401,6 +428,25 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         }
     }
 
+    /// A hub kind's key is resolved where the kind is declared, at the top
+    /// of its namespace, and must be fit to look objects up by.
+    fn lower_hub(&mut self, source: SourceId, id: TypeId, item: &ast::Hub<'src>) -> Hub {
+        let written = match &item.key.kind {
+            ast::TypeKind::Option(inner) => {
+                self.error(source, &item.key.span, "a hub key cannot be optional");
+                &**inner
+            }
+            _ => &item.key,
+        };
+        let scope = self.resolver.types[id.0].parent;
+        let key = self.lower_type(source, scope, written);
+        self.check_key(source, scope, written, &key, "a hub key");
+        Hub {
+            key,
+            fields: self.lower_fields(source, id, &item.body.fields),
+        }
+    }
+
     fn lower_union(&mut self, source: SourceId, id: TypeId, item: &ast::Union<'src>) -> Union {
         let name = item.name.0;
         if item.variants.is_empty() {
@@ -509,14 +555,176 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         id: TypeId,
         item: &ast::Message<'src>,
     ) -> Message {
-        let direction = match item.direction.0 {
-            ast::Direction::In => Direction::In,
-            ast::Direction::Out => Direction::Out,
-            ast::Direction::Bi => Direction::Bi,
-        };
         Message {
-            direction,
+            links: self.lower_links(source, id, &item.endpoints),
             fields: self.lower_fields(source, id, &item.body.fields),
+        }
+    }
+
+    /// Every role pair of the product of `endpoints`' sides, and of the
+    /// reverse product too with `<->`, each once. Sending kinds are sorted
+    /// once the schema is built, since that needs qualified names.
+    fn lower_links(
+        &mut self,
+        source: SourceId,
+        id: TypeId,
+        endpoints: &ast::Endpoints<'src>,
+    ) -> Vec<Link> {
+        // Endpoints are written outside the message's body.
+        let scope = self.resolver.types[id.0].parent;
+        let from = self.lower_side(source, scope, &endpoints.from);
+        let to = self.lower_side(source, scope, &endpoints.to);
+
+        let mut receivers = vec![&to];
+        if endpoints.both {
+            receivers.push(&from);
+        }
+        let mut kind = None;
+        for side in receivers {
+            if let Some(span) = &side.bare_hub {
+                self.error(
+                    source,
+                    span,
+                    "nothing could route a message to any hub; name the kind, as `hub<Party>`",
+                );
+            }
+            for (other, span) in &side.kinds {
+                match kind {
+                    None => kind = Some(*other),
+                    Some(kind) if kind == *other => {}
+                    Some(_) => {
+                        self.error(source, span, "a message to a hub names exactly one kind")
+                    }
+                }
+            }
+        }
+
+        // Both rules are symmetric, so the reverse product breaks none
+        // the product does not.
+        let arrow = if endpoints.both { "<->" } else { "->" };
+        let mut reported = HashSet::new();
+        for a in &from.roles {
+            for b in &to.roles {
+                let message = match (*a, *b) {
+                    (Role::Client, Role::Client) => "clients reach each other only through servers",
+                    (Role::Edge, other) | (other, Role::Edge) if other != Role::Client => {
+                        "edges run no gameplay, so `edge` pairs only with `client`"
+                    }
+                    _ => continue,
+                };
+                if reported.insert((*a, *b)) {
+                    self.error(
+                        source,
+                        &endpoints.span,
+                        format!("`{a} {arrow} {b}` is not a link; {message}"),
+                    );
+                }
+            }
+        }
+
+        let mut links = BTreeMap::new();
+        let mut pairs = vec![(&from, &to)];
+        if endpoints.both {
+            pairs.push((&to, &from));
+        }
+        for (senders, receivers) in pairs {
+            for a in &senders.roles {
+                for b in &receivers.roles {
+                    links.entry((*a, *b)).or_insert_with(|| Link {
+                        from: *a,
+                        to: *b,
+                        from_kinds: (*a == Role::Hub && !senders.kinds.is_empty())
+                            .then(|| senders.kinds.iter().map(|(kind, _)| *kind).collect()),
+                        to_kind: (*b == Role::Hub)
+                            .then(|| receivers.kinds.first().map(|(kind, _)| *kind))
+                            .flatten(),
+                    });
+                }
+            }
+        }
+        links.into_values().collect()
+    }
+
+    /// One side of a message's endpoints, reporting a role listed twice and
+    /// `hub` beside `hub<K>`.
+    fn lower_side(
+        &mut self,
+        source: SourceId,
+        scope: Option<TypeId>,
+        endpoints: &[ast::Endpoint<'src>],
+    ) -> Side {
+        let mut side = Side {
+            roles: Vec::new(),
+            bare_hub: None,
+            kinds: Vec::new(),
+        };
+        for endpoint in endpoints {
+            let span = &endpoint.span;
+            let repeated = match &endpoint.kind {
+                None if endpoint.role == Role::Hub => {
+                    let repeated = side.bare_hub.is_some();
+                    if !repeated
+                        && !side.kinds.is_empty()
+                        && let Some(kind) = endpoints.iter().find(|other| other.kind.is_some())
+                    {
+                        self.error(
+                            source,
+                            span,
+                            format!("`hub` beside `{kind}`; bare `hub` already means any kind"),
+                        );
+                    }
+                    side.bare_hub = Some(span.clone());
+                    repeated
+                }
+                None => side.roles.contains(&endpoint.role),
+                Some(path) => {
+                    let Some(kind) = self.hub_kind(source, scope, path) else {
+                        continue;
+                    };
+                    let repeated = side.kinds.iter().any(|(other, _)| *other == kind);
+                    if !repeated && side.bare_hub.is_some() {
+                        self.error(
+                            source,
+                            span,
+                            format!("`{endpoint}` beside `hub`; bare `hub` already means any kind"),
+                        );
+                    }
+                    if !repeated {
+                        side.kinds.push((kind, span.clone()));
+                    }
+                    repeated
+                }
+            };
+            if repeated {
+                self.error(
+                    source,
+                    span,
+                    format!("`{endpoint}` is listed twice on one side"),
+                );
+            } else if !side.roles.contains(&endpoint.role) {
+                side.roles.push(endpoint.role);
+            }
+        }
+        side
+    }
+
+    /// The hub kind `path` names, reporting anything else.
+    fn hub_kind(
+        &mut self,
+        source: SourceId,
+        scope: Option<TypeId>,
+        path: &ast::Path<'src>,
+    ) -> Option<TypeId> {
+        match self.resolver.resolve(source, scope, path) {
+            Ok(id) if matches!(self.resolver.types[id.0].item, ast::Item::Hub(_)) => Some(id),
+            Ok(_) => {
+                self.error(source, &path.span, format!("`{path}` is not a hub kind"));
+                None
+            }
+            Err(diagnostic) => {
+                self.diagnostics.push(diagnostic);
+                None
+            }
         }
     }
 
@@ -558,8 +766,8 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                 return self.lower_type(source, scope, item);
             }
             ast::TypeKind::Named(path) => match self.resolver.resolve(source, scope, path) {
-                Ok(id) => {
-                    if matches!(self.resolver.types[id.0].item, ast::Item::Message(_)) {
+                Ok(id) => match self.resolver.types[id.0].item {
+                    ast::Item::Message(_) => {
                         self.error(
                             source,
                             &ty.span,
@@ -568,10 +776,17 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                             ),
                         );
                         TypeKind::Bool
-                    } else {
-                        TypeKind::Named(id)
                     }
-                }
+                    ast::Item::Hub(_) => {
+                        self.error(
+                            source,
+                            &ty.span,
+                            "a hub kind is not a type; declare a struct for what you send",
+                        );
+                        TypeKind::Bool
+                    }
+                    _ => TypeKind::Named(id),
+                },
                 Err(diagnostic) => {
                     self.diagnostics.push(diagnostic);
                     TypeKind::Bool
@@ -693,8 +908,8 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                 if visiting.contains(&id) {
                     return None;
                 }
-                let item = match site.item {
-                    ast::Item::Struct(item) => item,
+                let body = match site.item {
+                    ast::Item::Struct(ast::Struct { body, .. }) => body,
                     ast::Item::Type(item) => {
                         visiting.push(id);
                         let path = self.holds_float(site.source, Some(id), &item.target, visiting);
@@ -704,7 +919,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                     _ => return None,
                 };
                 visiting.push(id);
-                item.body.fields.iter().find_map(|field| {
+                body.fields.iter().find_map(|field| {
                     let mut path = self.holds_float(site.source, Some(id), &field.ty, visiting)?;
                     path.insert(0, field.name.0);
                     Some(path)
@@ -921,7 +1136,9 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         let mut targets = Vec::new();
         match &defs[index].kind {
             DefKind::Enum(_) => {}
-            DefKind::Struct(Struct { fields }) | DefKind::Message(Message { fields, .. }) => {
+            DefKind::Struct(Struct { fields })
+            | DefKind::Message(Message { fields, .. })
+            | DefKind::Hub(Hub { fields, .. }) => {
                 for field in fields {
                     refs(&field.ty, &mut targets);
                 }
@@ -1110,26 +1327,170 @@ mod tests {
     }
 
     #[test]
-    fn messages_carry_their_direction() {
-        let schema = compiled(&[EXAMPLE1]);
-        let message = |name: &str| {
+    fn messages_carry_their_links() {
+        let schema = compiled(&[EXAMPLE1, EXAMPLE2]);
+        let links = |name: &str| -> Vec<String> {
             let (_, def) = def(&schema, name);
             let DefKind::Message(message) = &def.kind else {
                 panic!("expected a message");
             };
-            message.clone()
+            message
+                .links
+                .iter()
+                .map(|link| {
+                    let kinds = |kinds: Vec<TypeId>| -> String {
+                        let names: Vec<String> =
+                            kinds.iter().map(|id| schema.qualified(*id)).collect();
+                        format!("<{}>", names.join(" | "))
+                    };
+                    format!(
+                        "{}{} -> {}{}",
+                        link.from,
+                        link.from_kinds.clone().map(kinds).unwrap_or_default(),
+                        link.to,
+                        link.to_kind.map(|id| kinds(vec![id])).unwrap_or_default(),
+                    )
+                })
+                .collect()
         };
-        assert_eq!(message("Ping").direction, Direction::Bi);
-        assert_eq!(message("MyRequest").direction, Direction::In);
+        assert_eq!(
+            links("Ping"),
+            [
+                "client -> entry",
+                "client -> edge",
+                "entry -> client",
+                "edge -> client"
+            ]
+        );
+        assert_eq!(links("Party"), ["sim -> sim"], "deduplicated");
+        assert_eq!(links("MyResponse"), ["sim -> client"]);
+        assert_eq!(links("Status"), ["sim -> client", "hub -> client"]);
+        assert_eq!(
+            links("Deposit"),
+            [
+                "client -> hub<foo.bar.GuildBank>",
+                "sim -> hub<foo.bar.GuildBank>"
+            ]
+        );
+        assert_eq!(
+            links("GuildNotice"),
+            ["hub<foo.bar.Guild | foo.bar.GuildBank> -> client"]
+        );
+        // Resolved through `use foo.bar`.
+        assert_eq!(links("GuildExp"), ["sim -> hub<foo.bar.Guild>"]);
 
         let (response_id, _) = def(&schema, "MyResponse");
         let (result_id, result) = def(&schema, "Result");
         assert_eq!(result.parent, Some(response_id));
         assert_eq!(schema.path(result_id), ["MyResponse", "Result"]);
+    }
 
-        let response = message("MyResponse");
-        assert_eq!(response.direction, Direction::Out);
-        assert_eq!(response.fields[0].ty.kind, TypeKind::Named(result_id));
+    #[test]
+    fn sending_kinds_sort_by_qualified_name() {
+        let schema = compiled(&[
+            "namespace b\nhub(u8) A {}\n",
+            "namespace a\nuse b\nhub(u8) Z {}\nmessage(hub<Z> | hub<b.A> -> sim) M {}\n",
+        ]);
+        let (_, def) = def(&schema, "M");
+        let DefKind::Message(message) = &def.kind else {
+            panic!("expected a message");
+        };
+        let kinds: Vec<String> = message.links[0]
+            .from_kinds
+            .iter()
+            .flatten()
+            .map(|id| schema.qualified(*id))
+            .collect();
+        assert_eq!(kinds, ["a.Z", "b.A"]);
+    }
+
+    #[test]
+    fn endpoints_are_validated() {
+        let prelude = "namespace a\nhub(u8) P {}\nhub(u8) Q {}\nstruct S {}\n";
+        for (endpoints, expected) in [
+            ("sim | sim -> client", "`sim` is listed twice on one side"),
+            (
+                "sim -> hub<P> | hub<P>",
+                "`hub<P>` is listed twice on one side",
+            ),
+            ("hub | hub -> client", "`hub` is listed twice on one side"),
+            (
+                "hub<P> | hub -> client",
+                "`hub` beside `hub<P>`; bare `hub` already means any kind",
+            ),
+            (
+                "hub | hub<P> -> client",
+                "`hub<P>` beside `hub`; bare `hub` already means any kind",
+            ),
+            (
+                "client -> client",
+                "`client -> client` is not a link; clients reach each other only through servers",
+            ),
+            (
+                "client <-> sim | client",
+                "`client <-> client` is not a link; clients reach each other only through servers",
+            ),
+            (
+                "edge -> sim",
+                "`edge -> sim` is not a link; edges run no gameplay, so `edge` pairs only with `client`",
+            ),
+            (
+                "sim -> edge",
+                "`sim -> edge` is not a link; edges run no gameplay, so `edge` pairs only with `client`",
+            ),
+            (
+                "entry <-> edge",
+                "`entry <-> edge` is not a link; edges run no gameplay, so `edge` pairs only with `client`",
+            ),
+            (
+                "edge -> edge",
+                "`edge -> edge` is not a link; edges run no gameplay, so `edge` pairs only with `client`",
+            ),
+            (
+                "edge -> hub<P>",
+                "`edge -> hub` is not a link; edges run no gameplay, so `edge` pairs only with `client`",
+            ),
+            (
+                "sim -> hub",
+                "nothing could route a message to any hub; name the kind, as `hub<Party>`",
+            ),
+            (
+                "hub <-> sim",
+                "nothing could route a message to any hub; name the kind, as `hub<Party>`",
+            ),
+            (
+                "sim -> hub<P> | hub<Q>",
+                "a message to a hub names exactly one kind",
+            ),
+            (
+                "hub<P> <-> hub<Q>",
+                "a message to a hub names exactly one kind",
+            ),
+            (
+                "hub<P> | hub<Q> <-> client",
+                "a message to a hub names exactly one kind",
+            ),
+            ("sim -> hub<S>", "`S` is not a hub kind"),
+            ("sim -> hub<R>", "cannot find `R` in this scope"),
+        ] {
+            let src = format!("{prelude}message({endpoints}) M {{}}\n");
+            assert_eq!(messages(&[&src]), [expected], "{endpoints}");
+        }
+        // Each pair is reported once, whichever way it goes.
+        assert_eq!(
+            messages(&["namespace a\nmessage(edge | sim <-> sim | edge) M {}\n"]),
+            [
+                "`edge <-> sim` is not a link; edges run no gameplay, so `edge` pairs only with `client`",
+                "`edge <-> edge` is not a link; edges run no gameplay, so `edge` pairs only with `client`",
+                "`sim <-> edge` is not a link; edges run no gameplay, so `edge` pairs only with `client`",
+            ]
+        );
+        // The same kind on both sides is one kind.
+        compiled(&[&format!(
+            "{prelude}message(hub<P> | sim <-> hub<P>) M {{}}\n"
+        )]);
+        // Kinds resolve from the message's scope, as types do.
+        compiled(&["namespace a\nhub(u8) P {}\nstruct O { message(sim -> hub<P>) M {} }\n"]);
     }
 
     #[test]
@@ -1137,7 +1498,7 @@ mod tests {
         let schema = compiled(&[concat!(
             "namespace a\n",
             "struct Position { x: f32 }\n",
-            "message[in] NonScalars {\n",
+            "message(client -> sim) NonScalars {\n",
             "    v: vec<i32>,\n",
             "    ar: array<i32, 4>,\n",
             "    m2: map<u8, vec<Position>>,\n",
@@ -1191,7 +1552,7 @@ mod tests {
 
     #[test]
     fn nested_declarations_shadow_outer_ones() {
-        let src = "namespace a\nenum R { X }\nmessage[in] M {\n    enum R { Y }\n    r: R,\n}\n";
+        let src = "namespace a\nenum R { X }\nmessage(client -> sim) M {\n    enum R { Y }\n    r: R,\n}\n";
         let schema = compiled(&[src]);
         let (_, message) = def(&schema, "M");
         let DefKind::Message(message) = &message.kind else {
@@ -1203,7 +1564,9 @@ mod tests {
         assert!(schema.def(id).parent.is_some(), "the nested enum wins");
 
         // The nested declaration is reachable from outside by its path.
-        compiled(&["namespace a\nmessage[in] M { enum R { Y } r: R, }\nstruct S { r: M.R }\n"]);
+        compiled(&[
+            "namespace a\nmessage(client -> sim) M { enum R { Y } r: R, }\nstruct S { r: M.R }\n",
+        ]);
     }
 
     #[test]
@@ -1275,9 +1638,10 @@ mod tests {
             "    enum E { A }\n",
             "    x: u8,\n",
             "}\n",
-            "@large message[in] M {}\n",
+            "@large message(client -> sim) M {}\n",
             "@lock(Inventory, Gold) union U { A }\n",
             "@halo(false) type T = u8\n",
+            "@cached hub(u64) H {}\n",
             "@timeout_ms(1000) const C: u8 = 1\n",
         );
         let errors = compile(&[src]).expect_err("expected errors");
@@ -1292,6 +1656,7 @@ mod tests {
                 ("large", "unknown attribute `large`"),
                 ("lock", "unknown attribute `lock`"),
                 ("halo", "unknown attribute `halo`"),
+                ("cached", "unknown attribute `cached`"),
                 ("timeout_ms", "unknown attribute `timeout_ms`"),
             ]
         );
@@ -1362,7 +1727,7 @@ mod tests {
             "const Whole: f64 = 2\n",
             "const On: bool = true\n",
             "const Greeting: string = \"héllo\"\n",
-            "message[in] M {\n",
+            "message(client -> sim) M {\n",
             "    struct Inner { const Deep: u8 = 1 }\n",
             "    const MaxLength: u16 = 16\n",
             "}\n",
@@ -1620,7 +1985,7 @@ mod tests {
             ["the name `A` is declared more than once in this scope"]
         );
         assert_eq!(
-            messages(&["namespace a\nmessage[in] M { const A: u8 = 1 enum A { X } }\n"]),
+            messages(&["namespace a\nmessage(client -> sim) M { const A: u8 = 1 enum A { X } }\n"]),
             ["the name `A` is declared more than once in this scope"]
         );
         // The same name in different scopes is fine.
@@ -1640,7 +2005,9 @@ mod tests {
         );
         // The innermost name wins, even when it is a const.
         assert_eq!(
-            messages(&["namespace a\nstruct R {}\nmessage[in] M { const R: u8 = 1 r: R }\n"]),
+            messages(&[
+                "namespace a\nstruct R {}\nmessage(client -> sim) M { const R: u8 = 1 r: R }\n"
+            ]),
             ["`R` is a const, not a type"]
         );
     }
@@ -1648,11 +2015,14 @@ mod tests {
     #[test]
     fn messages_are_standalone() {
         assert_eq!(
-            messages(&["namespace a\nmessage[in] M {}\nstruct S { m: M }\n"]),
+            messages(&["namespace a\nmessage(client -> sim) M {}\nstruct S { m: M }\n"]),
             ["`M` is a message; messages are standalone and cannot be used as a type"]
         );
         assert_eq!(
-            messages(&["namespace a\nmessage[in] M {}\nmessage[out] N { v: vec<M> }\n"]).len(),
+            messages(&[
+                "namespace a\nmessage(client -> sim) M {}\nmessage(sim -> client) N { v: vec<M> }\n"
+            ])
+            .len(),
             1
         );
     }
@@ -1686,42 +2056,42 @@ mod tests {
             ),
         ];
         for (field, expected) in cases {
-            let src = format!("{prelude}message[in] M {{ {field} }}\n");
+            let src = format!("{prelude}message(client -> sim) M {{ {field} }}\n");
             assert_eq!(messages(&[&src]), [expected], "{field}");
         }
 
         // A fixed length makes strings fixed-size, and `option<bool>` stays
         // in the bitmap.
         compiled(&[&format!(
-            "{prelude}message[in] M {{ a: array<Flags, 2>, s: set<Code>, m: map<bytes[min_length=4, max_length=4], u8> }}\n"
+            "{prelude}message(client -> sim) M {{ a: array<Flags, 2>, s: set<Code>, m: map<bytes[min_length=4, max_length=4], u8> }}\n"
         )]);
     }
 
     #[test]
     fn lengths_fit_a_message() {
         assert_eq!(
-            messages(&["namespace a\nmessage[in] M { s: string[max_length=65536] }\n"]),
+            messages(&["namespace a\nmessage(client -> sim) M { s: string[max_length=65536] }\n"]),
             ["`max_length` must be at most 65535, the size of a message"]
         );
-        compiled(&["namespace a\nmessage[in] M { s: vec<u8>[max_length=65535] }\n"]);
+        compiled(&["namespace a\nmessage(client -> sim) M { s: vec<u8>[max_length=65535] }\n"]);
     }
 
     #[test]
     fn containers_need_fixed_size_items() {
         assert_eq!(
-            messages(&["namespace a\nmessage[in] M { a: array<vec<i32>, 2> }\n"]),
+            messages(&["namespace a\nmessage(client -> sim) M { a: array<vec<i32>, 2> }\n"]),
             ["`vec<i32>` is variable-size; an array item must be fixed-size"]
         );
         assert_eq!(
-            messages(&["namespace a\nmessage[in] M { s: set<string> }\n"]),
+            messages(&["namespace a\nmessage(client -> sim) M { s: set<string> }\n"]),
             ["`string` is variable-size; a set item must be fixed-size"]
         );
         assert_eq!(
-            messages(&["namespace a\nmessage[in] M { m: map<string, i32> }\n"]),
+            messages(&["namespace a\nmessage(client -> sim) M { m: map<string, i32> }\n"]),
             ["`string` is variable-size; a map key must be fixed-size"]
         );
         // Map values may be variable-size.
-        compiled(&["namespace a\nmessage[in] M { m: map<i32, vec<i32>> }\n"]);
+        compiled(&["namespace a\nmessage(client -> sim) M { m: map<i32, vec<i32>> }\n"]);
     }
 
     #[test]
@@ -1729,7 +2099,7 @@ mod tests {
         for ty in ["vec<i32>", "set<i32>", "map<i32, i32>", "array<i32, 2>"] {
             assert_eq!(
                 messages(&[&format!(
-                    "namespace a\nmessage[in] M {{ o: option<{ty}> }}\n"
+                    "namespace a\nmessage(client -> sim) M {{ o: option<{ty}> }}\n"
                 )]),
                 [format!(
                     "`{ty}` is a collection; collections cannot be optional"
@@ -1741,7 +2111,7 @@ mod tests {
             "namespace a\n",
             "struct P { x: f32 }\n",
             "enum E { A }\n",
-            "message[in] M { s: option<string>, b: option<bytes>, p: option<P>, e: option<E> }\n",
+            "message(client -> sim) M { s: option<string>, b: option<bytes>, p: option<P>, e: option<E> }\n",
         )]);
     }
 
@@ -1775,7 +2145,7 @@ mod tests {
             ),
         ];
         for (field, expected) in cases {
-            let src = format!("{prelude}message[in] M {{ {field} }}\n");
+            let src = format!("{prelude}message(client -> sim) M {{ {field} }}\n");
             assert_eq!(messages(&[&src]), [expected], "{field}");
         }
 
@@ -1783,7 +2153,7 @@ mod tests {
         compiled(&[concat!(
             "namespace a\n",
             "struct Cell { x: i32, y: i32 }\n",
-            "message[in] M { m: map<Cell, f32[nan]>, s: set<Cell> }\n",
+            "message(client -> sim) M { m: map<Cell, f32[nan]>, s: set<Cell> }\n",
         )]);
     }
 
@@ -1819,7 +2189,7 @@ mod tests {
 
         let schema = compiled(&[concat!(
             "namespace a\n",
-            "message[in] M {\n",
+            "message(client -> sim) M {\n",
             "    f: f32[min=0, max=1.5],\n",
             "    o: option<string[max_length=3]>,\n",
             "    m: map<u8[max=9], vec<i8[min=-1]>[min_length=1]>,\n",
@@ -1906,12 +2276,12 @@ mod tests {
             ),
         ];
         for (ty, expected) in cases {
-            let src = format!("namespace a\nmessage[in] M {{ x: {ty} }}\n");
+            let src = format!("namespace a\nmessage(client -> sim) M {{ x: {ty} }}\n");
             assert_eq!(messages(&[&src]), [expected], "{ty}");
         }
         // User types take no constraints either.
         assert_eq!(
-            messages(&["namespace a\nenum E { A }\nmessage[in] M { e: E[max=1] }\n"]),
+            messages(&["namespace a\nenum E { A }\nmessage(client -> sim) M { e: E[max=1] }\n"]),
             ["`E` takes no constraints"]
         );
     }
@@ -1919,11 +2289,11 @@ mod tests {
     #[test]
     fn options_only_wrap_a_field() {
         assert_eq!(
-            messages(&["namespace a\nmessage[in] M { v: vec<option<i32>> }\n"]),
+            messages(&["namespace a\nmessage(client -> sim) M { v: vec<option<i32>> }\n"]),
             ["`option<i32>` is nested; `option` is only allowed as a field's own type"]
         );
         assert_eq!(
-            messages(&["namespace a\nmessage[in] M { o: option<option<i32>> }\n"]),
+            messages(&["namespace a\nmessage(client -> sim) M { o: option<option<i32>> }\n"]),
             ["`option<i32>` is nested; `option` is only allowed as a field's own type"]
         );
     }
@@ -1975,7 +2345,7 @@ mod tests {
             "type Level = u8[max=100]\n",
             "type Hue = Color\n",
             "type Leader = PartyId\n",
-            "message[in] M { type Local = bool p: PartyId, l: Local }\n",
+            "message(client -> sim) M { type Local = bool p: PartyId, l: Local }\n",
         )]);
         let target = |name: &str| {
             let (_, def) = def(&schema, name);
@@ -2030,7 +2400,7 @@ mod tests {
                 "cannot find `Missing` in this scope",
             ),
             (
-                "message[in] M {}\nunion U { A(M) }",
+                "message(client -> sim) M {}\nunion U { A(M) }",
                 "`M` is a message; messages are standalone and cannot be used as a type",
             ),
         ];
@@ -2115,7 +2485,7 @@ mod tests {
             ("u: U[max_length=3]", "`U` takes no constraints"),
         ];
         for (field, expected) in cases {
-            let src = format!("{prelude}message[in] M {{ {field} }}\n");
+            let src = format!("{prelude}message(client -> sim) M {{ {field} }}\n");
             assert_eq!(messages(&[&src]), [expected], "{field}");
         }
         assert_eq!(
@@ -2164,14 +2534,14 @@ mod tests {
             ),
         ];
         for (field, expected) in cases {
-            let src = format!("{prelude}message[in] M {{ {field} }}\n");
+            let src = format!("{prelude}message(client -> sim) M {{ {field} }}\n");
             assert_eq!(messages(&[&src]), [expected], "{field}");
         }
 
         // A union is fine wherever a variable-size value is, and a `type`
         // wherever its target is.
         compiled(&[&format!(
-            "{prelude}message[in] M {{ v: vec<U>, m: map<u8, U>, o: option<U>, \
+            "{prelude}message(client -> sim) M {{ v: vec<U>, m: map<u8, U>, o: option<U>, \
              a: array<PartyId, 2>, s: set<PartyId>, k: map<PartyId, Weight>, \
              w: vec<Weight>, p: option<PartyId> }}\n"
         )]);
@@ -2216,6 +2586,157 @@ mod tests {
     }
 
     #[test]
+    fn hub_kinds_lower_with_their_key_and_fields() {
+        let schema = compiled(&[concat!(
+            "namespace a\n",
+            "type GuildId = u64\n",
+            "hub(GuildId) Guild {\n",
+            "    enum Rank { Member, Officer }\n",
+            "    name: string[max_length=24],\n",
+            "    rank: Rank,\n",
+            "    motto: option<string>,\n",
+            "}\n",
+            "hub(u32[max=9]) Plot { x: u8 }\n",
+        )]);
+        let (guild, def_) = def(&schema, "Guild");
+        let DefKind::Hub(hub) = &def_.kind else {
+            panic!("expected a hub kind");
+        };
+        assert_eq!(def_.parent, None);
+        assert_eq!(schema.type_name(&hub.key), "a.GuildId");
+        assert_eq!(
+            hub.fields
+                .iter()
+                .map(|field| (
+                    field.name.as_str(),
+                    schema.type_name(&field.ty),
+                    field.optional
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("name", "string[max_length=24]".to_string(), false),
+                ("rank", "a.Guild.Rank".to_string(), false),
+                ("motto", "string".to_string(), true),
+            ]
+        );
+        assert_eq!(def(&schema, "Rank").1.parent, Some(guild));
+
+        let (plot, def_) = def(&schema, "Plot");
+        let DefKind::Hub(hub) = &def_.kind else {
+            panic!("expected a hub kind");
+        };
+        assert_eq!(schema.type_name(&hub.key), "u32[max=9]");
+        assert!(schema.is_fixed(&TypeKind::Named(plot).into()));
+        assert!(!schema.is_fixed(&TypeKind::Named(guild).into()));
+    }
+
+    #[test]
+    fn hub_keys_are_fixed_size_and_hold_no_float() {
+        compiled(&[concat!(
+            "namespace a\n",
+            "enum E: u8 { A }\n",
+            "type Id = u64\n",
+            "struct Pair { a: u32, b: E }\n",
+            "hub(u8) A {}\n",
+            "hub(E) B {}\n",
+            "hub(Id) C {}\n",
+            "hub(Pair) D {}\n",
+            "hub(uuid) F {}\n",
+            "hub(entity) G {}\n",
+            "hub(array<u8, 4>) H {}\n",
+            "hub(string[min_length=4, max_length=4]) I {}\n",
+        )]);
+
+        let prelude = concat!(
+            "namespace a\n",
+            "struct Position { x: f32, y: f32 }\n",
+            "message(client -> sim) M {}\n",
+        );
+        let cases = [
+            ("f32", "`f32` holds a float; a hub key cannot hold a float"),
+            (
+                "Position",
+                "`Position` holds a float through field `x`; a hub key cannot hold a float",
+            ),
+            (
+                "string",
+                "`string` is variable-size; a hub key must be fixed-size",
+            ),
+            (
+                "vec<u8>",
+                "`vec<u8>` is variable-size; a hub key must be fixed-size",
+            ),
+            ("option<u64>", "a hub key cannot be optional"),
+            (
+                "M",
+                "`M` is a message; messages are standalone and cannot be used as a type",
+            ),
+            ("Missing", "cannot find `Missing` in this scope"),
+            (
+                "K",
+                "a hub kind is not a type; declare a struct for what you send",
+            ),
+            (
+                "array<u64, 9000>",
+                "`array<u64, 9000>` takes 72000 bytes; a message holds at most 65535",
+            ),
+        ];
+        for (key, expected) in cases {
+            let src = format!("{prelude}hub({key}) K {{}}\n");
+            assert_eq!(messages(&[&src]), [expected], "{key}");
+        }
+
+        // The key is resolved where the kind is declared, outside its body.
+        assert_eq!(
+            messages(&["namespace a\nhub(Id) K { type Id = u64 }\n"]),
+            ["cannot find `Id` in this scope"]
+        );
+    }
+
+    /// Each error's message and the source it points at.
+    fn spanned(src: &str) -> Vec<(String, String)> {
+        compile(&[src])
+            .expect_err("expected errors")
+            .into_iter()
+            .filter(|diagnostic| diagnostic.is_error())
+            .map(|diagnostic| (src[diagnostic.span.clone()].to_string(), diagnostic.message))
+            .collect()
+    }
+
+    #[test]
+    fn hub_kinds_are_not_types() {
+        let error = "a hub kind is not a type; declare a struct for what you send";
+        for (decl, written) in [
+            ("struct S { h: H }", "H"),
+            ("message(client -> sim) M { h: option<H> }", "H"),
+            ("struct S { v: vec<a.H> }", "a.H"),
+            ("struct S { a: array<H, 2> }", "H"),
+            ("struct S { s: set<H> }", "H"),
+            ("struct S { m: map<H, u8> }", "H"),
+            ("struct S { m: map<u8, H> }", "H"),
+            ("union U { A(H) }", "H"),
+            ("union U { A { h: H } }", "H"),
+            ("type T = H", "H"),
+            ("hub(H) K {}", "H"),
+            ("hub(u8) K { k: K }", "K"),
+        ] {
+            let src = format!("namespace a\nhub(u8) H {{ x: u8 }}\n{decl}\n");
+            assert_eq!(
+                spanned(&src),
+                [(written.to_string(), error.to_string())],
+                "{decl}"
+            );
+        }
+        // What a kind shows others is a struct of its own.
+        compiled(&[concat!(
+            "namespace a\n",
+            "hub(u8) H { x: u8, secret: u64 }\n",
+            "struct Info { x: u8 }\n",
+            "message(hub<H> -> client) M { info: Info }\n",
+        )]);
+    }
+
+    #[test]
     fn recursion_is_reported() {
         let recursive = "`S` refers to itself; recursive types are not allowed";
         assert_eq!(messages(&["namespace a\nstruct S { s: S }\n"]), [recursive]);
@@ -2237,7 +2758,7 @@ mod tests {
             1
         );
 
-        compiled(&["namespace a\nstruct S { x: i32 }\nmessage[in] M { v: vec<S> }\n"]);
+        compiled(&["namespace a\nstruct S { x: i32 }\nmessage(client -> sim) M { v: vec<S> }\n"]);
     }
 
     #[test]

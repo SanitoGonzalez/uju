@@ -1,5 +1,6 @@
 use std::fmt;
 
+pub use crate::ir::Role;
 use crate::lexer::{Rfc3339, Span, Spanned};
 
 pub type Ident<'src> = Spanned<&'src str>;
@@ -25,6 +26,7 @@ pub enum Item<'src> {
     Const(Const<'src>),
     Union(Union<'src>),
     Type(TypeDecl<'src>),
+    Hub(Hub<'src>),
 }
 
 /// `@name` or `@name(args)`, written above a declaration. Each declaration
@@ -77,7 +79,38 @@ pub struct Struct<'src> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message<'src> {
     pub attrs: Vec<Attribute<'src>>,
-    pub direction: Spanned<Direction>,
+    pub endpoints: Endpoints<'src>,
+    pub name: Ident<'src>,
+    pub body: Body<'src>,
+}
+
+/// `(client | sim -> hub<Party>)`: the roles sending a message, then the
+/// roles receiving it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Endpoints<'src> {
+    pub from: Vec<Endpoint<'src>>,
+    pub to: Vec<Endpoint<'src>>,
+    /// `<->`: each side also sends to the other.
+    pub both: bool,
+    /// Covers the parentheses.
+    pub span: Span,
+}
+
+/// `sim`, or `hub<Party>`, a hub kind's objects.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Endpoint<'src> {
+    pub role: Role,
+    /// The kind in `hub<Kind>`. Only `hub` takes one.
+    pub kind: Option<Path<'src>>,
+    pub span: Span,
+}
+
+/// `hub(Key) Name { ... }`: a hub kind, whose objects are found by a `Key`
+/// and hold the body as their state. Only at the top level of a namespace.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hub<'src> {
+    pub attrs: Vec<Attribute<'src>>,
+    pub key: Type<'src>,
     pub name: Ident<'src>,
     pub body: Body<'src>,
 }
@@ -155,14 +188,6 @@ pub enum DurationUnit {
     M,
     /// `h`: an hour.
     H,
-}
-
-/// Which way a message travels, as written in `message[in]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    In,
-    Out,
-    Bi,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -256,6 +281,7 @@ impl<'src> Item<'src> {
             Item::Const(item) => &item.name,
             Item::Union(item) => &item.name,
             Item::Type(item) => &item.name,
+            Item::Hub(item) => &item.name,
         }
     }
 
@@ -267,6 +293,7 @@ impl<'src> Item<'src> {
             Item::Const(item) => &item.attrs,
             Item::Union(item) => &item.attrs,
             Item::Type(item) => &item.attrs,
+            Item::Hub(item) => &item.attrs,
         }
     }
 
@@ -278,6 +305,7 @@ impl<'src> Item<'src> {
             Item::Const(item) => &mut item.attrs,
             Item::Union(item) => &mut item.attrs,
             Item::Type(item) => &mut item.attrs,
+            Item::Hub(item) => &mut item.attrs,
         }
     }
 
@@ -289,6 +317,7 @@ impl<'src> Item<'src> {
             Item::Const(_) => "const",
             Item::Union(_) => "union",
             Item::Type(_) => "type",
+            Item::Hub(_) => "hub",
         }
     }
 
@@ -296,6 +325,7 @@ impl<'src> Item<'src> {
         match self {
             Item::Struct(item) => Some(&item.body),
             Item::Message(item) => Some(&item.body),
+            Item::Hub(item) => Some(&item.body),
             Item::Enum(_) | Item::Const(_) | Item::Union(_) | Item::Type(_) => None,
         }
     }
@@ -307,25 +337,6 @@ impl AttributeArg<'_> {
             AttributeArg::Literal((_, span)) => span,
             AttributeArg::Path(path) => &path.span,
             AttributeArg::Call { span, .. } => span,
-        }
-    }
-}
-
-impl Direction {
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "in" => Direction::In,
-            "out" => Direction::Out,
-            "bi" => Direction::Bi,
-            _ => return None,
-        })
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Direction::In => "in",
-            Direction::Out => "out",
-            Direction::Bi => "bi",
         }
     }
 }
@@ -562,9 +573,13 @@ impl fmt::Display for DurationUnit {
     }
 }
 
-impl fmt::Display for Direction {
+impl fmt::Display for Endpoint<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        f.write_str(self.role.name())?;
+        if let Some(kind) = &self.kind {
+            write!(f, "<{kind}>")?;
+        }
+        Ok(())
     }
 }
 
@@ -688,11 +703,24 @@ mod tests {
     fn items_report_their_name_and_keyword() {
         let item = Item::Message(Message {
             attrs: Vec::new(),
-            direction: (Direction::In, 8..10),
-            name: ("MyRequest", 12..21),
+            endpoints: Endpoints {
+                from: vec![Endpoint {
+                    role: Role::Client,
+                    kind: None,
+                    span: 8..14,
+                }],
+                to: vec![Endpoint {
+                    role: Role::Sim,
+                    kind: None,
+                    span: 18..21,
+                }],
+                both: false,
+                span: 7..22,
+            },
+            name: ("MyRequest", 23..32),
             body: Body::default(),
         });
-        assert_eq!(item.name(), &("MyRequest", 12..21));
+        assert_eq!(item.name(), &("MyRequest", 23..32));
         assert_eq!(item.keyword(), "message");
         assert_eq!(item.body(), Some(&Body::default()));
 
@@ -748,10 +776,27 @@ mod tests {
     }
 
     #[test]
-    fn direction_names_round_trip() {
-        for direction in [Direction::In, Direction::Out, Direction::Bi] {
-            assert_eq!(Direction::from_name(direction.name()), Some(direction));
+    fn role_names_round_trip() {
+        for role in Role::ALL {
+            assert_eq!(Role::from_name(role.name()), Some(role));
         }
-        assert_eq!(Direction::from_name("inout"), None);
+        assert_eq!(Role::from_name("atlas"), None);
+        assert_eq!(Role::from_name("Sim"), None);
+    }
+
+    #[test]
+    fn endpoints_print_as_written() {
+        let hub = Endpoint {
+            role: Role::Hub,
+            kind: Some(path(&["a", "Party"])),
+            span: 0..0,
+        };
+        assert_eq!(hub.to_string(), "hub<a.Party>");
+        let sim = Endpoint {
+            role: Role::Sim,
+            kind: None,
+            span: 0..0,
+        };
+        assert_eq!(sim.to_string(), "sim");
     }
 }

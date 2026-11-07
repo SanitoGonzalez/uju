@@ -579,6 +579,7 @@ impl Generator<'_> {
         let fields = match &self.schema.def(id).kind {
             DefKind::Struct(item) => &item.fields,
             DefKind::Message(item) => &item.fields,
+            DefKind::Hub(item) => &item.fields,
             DefKind::Enum(_) | DefKind::Type(_) => {
                 unreachable!("enums and types are checked as what they hold")
             }

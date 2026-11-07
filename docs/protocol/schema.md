@@ -1,9 +1,9 @@
 # Schema
 
-> **Status.** Only attributes, naming, consts, types, unions, and the
-> planned component declarations are written up here. Until the rest of the
-> language is, `crates/uju-protoc/tests/data/example1.uju` shows every
-> declaration kind, type and constraint.
+> **Status.** Only attributes, naming, consts, types, unions, messages, hub
+> kinds, and the planned component declarations are written up here. Until
+> the rest of the language is, `crates/uju-protoc/tests/data/example1.uju`
+> shows every declaration kind, type and constraint.
 
 ## Declarations
 
@@ -38,10 +38,10 @@ struct Trade {
   is an error.
 - Line breaks carry no meaning, but by convention each attribute takes a
   line of its own.
-- Attributes go on `const`, `type`, `enum`, `union`, `struct` and `message`
-  declarations, at the top of a namespace or nested. They are not allowed on
-  `namespace`, `use`, fields or variants, and one with no declaration
-  after it is an error.
+- Attributes go on `const`, `type`, `enum`, `union`, `struct`, `message`
+  and `hub` declarations, at the top of a namespace or nested. They are not
+  allowed on `namespace`, `use`, fields or variants, and one with no
+  declaration after it is an error.
 
 Constraints keep their brackets after the type, as in `u8[max=10]`. They
 belong to the type, while attributes describe the declaration.
@@ -56,7 +56,8 @@ name has a convention:
 | Name | Convention | Example |
 |---|---|---|
 | Namespace segment | `snake_case` | `namespace demo.character` |
-| Enum, struct, message | `PascalCase` | `message[out] SpawnPlayer` |
+| Enum, struct, message | `PascalCase` | `message(sim -> client) SpawnPlayer` |
+| Hub kind | `PascalCase` | `hub(GuildId) Guild` |
 | Enum variant | `PascalCase` | `Blue` |
 | Union | `PascalCase` | `union InventoryOp` |
 | Union variant | `PascalCase` | `Remove(u8)` |
@@ -121,7 +122,7 @@ const Greeting: string = "Welcome!\n"
 const RespawnDelay: duration = 30s
 const SeasonStart: timestamp = 2026-11-07T12:00:00Z
 
-message[in] SetName {
+message(client -> sim) SetName {
     const MinLength: u8 = 2
     name: string[max_length=16],
 }
@@ -145,8 +146,8 @@ message[in] SetName {
 A const goes at the top of a namespace or in a struct or message, like a
 nested type. Consts and types share each scope, so a const can't have the
 name of a type declared beside it, and a type path that reaches a const is
-an error. Consts never go on the wire, but they count toward the
-[fingerprint](wire-format.md#fingerprint), by value rather than by
+an error. Consts never go on the wire, but they count toward both
+[fingerprints](wire-format.md#fingerprint), by value rather than by
 spelling: `1000ms` and `1s` are the same const, as are
 `2026-11-07T12:00:00.000Z` and `2026-11-07T12:00:00Z`.
 
@@ -253,7 +254,7 @@ union InventoryOp {
     Clear,                        // nothing
 }
 
-message[in] ApplyOps {
+message(client -> sim) ApplyOps {
     ops: vec<InventoryOp>[max_length=8],
 }
 ```
@@ -279,6 +280,171 @@ of fields variants go in a module named after the union, as
 `type` and `union` are keywords only where a declaration starts, as `true`
 and `false` are only literals where a value is expected. They stay usable
 as names, so `type: u8` is still a valid field.
+
+## Messages
+
+A message names its endpoints in parentheses: the roles sending it, an
+arrow, and the roles receiving it. Every message names them.
+
+```
+namespace demo.party
+
+type PartyId = u64
+
+hub(PartyId) Party {
+    leader: u64,
+}
+
+message(client -> sim) Move { x: f32, y: f32 }
+message(client -> hub<Party>) JoinParty {}
+message(sim | hub -> client) Kicked { reason: string[max_length=64] }
+message(sim -> sim) Hit { damage: u32 }
+message(client <-> entry) Ping {}
+```
+
+- The roles are `client`, `entry`, `edge`, `sim` and `hub`, the processes
+  of a [cluster](../architectures/topology.md#roles). Atlas speaks only
+  uju's own messages, so `atlas` is not an endpoint.
+- `->` goes one way and `<->` both ways. `|` lists the roles of one side,
+  each once.
+- A message travels every pair of a role on its left and a role on its
+  right, and with `<->` every pair the other way too. So
+  `sim | hub -> client` travels `sim -> client` and `hub -> client`. A pair
+  written twice counts once: `sim <-> sim` is the one pair `sim -> sim`.
+- Role names are not keywords, so `sim: u8` is still a valid field.
+
+Two kinds of pairs are errors:
+
+- `client -> client`. Clients reach each other only through servers.
+- A pair joining `edge` to any role but `client`, such as `edge -> sim` or
+  `hub -> edge`. Edges run no gameplay, so their only peer in the schema is
+  the client, for what the connection itself needs, such as a ping. What
+  edges exchange with sims and hubs, such as subscriptions, is uju's own.
+
+### Relays
+
+Clients connect only to entry and edges. A message between a client and a
+sim or a hub is relayed by the client's edge, which reads its
+[envelope](wire-format.md#envelope) and never its body. The schema still
+writes it as `client -> sim` or `hub -> client`, with no `edge` between.
+
+### Hub endpoints
+
+`hub<Kind>` names a [hub kind](#hub-kinds), as in `hub<Party>`. The kind
+resolves as a type path does, from the message's namespace and its `use`s.
+
+- **Receiving.** A message to a hub names exactly one kind. Its id then
+  implies the kind, and its envelope carries only the object's key. Bare
+  `hub` on a receiving side is an error, since nothing could route the
+  message, and so are `hub<Party> | hub<Guild>` and
+  `hub<Party> <-> hub<Guild>`. With `<->`, both sides receive, so both
+  follow this rule.
+- **Sending.** Bare `hub` means any kind may send the message, and
+  `hub<Party> | hub<Guild>` means only those kinds. `hub` beside
+  `hub<Party>` on one side is an error. The restriction counts toward the
+  [fingerprints](wire-format.md#fingerprint) and shows in the
+  [IR JSON](ir.md#structs-and-messages), but generated code does not
+  enforce it yet.
+
+### Generation by role
+
+`ujuc protocol rust --role sim` generates the code of one role: encoders
+for the messages it sends, views for the ones it receives, and the
+declarations those reach. A message the role neither sends nor receives is
+left out, and so is what only such messages reach. Declarations no message
+reaches are generated for every role, with both encoders and views, except
+[hub kinds](#hub-kinds). Without `--role`, every role is generated.
+
+The Rust backend emits a message as it does a struct, as an owned type and
+a view. The root module holds what changes with any message:
+
+- A `Link<From, To>` impl per message and pair, as
+  `impl Link<role::Client, role::Sim> for MyRequest`, whose `ID` is its id
+  in that pair. A role gets the impls of the pairs it sends or receives.
+- A dispatch enum per pair the role receives, as `ClientToSimMessage<'a>`,
+  whose `decode(id, buf)` decodes a message by its id.
+- The [fingerprints](wire-format.md#fingerprint): `CLIENT_FINGERPRINT`, and
+  `INTERNAL_FINGERPRINT` for every role but `client`.
+- For an edge, a relay table per pair it relays, `client -> sim`,
+  `client -> hub`, `sim -> client` and `hub -> client`, named after the
+  pair, as `CLIENT_TO_HUB_RELAYS`. Each is a `&[Relay]` indexed by message
+  id, which `Relay::find(table, id)` looks up. A `Relay` gives the
+  message's size when fixed, and for a hub receiver a `HubRoute` with the
+  kind's id and the key's size. That is all an edge needs to frame and
+  route what it relays, so it gets no types for relayed messages.
+
+A message to a hub also gets, beside it in its namespace's module, a
+`ToHub` impl in every role that sends it. Its `Key` is the kind's key
+type, so a sender routes it by a key of the right type. Where the kind
+itself is generated, a `HubMessage` impl also names the kind, so a sim
+finds the object's slot from the kind's id and the key.
+
+## Hub kinds
+
+A hub kind declares the state of one kind of
+[hub](../architectures/topology.md#hubs) object, and the key that finds an
+object:
+
+```
+namespace demo.guild
+
+type GuildId = u64
+
+hub(GuildId) Guild {
+    name: string[max_length=24],
+    level: u8,
+}
+
+hub(GuildId) GuildBank {
+    gold: u64,
+}
+```
+
+- The key goes in parentheses after `hub`. It is fixed-size, holds no
+  float, and can't be optional. Any type that passes these rules can be a
+  key, such as an integer, an enum, a `type`, `uuid`, or a fixed-size
+  struct. The key resolves where the kind is declared, so it can't name a
+  type nested in the kind.
+- The body takes what a struct's body takes, nested declarations and
+  consts included. It is the object's state, the unit a hub stores, locks
+  and caches. State to lock or cache apart goes in a kind of its own under
+  the same key, as `GuildBank` beside `Guild`.
+- A hub kind goes only at the top level of a namespace. One nested in a
+  struct, a message or another kind is an error.
+- Each kind has a `u16` id, dense from `1` over every kind, ordered by
+  fully qualified name. See [Hub kind ids](wire-format.md#hub-kind-ids).
+
+A hub kind is not a type. It is state with a key, as a component is, and
+messages name it only as an endpoint, `hub<Guild>`. Naming it where a type
+goes, in a field, a collection, an `option`, a union variant, a `type`
+target or a key, is an error: "a hub kind is not a type; declare a struct
+for what you send". What a client sees of an object is a struct of its own,
+which the hub's code fills:
+
+```
+struct GuildInfo {
+    name: string[max_length=24],
+    level: u8,
+}
+
+message(hub<Guild> -> client) GuildChanged {
+    info: GuildInfo,
+}
+```
+
+So a field added to a kind never reaches clients by accident, and a kind's
+body counts only toward the `internal`
+[fingerprint](wire-format.md#fingerprint). A body is still encoded as a
+struct with the same fields, for a hub's storage and its pushes to sims.
+
+The Rust backend emits a hub kind as it does a struct, as an owned type and
+a view, only for the `hub` role, which stores objects, and the `sim` role,
+which caches them. Each implements `HubKind` in the root, with its key's
+type, its id, and its qualified name. A role that sends to `hub<Guild>`
+without the kind still gets the key's type, `GuildId`.
+
+`hub` is a keyword only where a declaration starts, as `type` and `union`
+are, so `hub: u8` is still a valid field.
 
 ## Components
 

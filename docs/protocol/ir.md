@@ -15,7 +15,7 @@ ujuc protocol ir -o gen/ir schemas/
 
 | Path | Holds |
 |---|---|
-| `schema.json` | What spans namespaces: the fingerprint, the namespaces, and message id order |
+| `schema.json` | What spans namespaces: the fingerprints, the namespaces, and the message and hub kind id orders |
 | `namespaces/<name>.json` | One namespace's declarations, such as `namespaces/game.core.json` |
 
 A namespace's file changes only when the namespace itself changes. Namespace
@@ -23,7 +23,7 @@ files sit in their own directory, so a namespace named `schema` cannot
 collide with the root.
 
 All numbers are JSON integers, except float constraints and float consts,
-which keep their fraction (`1.0`). `fingerprint`, `u64` values, and
+which keep their fraction (`1.0`). Fingerprints, `u64` values, and
 `duration` and `timestamp` consts can exceed 2^53, so read them as 64-bit
 integers, not as doubles.
 
@@ -31,16 +31,27 @@ integers, not as doubles.
 
 ```json
 {
-  "fingerprint": 17932262614053035048,
-  "namespaces": ["foo.bar", "hello"],
-  "inbound": ["foo.bar.MyRequest", "foo.bar.Ping"],
-  "outbound": ["foo.bar.MyResponse", "foo.bar.Ping"]
+  "fingerprints": { "client": 4198648876519494714, "internal": 16186281289306324877 },
+  "namespaces": ["demo.guild"],
+  "links": [
+    { "from": "client", "to": "sim", "messages": ["demo.guild.Ping"] },
+    { "from": "client", "to": "hub", "messages": ["demo.guild.Rename"] },
+    { "from": "sim", "to": "client", "messages": ["demo.guild.Ping"] },
+    { "from": "hub", "to": "client", "messages": ["demo.guild.Renamed"] }
+  ],
+  "hubs": ["demo.guild.Guild"]
 }
 ```
 
-- `fingerprint`: the `u64` [fingerprint](wire-format.md#fingerprint).
-- `inbound` / `outbound`: qualified message names in [id](wire-format.md#message-ids)
-  order. The message at index `i` has id `i + 1`.
+- `fingerprints`: the `u64` `client` and `internal`
+  [fingerprints](wire-format.md#fingerprint).
+- `links`: each role pair some message travels, sorted by `from` then
+  `to` in the order `client`, `entry`, `edge`, `sim`, `hub`. `messages`
+  holds the pair's qualified message names in
+  [id](wire-format.md#message-ids) order. The message at index `i` has id
+  `i + 1`. Hub kinds share their role's pairs, as `client -> hub`.
+- `hubs`: qualified hub kind names in [id](wire-format.md#hub-kind-ids)
+  order. The kind at index `i` has id `i + 1`.
 
 ## Namespace files
 
@@ -58,7 +69,7 @@ integers, not as doubles.
 - `path`: its qualified name, as in `foo.bar.MyResponse.Result`, which is how
   other declarations refer to it
 - `parent`: the `path` of the declaration it is nested in, or `null`
-- `kind`: `enum`, `struct`, `message`, `union`, or `type`
+- `kind`: `enum`, `struct`, `message`, `union`, `type`, or `hub`
 
 ### Enums
 
@@ -70,15 +81,16 @@ An enum is stored on the wire as its `repr`.
 
 ### Structs and messages
 
-A struct or message has a `layout` and `fields`. A message also has a
-`direction` (`in`, `out`, or `bi`) and `ids`, which give its id in each
-direction it travels and `null` in the other:
+A struct or message has a `layout` and `fields`. A message also has its
+`links`:
 
 ```json
 {
   "kind": "message",
-  "direction": "bi",
-  "ids": { "inbound": 3, "outbound": 2 },
+  "links": [
+    { "from": "client", "to": "hub", "id": 3, "from_kinds": null, "to_kind": "demo.guild.Guild" },
+    { "from": "hub", "to": "client", "id": 2, "from_kinds": ["demo.guild.Guild"], "to_kind": null }
+  ],
   "layout": {
     "size": { "kind": "var", "max": null },
     "bitmap": 1,
@@ -97,6 +109,18 @@ direction it travels and `null` in the other:
   ]
 }
 ```
+
+`links` lists the role pairs the message travels, sorted as in
+`schema.json`. Each has:
+
+- `from` and `to`: the roles, with any hub kind as `hub`.
+- `id`: the message's [id](wire-format.md#message-ids) among the messages
+  of that pair.
+- `from_kinds`: the qualified names of the hub kinds that may send it,
+  sorted, when `from` is `hub` and the message names them. `null` when any
+  kind may send it, or when `from` is not `hub`.
+- `to_kind`: the qualified name of the hub kind it goes to when `to` is
+  `hub`, otherwise `null`.
 
 `layout` describes the [object](wire-format.md#objects):
 
@@ -120,6 +144,23 @@ bitmap's first byte.
 | `optional_bit` | `presence`, `value` | An `option<bool>`, or an optional `type` over `bool`: its presence bit, then its value bit |
 | `optional` | `presence` | An optional fixed-size value. Present values are packed back to back after the head, in declaration order |
 | `var` | `slot`, `presence` | A variable-size value in this var slot. `presence` is its bit when optional, otherwise `null`. An absent value's slot is empty |
+
+### Hub kinds
+
+```json
+{
+  "kind": "hub",
+  "id": 1,
+  "key": { "kind": "named", "path": "demo.guild.GuildId", "constraints": {}, "wire": { ... } },
+  "layout": { ... },
+  "fields": [ ... ]
+}
+```
+
+A [hub kind](schema.md#hub-kinds) has its `id`, from 1 as in `hubs` in
+`schema.json`, and its `key`, a [type](#types) as a field's is. Its
+`layout` and `fields` are exactly a struct's. Its `parent` is always
+`null`, since kinds are declared only at the top level.
 
 ### Unions
 

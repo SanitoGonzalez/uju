@@ -3,10 +3,10 @@ pub mod wire;
 
 use std::fmt;
 
+pub use lower::lower;
+
 use crate::lexer::Rfc3339;
 use crate::parser::ast::DurationUnit;
-
-pub use lower::lower;
 
 /// Index of a [`Namespace`] in [`Schema::namespaces`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,6 +51,7 @@ pub enum DefKind {
     Message(Message),
     Union(Union),
     Type(TypeDef),
+    Hub(Hub),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,16 @@ pub enum EnumRepr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Struct {
+    pub fields: Vec<Field>,
+}
+
+/// A hub kind: objects found by a `key`, each holding the fields as its
+/// state. Laid out and validated as a struct is, but not a type: nothing
+/// names it but `hub<Kind>` endpoints.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hub {
+    /// Fixed-size and free of floats, as a map key.
+    pub key: Type,
     pub fields: Vec<Field>,
 }
 
@@ -110,8 +121,34 @@ pub struct TypeDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
-    pub direction: Direction,
+    /// Every role pair the message travels, sorted by `from`, then `to`,
+    /// each given once.
+    pub links: Vec<Link>,
     pub fields: Vec<Field>,
+}
+
+/// A role a message names as an endpoint. Declared in canonical order,
+/// which sorting follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Role {
+    Client,
+    Entry,
+    Edge,
+    Sim,
+    Hub,
+}
+
+/// One `from -> to` pair a message travels, with hub kinds collapsed to
+/// [`Role::Hub`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub from: Role,
+    pub to: Role,
+    /// The hub kinds allowed to send, sorted by qualified name. `None` when
+    /// any kind may, and when `from` is not [`Role::Hub`].
+    pub from_kinds: Option<Vec<TypeId>>,
+    /// The hub kind receiving, `Some` exactly when `to` is [`Role::Hub`].
+    pub to_kind: Option<TypeId>,
 }
 
 /// A named value. Consts never go on the wire, but they are part of the
@@ -140,14 +177,6 @@ pub enum ConstValue {
     Duration(u64),
     /// Microseconds since the Unix epoch.
     Timestamp(u64),
-}
-
-/// Which way a message travels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    In,
-    Out,
-    Bi,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -308,6 +337,24 @@ impl Schema {
         }
     }
 
+    /// A link as written in source, with kinds qualified:
+    /// `hub<a.Guild> | hub<a.Party> -> client`.
+    pub fn link_name(&self, link: &Link) -> String {
+        let from = match &link.from_kinds {
+            Some(kinds) => kinds
+                .iter()
+                .map(|kind| format!("hub<{}>", self.qualified(*kind)))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            None => link.from.to_string(),
+        };
+        let to = match link.to_kind {
+            Some(kind) => format!("hub<{}>", self.qualified(kind)),
+            None => link.to.to_string(),
+        };
+        format!("{from} -> {to}")
+    }
+
     /// `ty`, or the scalar it stands for when it names a `type`, through
     /// any number of them.
     pub fn resolved<'a>(&'a self, mut ty: &'a Type) -> &'a Type {
@@ -325,9 +372,9 @@ impl Schema {
     }
 
     /// Whether every value of `ty` encodes to the same number of bytes. A
-    /// struct is fixed-size when all of its fields are, and none is optional
-    /// but an `option<bool>`, which takes two bits either way. A union never
-    /// is.
+    /// struct or hub kind is fixed-size when all of its fields are, and none
+    /// is optional but an `option<bool>`, which takes two bits either way. A
+    /// union never is.
     pub fn is_fixed(&self, ty: &Type) -> bool {
         self.is_fixed_in(ty, &mut Vec::new())
     }
@@ -351,12 +398,12 @@ impl Schema {
                     visiting.pop();
                     fixed
                 }
-                DefKind::Struct(item) => {
+                DefKind::Struct(Struct { fields }) | DefKind::Hub(Hub { fields, .. }) => {
                     if visiting.contains(id) {
                         return true;
                     }
                     visiting.push(*id);
-                    let fixed = item.fields.iter().all(|field| {
+                    let fixed = fields.iter().all(|field| {
                         (!field.optional || self.resolved(&field.ty).kind == TypeKind::Bool)
                             && self.is_fixed_in(&field.ty, visiting)
                     });
@@ -390,13 +437,53 @@ impl Constraints {
     }
 }
 
-impl Direction {
+impl Link {
+    /// Whether `role` is at either end.
+    pub fn has(&self, role: Role) -> bool {
+        self.from == role || self.to == role
+    }
+}
+
+impl Role {
+    /// Every role, in canonical order.
+    pub const ALL: [Role; 5] = [Role::Client, Role::Entry, Role::Edge, Role::Sim, Role::Hub];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "client" => Role::Client,
+            "entry" => Role::Entry,
+            "edge" => Role::Edge,
+            "sim" => Role::Sim,
+            "hub" => Role::Hub,
+            _ => return None,
+        })
+    }
+
     pub fn name(self) -> &'static str {
         match self {
-            Direction::In => "in",
-            Direction::Out => "out",
-            Direction::Bi => "bi",
+            Role::Client => "client",
+            Role::Entry => "entry",
+            Role::Edge => "edge",
+            Role::Sim => "sim",
+            Role::Hub => "hub",
         }
+    }
+
+    /// The name in Pascal case, as Rust types spell it: `Client`.
+    pub fn pascal(self) -> &'static str {
+        match self {
+            Role::Client => "Client",
+            Role::Entry => "Entry",
+            Role::Edge => "Edge",
+            Role::Sim => "Sim",
+            Role::Hub => "Hub",
+        }
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
     }
 }
 

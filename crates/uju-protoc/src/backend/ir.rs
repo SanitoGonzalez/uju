@@ -1,7 +1,8 @@
 //! Emits the compiled IR as JSON (`ujuc protocol ir`), with the wire layout
 //! of every declaration, for generators written outside `ujuc`. Each
-//! namespace gets `namespaces/<name>.json`; the fingerprint and the message
-//! id order, which change with any message, live in `schema.json`.
+//! namespace gets `namespaces/<name>.json`; the fingerprints and the message
+//! and hub kind id orders, which change with any message or kind, live in
+//! `schema.json`.
 //! `docs/protocol/ir.md` describes the format.
 
 use crate::backend::{self, Backend, Error, GeneratedFile};
@@ -36,7 +37,12 @@ impl Backend for Ir {
 fn root(schema: &ir::Schema, wire: &Wire) -> String {
     let mut json = Json::new();
     json.begin('{');
-    json.entry_num("fingerprint", wire.fingerprint());
+    let fingerprints = wire.fingerprints();
+    json.key("fingerprints");
+    json.begin('{');
+    json.entry_num("client", fingerprints.client);
+    json.entry_num("internal", fingerprints.internal);
+    json.end('}');
 
     json.key("namespaces");
     json.begin('[');
@@ -46,16 +52,29 @@ fn root(schema: &ir::Schema, wire: &Wire) -> String {
     }
     json.end(']');
 
-    // Index `i` holds the message with id `i + 1`.
-    for (key, messages) in [("inbound", wire.inbound()), ("outbound", wire.outbound())] {
-        json.key(key);
+    // Index `i` of a list holds the message, or hub kind, with id `i + 1`.
+    let names = |json: &mut Json, ids: &[TypeId]| {
         json.begin('[');
-        for id in messages {
+        for id in ids {
             json.item();
             json.quoted(&schema.qualified(*id));
         }
         json.end(']');
+    };
+    json.key("links");
+    json.begin('[');
+    for space in wire.spaces() {
+        json.item();
+        json.begin('{');
+        json.entry("from", space.from.name());
+        json.entry("to", space.to.name());
+        json.key("messages");
+        names(&mut json, &space.messages);
+        json.end('}');
     }
+    json.end(']');
+    json.key("hubs");
+    names(&mut json, wire.hubs());
 
     json.end('}');
     json.finish()
@@ -121,13 +140,40 @@ fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
         }
         DefKind::Message(item) => {
             json.entry("kind", "message");
-            json.entry("direction", item.direction.name());
-            let ids = wire.ids(id);
-            json.key("ids");
-            json.begin('{');
-            json.entry_opt_num("inbound", ids.inbound);
-            json.entry_opt_num("outbound", ids.outbound);
-            json.end('}');
+            json.key("links");
+            json.begin('[');
+            for (link, link_id) in item.links.iter().zip(wire.ids(id)) {
+                json.item();
+                json.begin('{');
+                json.entry("from", link.from.name());
+                json.entry("to", link.to.name());
+                json.entry_num("id", link_id);
+                match &link.from_kinds {
+                    Some(kinds) => {
+                        json.key("from_kinds");
+                        json.begin('[');
+                        for kind in kinds {
+                            json.item();
+                            json.quoted(&schema.qualified(*kind));
+                        }
+                        json.end(']');
+                    }
+                    None => json.entry_null("from_kinds"),
+                }
+                match link.to_kind {
+                    Some(kind) => json.entry("to_kind", &schema.qualified(kind)),
+                    None => json.entry_null("to_kind"),
+                }
+                json.end('}');
+            }
+            json.end(']');
+            object_json(json, schema, wire, id, &item.fields);
+        }
+        DefKind::Hub(item) => {
+            json.entry("kind", "hub");
+            json.entry_num("id", wire.hub_id(id).expect("a hub kind has an id"));
+            json.key("key");
+            type_json(json, schema, wire, &item.key);
             object_json(json, schema, wire, id, &item.fields);
         }
         DefKind::Union(item) => {
@@ -196,7 +242,7 @@ fn const_json(json: &mut Json, schema: &ir::Schema, id: ConstId) {
     json.end('}');
 }
 
-/// The layout and fields of a struct or message.
+/// The layout and fields of a struct, message, or hub kind.
 fn object_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId, fields: &[Field]) {
     fields_json(json, schema, wire, wire.layout(id), fields);
 }
@@ -599,18 +645,96 @@ mod tests {
     }
 
     #[test]
-    fn the_root_holds_the_fingerprint_and_id_order() {
+    fn the_root_holds_the_fingerprints_and_id_order() {
         let schema = compile(&[EXAMPLE1, EXAMPLE2]).unwrap().schema;
         let wire = Wire::new(&schema).unwrap();
         let files = Ir.generate(&schema).unwrap();
         let root = file(&files, "schema.json");
-        assert_eq!(root["fingerprint"], wire.fingerprint());
+        let fingerprints = wire.fingerprints();
+        assert_eq!(
+            root["fingerprints"],
+            json!({"client": fingerprints.client, "internal": fingerprints.internal})
+        );
+        assert_ne!(fingerprints.client, fingerprints.internal);
         assert_eq!(root["namespaces"], json!(["foo.bar", "hello"]));
         let names = |ids: &[TypeId]| -> Vec<String> {
             ids.iter().map(|id| schema.qualified(*id)).collect()
         };
-        assert_eq!(root["inbound"], json!(names(wire.inbound())));
-        assert_eq!(root["outbound"], json!(names(wire.outbound())));
+        let links: Vec<Value> = wire
+            .spaces()
+            .iter()
+            .map(|space| {
+                json!({
+                    "from": space.from.name(),
+                    "to": space.to.name(),
+                    "messages": names(&space.messages),
+                })
+            })
+            .collect();
+        assert_eq!(root["links"], json!(links));
+        assert_eq!(
+            root["links"][0],
+            json!({"from": "client", "to": "entry", "messages": ["foo.bar.Ping"]})
+        );
+        assert_eq!(root["hubs"], json!(names(wire.hubs())));
+        assert!(!wire.hubs().is_empty(), "the examples declare hub kinds");
+    }
+
+    #[test]
+    fn the_root_lists_hub_kinds_in_id_order() {
+        let files = generated(&[
+            "namespace b\nhub(u64) Guild {}\n",
+            "namespace a\nhub(u64) Party {}\nstruct S {}\n",
+        ]);
+        assert_eq!(
+            file(&files, "schema.json")["hubs"],
+            json!(["a.Party", "b.Guild"])
+        );
+        let files = generated(&["namespace a\nstruct S {}\n"]);
+        assert!(files[0].contents.contains(r#""hubs": []"#));
+    }
+
+    #[test]
+    fn hub_kinds_carry_their_id_key_and_layout() {
+        let sources = [concat!(
+            "namespace a\n",
+            "type GuildId = u64\n",
+            "hub(GuildId) Guild { name: string[max_length=24], level: u8 }\n",
+            "hub(u32[max=9]) Bank { gold: u64 }\n",
+            "struct S { name: string[max_length=24], level: u8 }\n",
+        )];
+        let guild = def(&sources, "a.Guild");
+        assert_eq!(guild["kind"], "hub");
+        assert_eq!(guild["id"], 2);
+        assert_eq!(guild["parent"], Value::Null);
+        assert_eq!(
+            guild["key"],
+            json!({
+                "kind": "named",
+                "path": "a.GuildId",
+                "constraints": {},
+                "wire": {"size": {"kind": "fixed", "bytes": 8}},
+            })
+        );
+        // Fields and layout exactly as a struct's.
+        let s = def(&sources, "a.S");
+        assert_eq!(guild["layout"], s["layout"]);
+        assert_eq!(guild["fields"], s["fields"]);
+
+        let bank = def(&sources, "a.Bank");
+        assert_eq!(bank["id"], 1);
+        assert_eq!(
+            bank["key"],
+            json!({
+                "kind": "u32",
+                "constraints": {"max": 9},
+                "wire": {
+                    "size": {"kind": "fixed", "bytes": 1},
+                    "int": {"kind": "biased", "min": 0, "width": 1},
+                },
+            })
+        );
+        assert_eq!(bank["layout"]["size"], json!({"kind": "fixed", "bytes": 8}));
     }
 
     #[test]
@@ -645,7 +769,7 @@ mod tests {
             "const Text: string = \"say \\\"hi\\\"\\n\"\n",
             "const Delay: duration = 30s\n",
             "const Start: timestamp = 2026-11-07T12:00:00Z\n",
-            "message[in] M { const Inner: u16 = 7 }\n",
+            "message(client -> sim) M { const Inner: u16 = 7 }\n",
         )]);
         let namespace = file(&files, "namespaces/a.json");
         assert_eq!(
@@ -674,28 +798,35 @@ mod tests {
     }
 
     #[test]
-    fn messages_carry_their_direction_and_ids() {
+    fn messages_carry_their_links() {
         let sources = [concat!(
             "namespace a\n",
-            "message[in] A {}\n",
-            "message[out] B {}\n",
-            "message[bi] C {}\n",
+            "hub(u64) Party {}\n",
+            "hub(u64) Guild {}\n",
+            "message(client -> sim) A {}\n",
+            "message(sim -> client) B {}\n",
+            "message(client <-> sim) C {}\n",
+            "message(client -> hub<Party>) D {}\n",
+            "message(hub<Party> | hub<Guild> | sim -> client) E {}\n",
         )];
-        let ids = |name: &str| {
-            let def = def(&sources, &format!("a.{name}"));
-            (def["direction"].clone(), def["ids"].clone())
-        };
+        let links = |name: &str| def(&sources, &format!("a.{name}"))["links"].clone();
+        let link = |from: &str, to: &str, id: u16| json!({"from": from, "to": to, "id": id, "from_kinds": null, "to_kind": null});
+        assert_eq!(links("A"), json!([link("client", "sim", 1)]));
+        assert_eq!(links("B"), json!([link("sim", "client", 1)]));
         assert_eq!(
-            ids("A"),
-            (json!("in"), json!({"inbound": 1, "outbound": null}))
+            links("C"),
+            json!([link("client", "sim", 2), link("sim", "client", 2)])
         );
         assert_eq!(
-            ids("B"),
-            (json!("out"), json!({"inbound": null, "outbound": 1}))
+            links("D"),
+            json!([{"from": "client", "to": "hub", "id": 1, "from_kinds": null, "to_kind": "a.Party"}])
         );
         assert_eq!(
-            ids("C"),
-            (json!("bi"), json!({"inbound": 2, "outbound": 2}))
+            links("E"),
+            json!([
+                link("sim", "client", 3),
+                {"from": "hub", "to": "client", "id": 1, "from_kinds": ["a.Guild", "a.Party"], "to_kind": null},
+            ])
         );
     }
 
@@ -761,7 +892,7 @@ mod tests {
             &[concat!(
                 "namespace foo.bar\n",
                 "struct Position { x: f32 }\n",
-                "message[in] M { m: map<u8, vec<Position>>, a: array<i32, 4> }\n",
+                "message(client -> sim) M { m: map<u8, vec<Position>>, a: array<i32, 4> }\n",
             )],
             "foo.bar.M",
         );
@@ -784,7 +915,7 @@ mod tests {
         let def = def(
             &[concat!(
                 "namespace a\n",
-                "message[in] M {\n",
+                "message(client -> sim) M {\n",
                 "    v: vec<string[max_length=14]>[max_length=10, min_length=1],\n",
                 "    f: f64[nan, infinite, max=1],\n",
                 "    u: u8,\n",

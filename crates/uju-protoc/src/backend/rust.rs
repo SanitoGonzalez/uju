@@ -1,13 +1,19 @@
 //! Emits Rust (`ujuc protocol rust`) against the `uju::net::wire` runtime: a module
 //! file per namespace, so `namespace game.core` lands in `game/core/mod.rs`
 //! under a root `mod.rs`. A namespace's file changes only with what it
-//! declares, or with what it uses from others; message ids, the fingerprint,
-//! and the dispatch enums, which change with any message, live in the root.
+//! declares, or with what it uses from others; message ids, the
+//! fingerprints, and the dispatch enums, which change with any message, live
+//! in the root.
 //!
-//! Each struct and message `Foo` becomes the owned `Foo`, which
+//! Each struct, message, and hub kind `Foo` becomes the owned `Foo`, which
 //! encodes into a caller's buffer, and `FooView`, which validates an encoding
-//! once and then reads it in place. Every layout comes from [`Wire`], so the
-//! code agrees with every other backend byte for byte. A `type` becomes a
+//! once and then reads it in place. A hub kind also implements `HubKind` in
+//! the root, since its id changes with any kind. A message to a hub kind
+//! implements `ToHub`, naming the key, in the roles that send it, and
+//! `HubMessage`, naming the kind, where the kind is generated. An edge's
+//! root holds a relay table per role pair it relays, such as
+//! `CLIENT_TO_SIM_RELAYS`, indexed by `id - 1`. Every layout comes from
+//! [`Wire`], so the code agrees with every other backend byte for byte. A `type` becomes a
 //! newtype over its scalar, which views read by value. A union `U` becomes
 //! the enum `U` and the view enum `UView`, whose variants with fields are
 //! read through views in the module `u`. Consts become
@@ -27,10 +33,10 @@ use self::out::Out;
 use self::types::*;
 use crate::backend::{self, Backend, Error, GeneratedFile};
 use crate::case;
-use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, UnionLayout, Width, Wire};
+use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, Space, UnionLayout, Width, Wire};
 use crate::ir::{
-    ConstId, ConstValue, Constraints, DefKind, Direction, Field, NamespaceId, Number, Schema, Type,
-    TypeId, TypeKind, Union, VariantData,
+    ConstId, ConstValue, Constraints, DefKind, Field, Message, NamespaceId, Number, Role, Schema,
+    Type, TypeId, TypeKind, Union, VariantData,
 };
 
 /// Where generated code finds the runtime, aliased as `__w` in each module.
@@ -63,30 +69,26 @@ const VIEW_METHODS: &[&str] = &[
 ];
 
 pub struct Rust {
-    /// The peer to generate, as in [`Options::direction`]. Types only one
-    /// side needs get only that side: a server decodes `in` messages and
-    /// encodes `out` ones.
+    /// The role to generate, as in [`Options::role`]. Types only one side
+    /// needs get only that side: a sim decodes what clients send it and
+    /// encodes what it sends them.
     ///
-    /// [`Options::direction`]: crate::backend::Options::direction
-    pub direction: Option<Direction>,
+    /// [`Options::role`]: crate::backend::Options::role
+    pub role: Option<Role>,
 }
 
 impl Backend for Rust {
     fn generate(&self, schema: &Schema) -> Result<Vec<GeneratedFile>, Error> {
         let wire = backend::wire(schema)?;
-        let direction = self
-            .direction
-            .filter(|direction| *direction != Direction::Bi);
-        let generator = Generator::new(schema, &wire, direction)?;
+        let generator = Generator::new(schema, &wire, self.role)?;
         Ok(generator.files())
     }
 }
 
-/// Handler branches for the messages one peer receives (`ujuc dispatch
+/// Handler branches for the messages one role receives (`ujuc dispatch
 /// rust`).
 pub struct RustDispatch {
-    /// `In` for a server, `Out` for a client.
-    pub direction: Direction,
+    pub role: Role,
 }
 
 impl Backend for RustDispatch {
@@ -127,8 +129,8 @@ const ALL: Traits = Traits {
 struct Generator<'a> {
     schema: &'a Schema,
     wire: &'a Wire,
-    /// `In` or `Out`; `None` for both peers.
-    direction: Option<Direction>,
+    /// `None` for every role.
+    role: Option<Role>,
     /// The Rust name of each declaration, indexed by [`TypeId`]: its path
     /// joined, as `MyResponseResult` for an enum nested in `MyResponse`.
     names: Vec<String>,
@@ -139,7 +141,8 @@ struct Generator<'a> {
     const_names: Vec<String>,
     const_modules: Vec<Vec<String>>,
     traits: Vec<Traits>,
-    /// Whether each declaration is encoded, or decoded, by this peer.
+    /// Whether each declaration is encoded, or decoded, by this role. A
+    /// declaration doing neither is left out.
     encode: Vec<bool>,
     decode: Vec<bool>,
     /// Whether a fixed-size struct's bytes need checks beyond their size,
@@ -151,11 +154,7 @@ struct Generator<'a> {
 }
 
 impl<'a> Generator<'a> {
-    fn new(
-        schema: &'a Schema,
-        wire: &'a Wire,
-        direction: Option<Direction>,
-    ) -> Result<Generator<'a>, Error> {
+    fn new(schema: &'a Schema, wire: &'a Wire, role: Option<Role>) -> Result<Generator<'a>, Error> {
         unsupported(schema)?;
         let len = schema.defs.len();
         let names = schema.defs.iter().map(|def| ident(&def.name)).collect();
@@ -168,11 +167,11 @@ impl<'a> Generator<'a> {
             .iter()
             .map(|item| scope_module(schema, item.namespace, item.parent))
             .collect();
-        let (encode, decode) = roles(schema, direction);
+        let (encode, decode) = roles(schema, role);
         let generator = Generator {
             schema,
             wire,
-            direction,
+            role,
             names,
             modules,
             const_names,
@@ -254,24 +253,21 @@ impl<'a> Generator<'a> {
                 claim(outer, name.clone(), owner);
             }
         }
-        for (name, generated) in [
-            ("FINGERPRINT", true),
-            ("InboundMessage", self.dispatches(Direction::In)),
-            ("OutboundMessage", self.dispatches(Direction::Out)),
-        ] {
-            if generated {
-                claim(&[], name.to_string(), format!("the generated `{name}`"));
-            }
+        let mut generated = vec!["CLIENT_FINGERPRINT".to_string()];
+        if self.role != Some(Role::Client) {
+            generated.push("INTERNAL_FINGERPRINT".to_string());
+        }
+        generated.extend(self.received().map(dispatch_name));
+        generated.extend(self.relayed().map(relay_name));
+        for name in generated {
+            let owner = format!("the generated `{name}`");
+            claim(&[], name, owner);
         }
         // A variant qualified by its namespace can still meet another
         // message's: `aB.c.M` and `a.bC.M` are both `ABCM`.
-        for (way, messages, name) in [
-            (Direction::In, self.wire.inbound(), "InboundMessage"),
-            (Direction::Out, self.wire.outbound(), "OutboundMessage"),
-        ] {
-            if !self.dispatches(way) {
-                continue;
-            }
+        for space in self.received() {
+            let name = dispatch_name(space);
+            let messages = &space.messages;
             let mut seen = BTreeMap::new();
             for (variant, id) in self.variants(messages).into_iter().zip(messages) {
                 if let Some(previous) = seen.insert(variant.clone(), *id) {
@@ -289,14 +285,39 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
-    /// Whether the dispatch enum of messages travelling `way` is generated:
-    /// the peer receiving them decodes them.
-    fn dispatches(&self, way: Direction) -> bool {
-        let messages = match way {
-            Direction::In => self.wire.inbound(),
-            _ => self.wire.outbound(),
-        };
-        !messages.is_empty() && self.direction.is_none_or(|direction| direction == way)
+    /// The role pairs this role receives, each with a dispatch enum.
+    fn received(&self) -> impl Iterator<Item = &'a Space> + use<'a, '_> {
+        self.wire
+            .spaces()
+            .iter()
+            .filter(|space| self.role.is_none_or(|role| role == space.to))
+    }
+
+    /// The role pairs this role sends or receives, each message of which
+    /// implements `Link`.
+    fn linked(&self) -> impl Iterator<Item = &'a Space> + use<'a, '_> {
+        self.wire.spaces().iter().filter(|space| {
+            self.role
+                .is_none_or(|role| role == space.from || role == space.to)
+        })
+    }
+
+    /// The role pairs an edge relays, between clients and sims or hubs,
+    /// each with a relay table. Only edges have them.
+    fn relayed(&self) -> impl Iterator<Item = &'a Space> + use<'a, '_> {
+        let edge = self.role.is_none_or(|role| role == Role::Edge);
+        self.wire.spaces().iter().filter(move |space| {
+            edge && matches!(
+                (space.from, space.to),
+                (Role::Client, Role::Sim | Role::Hub) | (Role::Sim | Role::Hub, Role::Client)
+            )
+        })
+    }
+
+    /// Whether this role encodes or decodes declaration `id`, so it is
+    /// generated at all.
+    fn generated(&self, id: TypeId) -> bool {
+        self.encode[id.0] || self.decode[id.0]
     }
 
     fn files(&self) -> Vec<GeneratedFile> {
@@ -310,7 +331,7 @@ impl<'a> Generator<'a> {
                 module.file = true;
             }
         }
-        for id in defs {
+        for id in defs.into_iter().filter(|id| self.generated(*id)) {
             let mut module = &mut root;
             for segment in &self.modules[id.0] {
                 module = module.children.entry(segment.clone()).or_default();
@@ -350,21 +371,38 @@ impl<'a> Generator<'a> {
                 out.line(format!("pub mod {name};"));
             }
         }
-        if root {
+        let kinds = self.wire.hubs().iter().any(|id| self.generated(*id));
+        let linked = self.linked().next().is_some() || self.relayed().next().is_some();
+        if root && (kinds || linked) {
             out.line("");
-            out.line("/// A hash of the schema; peers with different fingerprints cannot talk.");
+            out.line(format!("use {RUNTIME} as __w;"));
+        }
+        if root {
+            let fingerprints = self.wire.fingerprints();
+            out.line("");
+            out.line("/// A hash of what clients see. A client and a server with different");
+            out.line("/// client fingerprints cannot talk.");
             out.line(format!(
-                "pub const FINGERPRINT: u64 = 0x{:016x};",
-                self.wire.fingerprint()
+                "pub const CLIENT_FINGERPRINT: u64 = 0x{:016x};",
+                fingerprints.client
             ));
+            if self.role != Some(Role::Client) {
+                out.line("");
+                out.line("/// A hash of the whole schema. Servers with different internal");
+                out.line("/// fingerprints cannot talk.");
+                out.line(format!(
+                    "pub const INTERNAL_FINGERPRINT: u64 = 0x{:016x};",
+                    fingerprints.internal
+                ));
+            }
         }
         self.module(&mut out, module, path);
         if root {
-            self.ids(&mut out);
-            for way in [Direction::In, Direction::Out] {
-                if self.dispatches(way) {
-                    self.dispatch(&mut out, way);
-                }
+            self.links(&mut out);
+            self.hub_kinds(&mut out);
+            self.relays(&mut out);
+            for space in self.received() {
+                self.dispatch(&mut out, space);
             }
         }
         // A raw identifier names its file without the `r#`.
@@ -401,8 +439,9 @@ impl<'a> Generator<'a> {
                 DefKind::Struct(item) => self.object(out, *id, &item.fields, path),
                 DefKind::Message(item) => {
                     self.object(out, *id, &item.fields, path);
-                    self.message(out, *id);
+                    self.message(out, *id, item);
                 }
+                DefKind::Hub(item) => self.object(out, *id, &item.fields, path),
                 DefKind::Type(item) => self.newtype(out, *id, item, path),
                 DefKind::Union(item) => self.union(out, *id, item, path),
             }
@@ -504,6 +543,15 @@ fn unsupported(schema: &Schema) -> Result<(), Error> {
             DefKind::Enum(_) => continue,
             DefKind::Struct(item) => &item.fields,
             DefKind::Message(item) => &item.fields,
+            DefKind::Hub(item) => {
+                if let Some(name) = find(&item.key) {
+                    errors.push(format!(
+                        "`{}`: the Rust backend does not support `{name}` yet",
+                        schema.qualified(TypeId(index))
+                    ));
+                }
+                &item.fields
+            }
             // Reported once here rather than at every field it types.
             DefKind::Type(item) => {
                 if let Some(name) = find(&item.target) {
@@ -641,47 +689,54 @@ fn string_literal(value: &str) -> String {
     out
 }
 
-/// Every declaration's role: whether this peer encodes it, and whether it
-/// decodes it. Structs no message reaches get both.
-fn roles(schema: &Schema, direction: Option<Direction>) -> (Vec<bool>, Vec<bool>) {
+/// Whether `role` encodes each declaration, and whether it decodes it:
+/// what the messages it sends and receives reach. Declarations no message
+/// reaches get both. Hub kinds are generated, with both, only for hubs,
+/// which store them, and sims, which cache them.
+fn roles(schema: &Schema, role: Option<Role>) -> (Vec<bool>, Vec<bool>) {
     let len = schema.defs.len();
-    let Some(direction) = direction else {
+    let Some(role) = role else {
         return (vec![true; len], vec![true; len]);
     };
-    let mut encode = vec![false; len];
-    let mut decode = vec![false; len];
+    struct Marker<'a> {
+        schema: &'a Schema,
+        encode: Vec<bool>,
+        decode: Vec<bool>,
+    }
 
-    fn mark(
-        schema: &Schema,
-        id: TypeId,
-        roles: (bool, bool),
-        encode: &mut [bool],
-        decode: &mut [bool],
-    ) {
-        let (enc, dec) = roles;
-        if (!enc || encode[id.0]) && (!dec || decode[id.0]) {
-            return;
-        }
-        encode[id.0] |= enc;
-        decode[id.0] |= dec;
-        let mut named = Vec::new();
-        match &schema.def(id).kind {
-            DefKind::Struct(item) => fields_named(&item.fields, &mut named),
-            DefKind::Message(item) => fields_named(&item.fields, &mut named),
-            DefKind::Type(item) => named_in(&item.target, &mut named),
-            DefKind::Union(item) => {
-                for variant in &item.variants {
-                    match &variant.data {
-                        VariantData::Unit => {}
-                        VariantData::Type(ty) => named_in(ty, &mut named),
-                        VariantData::Fields(fields) => fields_named(fields, &mut named),
+    impl Marker<'_> {
+        fn mark(&mut self, id: TypeId, roles: (bool, bool)) {
+            let (enc, dec) = roles;
+            if (!enc || self.encode[id.0]) && (!dec || self.decode[id.0]) {
+                return;
+            }
+            let schema = self.schema;
+            let mut named = Vec::new();
+            match &schema.def(id).kind {
+                DefKind::Struct(item) => fields_named(&item.fields, &mut named),
+                DefKind::Message(item) => fields_named(&item.fields, &mut named),
+                // Whoever reads or writes a kind's objects names them by key.
+                DefKind::Hub(item) => {
+                    named_in(&item.key, &mut named);
+                    fields_named(&item.fields, &mut named);
+                }
+                DefKind::Type(item) => named_in(&item.target, &mut named),
+                DefKind::Union(item) => {
+                    for variant in &item.variants {
+                        match &variant.data {
+                            VariantData::Unit => {}
+                            VariantData::Type(ty) => named_in(ty, &mut named),
+                            VariantData::Fields(fields) => fields_named(fields, &mut named),
+                        }
                     }
                 }
+                DefKind::Enum(_) => {}
             }
-            DefKind::Enum(_) => return,
-        }
-        for inner in named {
-            mark(schema, inner, roles, encode, decode);
+            self.encode[id.0] |= enc;
+            self.decode[id.0] |= dec;
+            for inner in named {
+                self.mark(inner, roles);
+            }
         }
     }
 
@@ -691,29 +746,63 @@ fn roles(schema: &Schema, direction: Option<Direction>) -> (Vec<bool>, Vec<bool>
         }
     }
 
-    for (index, def) in schema.defs.iter().enumerate() {
-        if let DefKind::Message(item) = &def.kind {
-            let roles = match (direction, item.direction) {
-                (_, Direction::Bi) => (true, true),
-                (peer, way) if peer == way => (false, true),
-                _ => (true, false),
-            };
-            mark(schema, TypeId(index), roles, &mut encode, &mut decode);
+    let mut marker = Marker {
+        schema,
+        encode: vec![false; len],
+        decode: vec![false; len],
+    };
+    // No message reaches a kind's body, so only its holders get it.
+    if matches!(role, Role::Hub | Role::Sim) {
+        for (index, def) in schema.defs.iter().enumerate() {
+            if matches!(def.kind, DefKind::Hub(_)) {
+                marker.mark(TypeId(index), (true, true));
+            }
         }
     }
     for (index, def) in schema.defs.iter().enumerate() {
-        let reached = encode[index] || decode[index];
-        if !reached && !matches!(def.kind, DefKind::Message(_)) {
-            mark(
-                schema,
-                TypeId(index),
-                (true, true),
-                &mut encode,
-                &mut decode,
-            );
+        let DefKind::Message(item) = &def.kind else {
+            continue;
+        };
+        let sends = item.links.iter().any(|link| link.from == role);
+        let receives = item.links.iter().any(|link| link.to == role);
+        if sends || receives {
+            marker.mark(TypeId(index), (sends, receives));
+        }
+        // A sender names the object a message goes to by its kind's key.
+        for link in item.links.iter().filter(|link| link.from == role) {
+            if let Some(kind) = link.to_kind
+                && let DefKind::Hub(hub) = &schema.def(kind).kind
+            {
+                let mut named = Vec::new();
+                named_in(&hub.key, &mut named);
+                for id in named {
+                    marker.mark(id, (true, false));
+                }
+            }
         }
     }
-    (encode, decode)
+    for (index, def) in schema.defs.iter().enumerate() {
+        let reached = marker.encode[index] || marker.decode[index];
+        if !reached && !matches!(def.kind, DefKind::Message(_) | DefKind::Hub(_)) {
+            marker.mark(TypeId(index), (true, true));
+        }
+    }
+    (marker.encode, marker.decode)
+}
+
+/// The dispatch enum of the messages linking a role pair:
+/// `ClientToSimMessage`.
+fn dispatch_name(space: &Space) -> String {
+    format!("{}To{}Message", space.from.pascal(), space.to.pascal())
+}
+
+/// The relay table of a role pair: `CLIENT_TO_SIM_RELAYS`.
+fn relay_name(space: &Space) -> String {
+    format!(
+        "{}_TO_{}_RELAYS",
+        space.from.name().to_uppercase(),
+        space.to.name().to_uppercase()
+    )
 }
 
 /// The declarations `ty` names directly; a `type`'s target is reached
@@ -741,6 +830,7 @@ fn traits(schema: &Schema) -> Vec<Traits> {
                 DefKind::Enum(_) => continue,
                 DefKind::Struct(item) => fields_traits(&item.fields, &traits),
                 DefKind::Message(item) => fields_traits(&item.fields, &traits),
+                DefKind::Hub(item) => fields_traits(&item.fields, &traits),
                 DefKind::Type(item) => type_traits(&item.target, &traits),
                 // A union has no variant to default to.
                 DefKind::Union(item) => {

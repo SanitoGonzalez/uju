@@ -3,10 +3,11 @@
 //! backend reads its layout from here, so all targets agree byte for byte.
 //! `docs/protocol/wire-format.md` specifies the format itself.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::ir::{
-    ConstId, ConstValue, DefKind, Direction, Field, Number, Schema, Type, TypeId, TypeKind,
+    ConstId, ConstValue, DefKind, Field, Link, Number, Role, Schema, Type, TypeId, TypeKind,
     VariantData,
 };
 
@@ -141,7 +142,7 @@ pub enum Sequence {
     Prefixed { count: Width, prefix: Width },
 }
 
-/// Layout of a struct or message.
+/// Layout of a struct, message, or hub kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub size: Size,
@@ -198,13 +199,24 @@ pub enum Slot {
     Var { slot: u32, presence: Option<u32> },
 }
 
-/// A message's id in each direction it travels; `bi` messages have both.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Ids {
-    /// Among the messages a server receives: `in` and `bi`.
-    pub inbound: Option<u16>,
-    /// Among the messages a server sends: `out` and `bi`.
-    pub outbound: Option<u16>,
+/// The id space of one role pair: the messages linking `from` to `to`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Space {
+    pub from: Role,
+    pub to: Role,
+    /// In id order from 1, which is qualified name order.
+    pub messages: Vec<TypeId>,
+}
+
+/// The schema's two fingerprints. Peers with different fingerprints
+/// cannot talk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fingerprints {
+    /// What clients see: the messages with a client endpoint, what they
+    /// reach, and every const.
+    pub client: u64,
+    /// Everything.
+    pub internal: u64,
 }
 
 /// A declaration that cannot be laid out.
@@ -224,15 +236,19 @@ pub struct Error {
 pub struct Wire {
     /// Indexed by [`TypeId`].
     sizes: Vec<Size>,
-    /// Indexed by [`TypeId`]; `Some` for structs and messages.
+    /// Indexed by [`TypeId`]; `Some` for structs, messages, and hub kinds.
     layouts: Vec<Option<Layout>>,
     /// Indexed by [`TypeId`]; `Some` for unions.
     unions: Vec<Option<UnionLayout>>,
-    /// Indexed by [`TypeId`]; empty for everything but messages.
-    ids: Vec<Ids>,
-    inbound: Vec<TypeId>,
-    outbound: Vec<TypeId>,
-    fingerprint: u64,
+    /// Indexed by [`TypeId`]: a message's id on each of its links, in
+    /// link order. Empty for everything but messages.
+    ids: Vec<Vec<u16>>,
+    /// The role pairs some message links, in canonical role order.
+    spaces: Vec<Space>,
+    /// Indexed by [`TypeId`]; `Some` for hub kinds.
+    hub_ids: Vec<Option<u16>>,
+    hubs: Vec<TypeId>,
+    fingerprints: Fingerprints,
 }
 
 impl Wire {
@@ -247,7 +263,7 @@ impl Wire {
         };
         let sizes: Vec<Size> = (0..len).map(|index| builder.def(TypeId(index))).collect();
 
-        let mut messages: Vec<(String, TypeId, Direction)> = schema
+        let mut messages: Vec<(String, TypeId, &[Link])> = schema
             .defs
             .iter()
             .enumerate()
@@ -255,36 +271,57 @@ impl Wire {
                 DefKind::Message(item) => Some((
                     schema.qualified(TypeId(index)),
                     TypeId(index),
-                    item.direction,
+                    &item.links[..],
                 )),
                 _ => None,
             })
             .collect();
         // Qualified names are unique.
         messages.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut ids = vec![Ids::default(); len];
-        let mut inbound = Vec::new();
-        let mut outbound = Vec::new();
-        for (_, id, direction) in messages {
-            let mut assign = |space: &mut Vec<TypeId>, name: &str| {
+        let mut ids = vec![Vec::new(); len];
+        let mut spaces: BTreeMap<(Role, Role), Vec<TypeId>> = BTreeMap::new();
+        for (_, id, links) in messages {
+            for link in links {
+                let space = spaces.entry((link.from, link.to)).or_default();
+                space.push(id);
                 // From 1: a zeroed id is no message.
-                let index = u16::try_from(space.len() + 1).ok();
-                if index.is_none() {
+                let index = u16::try_from(space.len()).unwrap_or_else(|_| {
                     builder.errors.push(Error {
                         def: id,
                         variant: None,
                         field: None,
-                        message: format!("more than {} {name} messages", u16::MAX),
+                        message: format!(
+                            "more than {} `{} -> {}` messages",
+                            u16::MAX,
+                            link.from,
+                            link.to
+                        ),
                     });
-                }
-                space.push(id);
-                index
-            };
-            if matches!(direction, Direction::In | Direction::Bi) {
-                ids[id.0].inbound = assign(&mut inbound, "inbound");
+                    0
+                });
+                ids[id.0].push(index);
             }
-            if matches!(direction, Direction::Out | Direction::Bi) {
-                ids[id.0].outbound = assign(&mut outbound, "outbound");
+        }
+
+        let mut hubs: Vec<(String, TypeId)> = schema
+            .defs
+            .iter()
+            .enumerate()
+            .filter(|(_, def)| matches!(def.kind, DefKind::Hub(_)))
+            .map(|(index, _)| (schema.qualified(TypeId(index)), TypeId(index)))
+            .collect();
+        hubs.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut hub_ids = vec![None; len];
+        for (index, (_, id)) in hubs.iter().enumerate() {
+            // From 1, as message ids.
+            hub_ids[id.0] = u16::try_from(index + 1).ok();
+            if hub_ids[id.0].is_none() {
+                builder.errors.push(Error {
+                    def: *id,
+                    variant: None,
+                    field: None,
+                    message: format!("more than {} hub kinds", u16::MAX),
+                });
             }
         }
 
@@ -296,9 +333,16 @@ impl Wire {
             layouts: builder.layouts,
             unions: builder.unions,
             ids,
-            inbound,
-            outbound,
-            fingerprint: fnv1a(canonical(schema).as_bytes()),
+            spaces: spaces
+                .into_iter()
+                .map(|((from, to), messages)| Space { from, to, messages })
+                .collect(),
+            hub_ids,
+            hubs: hubs.into_iter().map(|(_, id)| id).collect(),
+            fingerprints: Fingerprints {
+                client: fnv1a(canonical(schema, Scope::Client).as_bytes()),
+                internal: fnv1a(canonical(schema, Scope::Internal).as_bytes()),
+            },
         })
     }
 
@@ -311,15 +355,15 @@ impl Wire {
         sequence(ty, &mut |id| self.sizes[id.0]).map(|(sequence, _)| sequence)
     }
 
-    /// The layout of a struct or message.
+    /// The layout of a struct, message, or hub kind.
     ///
     /// # Panics
     ///
-    /// When `id` is not a struct or message.
+    /// When `id` is not a struct, message, or hub kind.
     pub fn layout(&self, id: TypeId) -> &Layout {
         self.layouts[id.0]
             .as_ref()
-            .expect("only structs and messages have a layout")
+            .expect("only structs, messages, and hub kinds have a layout")
     }
 
     /// The layout of a union.
@@ -331,24 +375,50 @@ impl Wire {
         self.unions[id.0].as_ref().expect("not a union")
     }
 
-    pub fn ids(&self, id: TypeId) -> Ids {
-        self.ids[id.0]
+    /// Message `id`'s id on each of its links, in the order of
+    /// [`Message::links`]. Empty for anything but a message.
+    ///
+    /// [`Message::links`]: crate::ir::Message::links
+    pub fn ids(&self, id: TypeId) -> &[u16] {
+        &self.ids[id.0]
     }
 
-    /// The messages a server receives, in inbound id order from 1.
-    pub fn inbound(&self) -> &[TypeId] {
-        &self.inbound
+    /// Message `id`'s id among the messages linking `from` to `to`, `None`
+    /// when it does not link them.
+    pub fn message_id(&self, id: TypeId, from: Role, to: Role) -> Option<u16> {
+        self.space(from, to)
+            .iter()
+            .position(|other| *other == id)
+            .map(|index| index as u16 + 1)
     }
 
-    /// The messages a server sends, in outbound id order from 1.
-    pub fn outbound(&self) -> &[TypeId] {
-        &self.outbound
+    /// Every role pair some message links, in canonical role order: by
+    /// `from`, then `to`.
+    pub fn spaces(&self) -> &[Space] {
+        &self.spaces
     }
 
-    /// A hash of everything both peers must agree on, names included; peers
-    /// with different fingerprints cannot talk.
-    pub fn fingerprint(&self) -> u64 {
-        self.fingerprint
+    /// The messages linking `from` to `to`, in id order from 1.
+    pub fn space(&self, from: Role, to: Role) -> &[TypeId] {
+        self.spaces
+            .iter()
+            .find(|space| space.from == from && space.to == to)
+            .map_or(&[], |space| &space.messages)
+    }
+
+    /// The id of hub kind `id`, `None` for any other declaration.
+    pub fn hub_id(&self, id: TypeId) -> Option<u16> {
+        self.hub_ids[id.0]
+    }
+
+    /// Every hub kind, in id order from 1.
+    pub fn hubs(&self) -> &[TypeId] {
+        &self.hubs
+    }
+
+    /// Hashes of what peers must agree on, names included.
+    pub fn fingerprints(&self) -> Fingerprints {
+        self.fingerprints
     }
 }
 
@@ -382,6 +452,21 @@ impl Builder<'_> {
             DefKind::Enum(item) => Size::Fixed(item.repr.size() as u32),
             DefKind::Struct(item) => self.object(id, &item.fields),
             DefKind::Message(item) => self.object(id, &item.fields),
+            DefKind::Hub(item) => {
+                // The key travels in envelopes, so it must fit as a value.
+                if let Some(size) = self.oversized(&item.key) {
+                    self.errors.push(Error {
+                        def: id,
+                        variant: None,
+                        field: None,
+                        message: format!(
+                            "`{}` takes {size} bytes; a message holds at most {MAX_SIZE}",
+                            self.schema.type_name(&item.key)
+                        ),
+                    });
+                }
+                self.object(id, &item.fields)
+            }
             DefKind::Union(item) => self.union(id, &item.variants),
             // A scalar, so never too large.
             DefKind::Type(item) => self.size(&item.target),
@@ -442,7 +527,8 @@ impl Builder<'_> {
         size
     }
 
-    /// Lays out the fields of a struct or message, or of a union's variant.
+    /// Lays out the fields of a struct, message, or hub kind, or of a union's
+    /// variant.
     fn layout(&mut self, id: TypeId, variant: Option<usize>, fields: &[Field]) -> Layout {
         let mut bits = 0;
         let mut bit = || {
@@ -658,12 +744,32 @@ fn sequence_max(ty: &Type, sequence: Sequence, item: Size) -> Option<u32> {
     bound(total)
 }
 
-/// Every declaration as written in source, sorted by qualified name, so the
-/// order sources are compiled in does not matter. Field order does: it is
-/// the layout. Consts follow the types, sorted the same way.
-fn canonical(schema: &Schema) -> String {
-    let mut defs: Vec<(String, TypeId)> = (0..schema.defs.len())
-        .map(|index| (schema.qualified(TypeId(index)), TypeId(index)))
+/// What a fingerprint covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Client,
+    Internal,
+}
+
+/// Every declaration in `scope` as written in source, sorted by qualified
+/// name, so the order sources are compiled in does not matter. Field order
+/// does: it is the layout. Consts follow the types, sorted the same way.
+///
+/// A message spells its links normalized: its pairs in canonical role
+/// order, comma-separated, with kinds qualified and sending kinds sorted,
+/// as `message(client -> hub<a.Party>, hub<a.Guild> | hub<a.Party> -> client)`.
+/// For clients, a message lists only the links with a client end, and a hub
+/// kind only its key and name, as `hub(u64) a.Party`.
+fn canonical(schema: &Schema, scope: Scope) -> String {
+    let listed = match scope {
+        Scope::Internal => vec![true; schema.defs.len()],
+        Scope::Client => client_listed(schema),
+    };
+    let mut defs: Vec<(String, TypeId)> = listed
+        .iter()
+        .enumerate()
+        .filter(|(_, listed)| **listed)
+        .map(|(index, _)| (schema.qualified(TypeId(index)), TypeId(index)))
         .collect();
     defs.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -694,8 +800,20 @@ fn canonical(schema: &Schema) -> String {
                 fields(&mut out, &item.fields);
             }
             DefKind::Message(item) => {
-                let _ = write!(out, "message[{}] {name}", item.direction.name());
+                let links: Vec<String> = item
+                    .links
+                    .iter()
+                    .filter(|link| scope == Scope::Internal || link.has(Role::Client))
+                    .map(|link| schema.link_name(link))
+                    .collect();
+                let _ = write!(out, "message({}) {name}", links.join(", "));
                 fields(&mut out, &item.fields);
+            }
+            DefKind::Hub(item) => {
+                let _ = write!(out, "hub({}) {name}", schema.type_name(&item.key));
+                if scope == Scope::Internal {
+                    fields(&mut out, &item.fields);
+                }
             }
             DefKind::Union(item) => {
                 let _ = write!(out, "union {name} {{");
@@ -747,6 +865,74 @@ fn canonical(schema: &Schema) -> String {
     out
 }
 
+/// Which declarations the client fingerprint lists: every message with a
+/// client end, whatever they reach, and each hub kind they name, with what
+/// its key reaches. Hub kinds are listed by key and name.
+fn client_listed(schema: &Schema) -> Vec<bool> {
+    let mut listed = vec![false; schema.defs.len()];
+    let mut todo = Vec::new();
+    for (index, def) in schema.defs.iter().enumerate() {
+        let DefKind::Message(item) = &def.kind else {
+            continue;
+        };
+        let links: Vec<&Link> = item
+            .links
+            .iter()
+            .filter(|link| link.has(Role::Client))
+            .collect();
+        if links.is_empty() {
+            continue;
+        }
+        todo.push(TypeId(index));
+        for link in links {
+            todo.extend(link.from_kinds.iter().flatten().copied());
+            todo.extend(link.to_kind);
+        }
+    }
+    while let Some(id) = todo.pop() {
+        if listed[id.0] {
+            continue;
+        }
+        listed[id.0] = true;
+        let mut types: Vec<&Type> = Vec::new();
+        match &schema.def(id).kind {
+            DefKind::Hub(item) => types.push(&item.key),
+            DefKind::Enum(_) => {}
+            DefKind::Struct(item) => types.extend(item.fields.iter().map(|field| &field.ty)),
+            DefKind::Message(item) => types.extend(item.fields.iter().map(|field| &field.ty)),
+            DefKind::Type(item) => types.push(&item.target),
+            DefKind::Union(item) => {
+                for variant in &item.variants {
+                    match &variant.data {
+                        VariantData::Unit => {}
+                        VariantData::Type(ty) => types.push(ty),
+                        VariantData::Fields(fields) => {
+                            types.extend(fields.iter().map(|field| &field.ty));
+                        }
+                    }
+                }
+            }
+        }
+        for ty in types {
+            named(ty, &mut todo);
+        }
+    }
+    listed
+}
+
+/// The declarations `ty` names, through collections.
+fn named(ty: &Type, out: &mut Vec<TypeId>) {
+    match &ty.kind {
+        TypeKind::Array(item, _) | TypeKind::Vec(item) | TypeKind::Set(item) => named(item, out),
+        TypeKind::Map(key, value) => {
+            named(key, out);
+            named(value, out);
+        }
+        TypeKind::Named(id) => out.push(*id),
+        _ => {}
+    }
+}
+
 /// 64-bit FNV-1a: tiny, stable, and enough to tell schemas apart. It is not
 /// collision-resistant against a deliberate attacker, and need not be.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -788,8 +974,9 @@ mod tests {
         match &schema.def(id).kind {
             DefKind::Struct(item) => &item.fields,
             DefKind::Message(item) => &item.fields,
+            DefKind::Hub(item) => &item.fields,
             DefKind::Enum(_) | DefKind::Union(_) | DefKind::Type(_) => {
-                panic!("only structs and messages have fields")
+                panic!("only structs, messages, and hub kinds have fields")
             }
         }
     }
@@ -839,7 +1026,7 @@ mod tests {
             ("i8[min=-128, max=127]", Int::Native(Width::U8)),
         ];
         for (ty, expected) in cases {
-            let (schema, _, m) = message(&format!("message[in] M {{ x: {ty} }}"));
+            let (schema, _, m) = message(&format!("message(client -> sim) M {{ x: {ty} }}"));
             assert_eq!(Int::of(field(&schema, m, "x")), Some(expected), "{ty}");
         }
     }
@@ -848,7 +1035,7 @@ mod tests {
     fn scalars_have_fixed_sizes() {
         let (schema, wire, m) = message(concat!(
             "enum E: u16 { A }\n",
-            "message[in] M { a: f32, b: timestamp, c: duration, d: entity, e: uentity, ",
+            "message(client -> sim) M { a: f32, b: timestamp, c: duration, d: entity, e: uentity, ",
             "f: uuid, g: E, h: string[min_length=3, max_length=3], i: array<u16, 3>, ",
             "j: bytes[max_length=4] }",
         ));
@@ -940,7 +1127,7 @@ mod tests {
 
     #[test]
     fn unbounded_objects_take_wide_boundaries() {
-        let (_, wire, m) = message("message[in] M { a: string, b: string, c: string }");
+        let (_, wire, m) = message("message(client -> sim) M { a: string, b: string, c: string }");
         let layout = wire.layout(m);
         assert_eq!(layout.boundary, Width::U16);
         assert_eq!(
@@ -954,7 +1141,7 @@ mod tests {
     fn optional_fields_take_presence_bits() {
         let (_, wire, m) = message(concat!(
             "struct P { x: f32 }\n",
-            "message[in] M { flag: bool, o: option<bool>, p: option<P>, s: option<string>, ",
+            "message(client -> sim) M { flag: bool, o: option<bool>, p: option<P>, s: option<string>, ",
             "n: u8, q: option<u16> }",
         ));
         let layout = wire.layout(m);
@@ -994,7 +1181,7 @@ mod tests {
         let (schema, wire) = compiled(&[concat!(
             "namespace a\n",
             "struct Named { id: u32, name: string[max_length=8] }\n",
-            "message[out] M { all: vec<Named>[max_length=4] }\n",
+            "message(sim -> client) M { all: vec<Named>[max_length=4] }\n",
         )]);
         let named = wire.layout(id(&schema, "Named"));
         assert_eq!(
@@ -1026,7 +1213,7 @@ mod tests {
         let (schema, wire, m) = message(concat!(
             "struct P { x: f32, y: f32 }\n",
             "struct Empty {}\n",
-            "message[in] M { ps: vec<P>, flags: vec<bool>, empties: vec<Empty>[max_length=9], ",
+            "message(client -> sim) M { ps: vec<P>, flags: vec<bool>, empties: vec<Empty>[max_length=9], ",
             "set: set<u16>, fixed: map<u8, P>, var: map<u8, string[max_length=3]> }",
         ));
         let sequence = |name| wire.sequence(field(&schema, m, name)).unwrap();
@@ -1060,7 +1247,7 @@ mod tests {
             "}\n",
             "union Units { A, B }\n",
             "union Open { A(u8), B(string) }\n",
-            "message[in] M { u: U, o: option<U>, v: vec<U>[max_length=2] }\n",
+            "message(client -> sim) M { u: U, o: option<U>, v: vec<U>[max_length=2] }\n",
         )]);
         let u = wire.union(id(&schema, "U"));
         assert_eq!(u.tag, Width::U8);
@@ -1146,7 +1333,7 @@ mod tests {
             "type Hue = E\n",
             "type Alias = Level\n",
             "type Flag = bool\n",
-            "message[in] M { level: Level, big: Big, id: Id, hue: Hue, alias: Alias, ",
+            "message(client -> sim) M { level: Level, big: Big, id: Id, hue: Hue, alias: Alias, ",
             "ids: vec<Id>, keyed: map<Big, P>, grid: array<Level, 3> }",
         ));
         let target = |name: &str| {
@@ -1235,7 +1422,7 @@ mod tests {
             "union Op { Add { id: PartyId, note: option<string> }, Remove(u8[max=9]), Clear }\n",
         )]);
         assert_eq!(
-            canonical(&schema),
+            canonical(&schema, Scope::Internal),
             concat!(
                 "union a.Op { Add { id: a.PartyId, note: option<string>, }, Remove(u8[max=9]), Clear, }\n",
                 "type a.PartyId = u64\n",
@@ -1255,7 +1442,7 @@ mod tests {
             "const Z: duration = 0h\n",
         )]);
         assert_eq!(
-            canonical(&schema),
+            canonical(&schema, Scope::Internal),
             concat!(
                 "const a.D: duration = 1s\n",
                 "const a.L: duration = 90m\n",
@@ -1272,7 +1459,8 @@ mod tests {
         let fingerprint = |src: &str| {
             compiled(&[&format!("namespace a\n{src}\n")])
                 .1
-                .fingerprint()
+                .fingerprints()
+                .internal
         };
         let base = fingerprint(concat!(
             "type Id = u32\n",
@@ -1308,39 +1496,233 @@ mod tests {
     }
 
     #[test]
-    fn messages_take_dense_ids_per_direction() {
+    fn messages_take_dense_ids_per_role_pair() {
         let (schema, wire) = compiled(&[concat!(
             "namespace a\n",
-            "message[in] C {}\n",
-            "message[bi] B {}\n",
-            "message[out] D {}\n",
-            "message[in] A {}\n",
+            "hub(u64) P {}\n",
+            "message(client -> sim) C {}\n",
+            "message(client <-> sim) B {}\n",
+            "message(sim | hub -> client) D {}\n",
+            "message(client -> sim | hub<P>) A {}\n",
+            "message(sim <-> sim) E {}\n",
         )]);
-        let names = |ids: &[TypeId]| -> Vec<String> {
-            ids.iter().map(|id| schema.qualified(*id)).collect()
+        let spaces: Vec<(Role, Role, Vec<String>)> = wire
+            .spaces()
+            .iter()
+            .map(|space| {
+                let names = space.messages.iter().map(|id| schema.qualified(*id));
+                (space.from, space.to, names.collect())
+            })
+            .collect();
+        assert_eq!(
+            spaces,
+            [
+                (
+                    Role::Client,
+                    Role::Sim,
+                    vec!["a.A".into(), "a.B".into(), "a.C".into()]
+                ),
+                (Role::Client, Role::Hub, vec!["a.A".into()]),
+                (Role::Sim, Role::Client, vec!["a.B".into(), "a.D".into()]),
+                (Role::Sim, Role::Sim, vec!["a.E".into()]),
+                (Role::Hub, Role::Client, vec!["a.D".into()]),
+            ]
+        );
+        let b = id(&schema, "B");
+        assert_eq!(wire.ids(b), [2, 1], "in link order");
+        assert_eq!(wire.message_id(b, Role::Client, Role::Sim), Some(2));
+        assert_eq!(wire.message_id(b, Role::Sim, Role::Client), Some(1));
+        assert_eq!(wire.message_id(b, Role::Hub, Role::Client), None);
+        assert_eq!(wire.ids(id(&schema, "A")), [1, 1], "no message is 0");
+        assert_eq!(wire.ids(id(&schema, "E")), [1], "`sim <-> sim` is one pair");
+        assert!(wire.space(Role::Entry, Role::Client).is_empty());
+        assert!(wire.ids(id(&schema, "P")).is_empty());
+    }
+
+    #[test]
+    fn canonical_text_normalizes_links() {
+        let canonical_of = |src: &str| {
+            let (schema, _) = compiled(&[&format!(
+                "namespace a\nhub(u64) Party {{}}\nhub(u32) Guild {{}}\n{src}\n"
+            )]);
+            let text = canonical(&schema, Scope::Internal);
+            let line = text.lines().find(|line| line.starts_with("message"));
+            line.unwrap().to_string()
         };
-        assert_eq!(names(wire.inbound()), ["a.A", "a.B", "a.C"]);
-        assert_eq!(names(wire.outbound()), ["a.B", "a.D"]);
         assert_eq!(
-            wire.ids(id(&schema, "B")),
-            Ids {
-                inbound: Some(2),
-                outbound: Some(1),
-            }
+            canonical_of("message(hub<Party> | hub<Guild> -> client) M {}"),
+            "message(hub<a.Guild> | hub<a.Party> -> client) a.M { }",
+            "sending kinds are sorted by qualified name"
         );
         assert_eq!(
-            wire.ids(id(&schema, "A")).inbound,
-            Some(1),
-            "no message is 0"
+            canonical_of("message(client <-> hub<Party>) M {}"),
+            "message(client -> hub<a.Party>, hub<a.Party> -> client) a.M { }"
         );
-        assert_eq!(wire.ids(id(&schema, "D")).inbound, None);
+        assert_eq!(
+            canonical_of("message(hub<Party> <-> client) M {}"),
+            canonical_of("message(client <-> hub<Party>) M {}")
+        );
+        assert_eq!(
+            canonical_of("message(hub | sim -> entry | client) M {}"),
+            "message(sim -> client, sim -> entry, hub -> client, hub -> entry) a.M { }"
+        );
+        assert_eq!(
+            canonical_of("message(sim <-> sim) M {}"),
+            "message(sim -> sim) a.M { }"
+        );
+    }
+
+    #[test]
+    fn the_client_fingerprint_lists_what_clients_see() {
+        let (schema, _) = compiled(&[concat!(
+            "namespace a\n",
+            "type PartyId = u64\n",
+            "type Exp = u32\n",
+            "struct Seen { e: E }\n",
+            "struct Unseen { x: u8 }\n",
+            "enum E { A }\n",
+            "hub(PartyId) Party { members: vec<u64> }\n",
+            "hub(u32) Guild { name: string }\n",
+            "hub(u16) Bank { gold: u64 }\n",
+            "message(client -> hub<Party> | sim) Join { seen: Seen }\n",
+            "message(hub<Guild> -> client | sim) Notice {}\n",
+            "message(sim -> hub<Bank>) Deposit { exp: Exp }\n",
+            "const C: u8 = 1\n",
+        )]);
+        // Kinds by header only, and only the links with a client end.
+        assert_eq!(
+            canonical(&schema, Scope::Client),
+            concat!(
+                "enum a.E: u32 { A = 0, }\n",
+                "hub(u32) a.Guild\n",
+                "message(client -> sim, client -> hub<a.Party>) a.Join { seen: a.Seen, }\n",
+                "message(hub<a.Guild> -> client) a.Notice { }\n",
+                "hub(a.PartyId) a.Party\n",
+                "type a.PartyId = u64\n",
+                "struct a.Seen { e: a.E, }\n",
+                "const a.C: u8 = 1\n",
+            )
+        );
+    }
+
+    #[test]
+    fn server_links_leave_the_client_fingerprint_alone() {
+        let fingerprints = |src: &str| {
+            compiled(&[&format!(
+                "namespace a\nhub(u64) P {{ x: u8 }}\nmessage(client -> sim) M {{}}\n{src}\n"
+            )])
+            .1
+            .fingerprints()
+        };
+        let base = fingerprints("message(sim -> hub<P>) N { x: u8 }");
+        for changed in [
+            "message(sim -> hub<P>) N { x: u16 }",
+            "message(sim -> sim) N { x: u8 }",
+            "message(hub -> sim) N { x: u8 }",
+            "hub(u8) Q {}\nmessage(sim -> hub<P>) N { x: u8 }",
+        ] {
+            let fingerprints = fingerprints(changed);
+            assert_eq!(base.client, fingerprints.client, "{changed}");
+            assert_ne!(base.internal, fingerprints.internal, "{changed}");
+        }
+        for changed in [
+            "message(client -> sim) N { x: u8 }",
+            "message(sim -> client) N { x: u8 }",
+            "message(sim | client -> hub<P>) N { x: u8 }",
+            "const C: u8 = 1\nmessage(sim -> hub<P>) N { x: u8 }",
+        ] {
+            assert_ne!(base.client, fingerprints(changed).client, "{changed}");
+        }
+        // A kind's body is never in the client fingerprint, its key is.
+        let with_kind = |kind: &str| {
+            compiled(&[&format!(
+                "namespace a\n{kind}\nmessage(client -> hub<P>) M {{}}\n"
+            )])
+            .1
+            .fingerprints()
+        };
+        let base = with_kind("hub(u64) P { x: u8 }");
+        assert_eq!(base.client, with_kind("hub(u64) P { y: u16 }").client);
+        assert_ne!(base.internal, with_kind("hub(u64) P { y: u16 }").internal);
+        assert_ne!(base.client, with_kind("hub(u32) P { x: u8 }").client);
+    }
+
+    #[test]
+    fn hub_kinds_lay_out_as_structs() {
+        let (schema, wire) = compiled(&[concat!(
+            "namespace a\n",
+            "struct S { a: bool, x: u16, name: string[max_length=8], hp: option<u32> }\n",
+            "hub(u64) H { a: bool, x: u16, name: string[max_length=8], hp: option<u32> }\n",
+        )]);
+        assert_eq!(wire.layout(id(&schema, "H")), wire.layout(id(&schema, "S")));
+    }
+
+    #[test]
+    fn hub_kinds_take_dense_ids_by_qualified_name() {
+        let (schema, wire) = compiled(&[
+            "namespace b\nhub(u64) Guild {}\nhub(u32) Bank {}\n",
+            "namespace a\nhub(u64) Party {}\nstruct S {}\n",
+        ]);
+        let names: Vec<String> = wire.hubs().iter().map(|id| schema.qualified(*id)).collect();
+        assert_eq!(names, ["a.Party", "b.Bank", "b.Guild"]);
+        assert_eq!(wire.hub_id(id(&schema, "Party")), Some(1), "no kind is 0");
+        assert_eq!(wire.hub_id(id(&schema, "Bank")), Some(2));
+        assert_eq!(wire.hub_id(id(&schema, "Guild")), Some(3));
+        assert_eq!(wire.hub_id(id(&schema, "S")), None);
+
+        let (_, wire) = compiled(&["namespace a\nstruct S {}\n"]);
+        assert!(wire.hubs().is_empty());
+    }
+
+    #[test]
+    fn canonical_text_spells_out_hub_kinds() {
+        let (schema, _) = compiled(&[concat!(
+            "namespace a\n",
+            "type GuildId = u64\n",
+            "hub(GuildId) Guild { enum Rank { A } name: string[max_length=24], rank: option<Rank> }\n",
+            "hub(u32[max=9]) Plot {}\n",
+        )]);
+        assert_eq!(
+            canonical(&schema, Scope::Internal),
+            concat!(
+                "hub(a.GuildId) a.Guild { name: string[max_length=24], rank: option<a.Guild.Rank>, }\n",
+                "enum a.Guild.Rank: u32 { A = 0, }\n",
+                "type a.GuildId = u64\n",
+                "hub(u32[max=9]) a.Plot { }\n",
+            )
+        );
+    }
+
+    #[test]
+    fn fingerprints_cover_hub_kinds() {
+        let fingerprint = |src: &str| {
+            compiled(&[&format!("namespace a\n{src}\n")])
+                .1
+                .fingerprints()
+                .internal
+        };
+        let base = fingerprint("type Id = u64\nhub(Id) G { x: u8 }");
+        assert_eq!(base, fingerprint("hub(Id) G { x: u8, }\ntype Id = u64"));
+        for changed in [
+            // The key, by name and by type.
+            "type Id = u64\nhub(u64) G { x: u8 }",
+            "type Id = u32\nhub(Id) G { x: u8 }",
+            "type Key = u64\nhub(Key) G { x: u8 }",
+            // The kind's name and fields.
+            "type Id = u64\nhub(Id) H { x: u8 }",
+            "type Id = u64\nhub(Id) G { y: u8 }",
+            // A struct is not a kind.
+            "type Id = u64\nstruct G { x: u8 }",
+        ] {
+            assert_ne!(base, fingerprint(changed), "{changed}");
+        }
     }
 
     #[test]
     fn fingerprints_ignore_source_order() {
         let (_, forward) = compiled(&[EXAMPLE1, EXAMPLE2]);
         let (_, backward) = compiled(&[EXAMPLE2, EXAMPLE1]);
-        assert_eq!(forward.fingerprint(), backward.fingerprint());
+        assert_eq!(forward.fingerprints(), backward.fingerprints());
     }
 
     #[test]
@@ -1348,20 +1730,24 @@ mod tests {
         let fingerprint = |src: &str| {
             compiled(&[&format!("namespace a\n{src}\n")])
                 .1
-                .fingerprint()
+                .fingerprints()
+                .internal
         };
-        let base = fingerprint("message[in] M { x: u8, y: u16 }");
-        assert_eq!(base, fingerprint("message[in] M { x: u8, y: u16 }"));
+        let base = fingerprint("message(client -> sim) M { x: u8, y: u16 }");
+        assert_eq!(
+            base,
+            fingerprint("message(client -> sim) M { x: u8, y: u16 }")
+        );
         for changed in [
-            "message[in] M { x: u8, z: u16 }",
-            "message[in] N { x: u8, y: u16 }",
-            "message[in] M { y: u16, x: u8 }",
-            "message[out] M { x: u8, y: u16 }",
-            "message[in] M { x: u8[max=9], y: u16 }",
-            "message[in] M { x: option<u8>, y: u16 }",
-            "message[in] M { x: u8, y: u16 }\nenum E { A }",
-            "message[in] M { x: u8, y: u16 }\nconst C: u8 = 1",
-            "message[in] M { const C: u8 = 1 x: u8, y: u16 }",
+            "message(client -> sim) M { x: u8, z: u16 }",
+            "message(client -> sim) N { x: u8, y: u16 }",
+            "message(client -> sim) M { y: u16, x: u8 }",
+            "message(sim -> client) M { x: u8, y: u16 }",
+            "message(client -> sim) M { x: u8[max=9], y: u16 }",
+            "message(client -> sim) M { x: option<u8>, y: u16 }",
+            "message(client -> sim) M { x: u8, y: u16 }\nenum E { A }",
+            "message(client -> sim) M { x: u8, y: u16 }\nconst C: u8 = 1",
+            "message(client -> sim) M { const C: u8 = 1 x: u8, y: u16 }",
         ] {
             assert_ne!(base, fingerprint(changed), "{changed}");
         }
@@ -1372,7 +1758,8 @@ mod tests {
         let fingerprint = |src: &str| {
             compiled(&[&format!("namespace a\n{src}\n")])
                 .1
-                .fingerprint()
+                .fingerprints()
+                .internal
         };
         let base = fingerprint("const C: u8 = 1\nconst S: string = \"a\"");
         for changed in [
