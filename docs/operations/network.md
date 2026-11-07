@@ -91,7 +91,7 @@ thread `N` uses `base + N`:
 | shard | sim and hub shards | listen | edges, sim shards, hub shards, entry |
 | upstream | sim and hub shards, edges | local port of outbound sessions | sim and hub shards |
 
-Ports are registered in atlas's directory with their (node, thread). The
+Ports are registered in director's directory with their (node, thread). The
 examples below use `9000` as the upstream base. Whether an edge has an
 upstream port per thread or one per node depends on how its threads split
 the work, which is not settled (see

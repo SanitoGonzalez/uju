@@ -1614,7 +1614,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "uju-atlas"
+name = "uju-director"
 version = "0.1.0"
 dependencies = [
  "anyhow",

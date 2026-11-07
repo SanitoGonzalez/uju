@@ -1,5 +1,5 @@
 [package]
-name = "uju-atlas"
+name = "uju-director"
 version.workspace = true
 edition.workspace = true
 
