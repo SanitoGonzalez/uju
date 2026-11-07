@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn a_namespace_named_like_the_root_does_not_collide() {
-        let files = generated(&["namespace schema;\nstruct S {}\n"]);
+        let files = generated(&["namespace schema\nstruct S {}\n"]);
         assert_eq!(files[0].path.to_str(), Some("schema.json"));
         assert_eq!(files[1].path.to_str(), Some("namespaces/schema.json"));
     }
@@ -633,13 +633,13 @@ mod tests {
     #[test]
     fn consts_carry_their_type_and_value() {
         let files = generated(&[concat!(
-            "namespace a;\n",
-            "const Count: u64 = 18446744073709551615;\n",
-            "const Low: i8 = -128;\n",
-            "const Whole: f32 = 2;\n",
-            "const On: bool = true;\n",
-            "const Text: string = \"say \\\"hi\\\"\\n\";\n",
-            "message[in] M { const Inner: u16 = 7; }\n",
+            "namespace a\n",
+            "const Count: u64 = 18446744073709551615\n",
+            "const Low: i8 = -128\n",
+            "const Whole: f32 = 2\n",
+            "const On: bool = true\n",
+            "const Text: string = \"say \\\"hi\\\"\\n\"\n",
+            "message[in] M { const Inner: u16 = 7 }\n",
         )]);
         let namespace = file(&files, "namespaces/a.json");
         assert_eq!(
@@ -666,7 +666,7 @@ mod tests {
     #[test]
     fn messages_carry_their_direction_and_ids() {
         let sources = [concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "message[in] A {}\n",
             "message[out] B {}\n",
             "message[bi] C {}\n",
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn struct_fields_are_flagged_optional_too() {
         let def = def(
-            &["namespace a;\nstruct S { o: option<string>, v: u8 }\n"],
+            &["namespace a\nstruct S { o: option<string>, v: u8 }\n"],
             "a.S",
         );
         assert_eq!(field(&def, "o")["optional"], true);
@@ -704,7 +704,7 @@ mod tests {
     fn objects_carry_their_layout_and_slots() {
         let def = def(
             &[concat!(
-                "namespace a;\n",
+                "namespace a\n",
                 "struct S {\n",
                 "    flag: bool,\n",
                 "    maybe: option<bool>,\n",
@@ -749,7 +749,7 @@ mod tests {
     fn types_are_trees_with_qualified_names() {
         let def = def(
             &[concat!(
-                "namespace foo.bar;\n",
+                "namespace foo.bar\n",
                 "struct Position { x: f32 }\n",
                 "message[in] M { m: map<u8, vec<Position>>, a: array<i32, 4> }\n",
             )],
@@ -773,7 +773,7 @@ mod tests {
     fn constraints_hold_only_what_is_set() {
         let def = def(
             &[concat!(
-                "namespace a;\n",
+                "namespace a\n",
                 "message[in] M {\n",
                 "    v: vec<string[max_length=14]>[max_length=10, min_length=1],\n",
                 "    f: f64[nan, infinite, max=1],\n",
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn integers_carry_their_encoding() {
         let def = def(
-            &["namespace a;\nstruct S { n: i32, b: i32[min=-100, max=100] }\n"],
+            &["namespace a\nstruct S { n: i32, b: i32[min=-100, max=100] }\n"],
             "a.S",
         );
         assert_eq!(
@@ -813,7 +813,7 @@ mod tests {
     fn collections_carry_their_sequence() {
         let def = def(
             &[concat!(
-                "namespace a;\n",
+                "namespace a\n",
                 "struct E {}\n",
                 "struct S {\n",
                 "    packed: vec<u32>,\n",
@@ -840,8 +840,8 @@ mod tests {
     fn unions_carry_their_tag_and_variants() {
         let def = def(
             &[concat!(
-                "namespace a;\n",
-                "type Flag = bool;\n",
+                "namespace a\n",
+                "type Flag = bool\n",
                 "union Op { Add { slot: u8, hot: Flag }, Remove(u8[max=9]), Clear }\n",
             )],
             "a.Op",
@@ -901,7 +901,7 @@ mod tests {
         let variants: Vec<String> = (0..256).map(|index| format!("V{index}")).collect();
         let def = def(
             &[&format!(
-                "namespace a;\nunion U {{ {} }}\n",
+                "namespace a\nunion U {{ {} }}\n",
                 variants.join(", ")
             )],
             "a.U",
@@ -914,11 +914,11 @@ mod tests {
     #[test]
     fn types_carry_their_target() {
         let sources = [concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "enum E: u16 { A }\n",
-            "type Level = i32[min=-100, max=100];\n",
-            "type Hue = E;\n",
-            "type Rank = Level;\n",
+            "type Level = i32[min=-100, max=100]\n",
+            "type Hue = E\n",
+            "type Rank = Level\n",
             "struct S { level: Level }\n",
         )];
         let level = def(&sources, "a.Level");
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn empty_containers_stay_on_one_line() {
-        let files = generated(&["namespace a;\nstruct S {}\n"]);
+        let files = generated(&["namespace a\nstruct S {}\n"]);
         assert!(
             files[1].contents.contains(r#""fields": []"#)
                 && files[1].contents.contains(r#""consts": []"#),

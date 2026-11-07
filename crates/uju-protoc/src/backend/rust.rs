@@ -1,5 +1,5 @@
 //! Emits Rust (`ujuc protocol rust`) against the `uju::net::wire` runtime: a module
-//! file per namespace, so `namespace game.core;` lands in `game/core/mod.rs`
+//! file per namespace, so `namespace game.core` lands in `game/core/mod.rs`
 //! under a root `mod.rs`. A namespace's file changes only with what it
 //! declares, or with what it uses from others; message ids, the fingerprint,
 //! and the dispatch enums, which change with any message, live in the root.

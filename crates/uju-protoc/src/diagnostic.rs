@@ -74,8 +74,8 @@ mod tests {
 
     #[test]
     fn renders_with_line_and_column() {
-        let src = "namespace a;\nstruct S {}\n";
-        let diagnostic = Diagnostic::new(SourceId(0), 13..19, "boom");
+        let src = "namespace a\nstruct S {}\n";
+        let diagnostic = Diagnostic::new(SourceId(0), 12..18, "boom");
         assert_eq!(diagnostic.render("x.uju", src), "x.uju:2:1: boom");
 
         let first = Diagnostic::new(SourceId(0), 10..11, "boom");

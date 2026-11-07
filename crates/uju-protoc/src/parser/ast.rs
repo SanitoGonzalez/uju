@@ -27,8 +27,34 @@ pub enum Item<'src> {
     Type(TypeDecl<'src>),
 }
 
+/// `@name` or `@name(args)`, written above a declaration. Each declaration
+/// struct holds its own in `attrs`, in source order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attribute<'src> {
+    pub name: Ident<'src>,
+    /// Empty for a bare `@name`; `@name()` is a syntax error.
+    pub args: Vec<AttributeArg<'src>>,
+    /// From the `@` to the closing parenthesis, if any.
+    pub span: Span,
+}
+
+/// An attribute's argument, as written.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeArg<'src> {
+    Literal(Spanned<Literal>),
+    /// `Faction` or `a.b.C`.
+    Path(Path<'src>),
+    /// `ops(InventoryOp)`. `args` is never empty.
+    Call {
+        path: Path<'src>,
+        args: Vec<AttributeArg<'src>>,
+        span: Span,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Enum<'src> {
+    pub attrs: Vec<Attribute<'src>>,
     pub name: Ident<'src>,
     /// `None` when the underlying type is left to default to `u32`.
     pub repr: Option<Spanned<Prim>>,
@@ -43,12 +69,14 @@ pub struct Variant<'src> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Struct<'src> {
+    pub attrs: Vec<Attribute<'src>>,
     pub name: Ident<'src>,
     pub body: Body<'src>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message<'src> {
+    pub attrs: Vec<Attribute<'src>>,
     pub direction: Spanned<Direction>,
     pub name: Ident<'src>,
     pub body: Body<'src>,
@@ -58,6 +86,7 @@ pub struct Message<'src> {
 /// carry data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Union<'src> {
+    pub attrs: Vec<Attribute<'src>>,
     pub name: Ident<'src>,
     pub variants: Vec<UnionVariant<'src>>,
 }
@@ -83,16 +112,18 @@ pub enum VariantData<'src> {
     },
 }
 
-/// `type Name = Target;`: a named type, laid out as its target.
+/// `type Name = Target`: a named type, laid out as its target.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeDecl<'src> {
+    pub attrs: Vec<Attribute<'src>>,
     pub name: Ident<'src>,
     pub target: Type<'src>,
 }
 
-/// `const Name: Type = value;`, at the top level or in a struct or message.
+/// `const Name: Type = value`, at the top level or in a struct or message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Const<'src> {
+    pub attrs: Vec<Attribute<'src>>,
     pub name: Ident<'src>,
     pub ty: Type<'src>,
     pub value: Spanned<Literal>,
@@ -209,6 +240,28 @@ impl<'src> Item<'src> {
         }
     }
 
+    pub fn attrs(&self) -> &[Attribute<'src>] {
+        match self {
+            Item::Enum(item) => &item.attrs,
+            Item::Struct(item) => &item.attrs,
+            Item::Message(item) => &item.attrs,
+            Item::Const(item) => &item.attrs,
+            Item::Union(item) => &item.attrs,
+            Item::Type(item) => &item.attrs,
+        }
+    }
+
+    pub fn attrs_mut(&mut self) -> &mut Vec<Attribute<'src>> {
+        match self {
+            Item::Enum(item) => &mut item.attrs,
+            Item::Struct(item) => &mut item.attrs,
+            Item::Message(item) => &mut item.attrs,
+            Item::Const(item) => &mut item.attrs,
+            Item::Union(item) => &mut item.attrs,
+            Item::Type(item) => &mut item.attrs,
+        }
+    }
+
     pub fn keyword(&self) -> &'static str {
         match self {
             Item::Enum(_) => "enum",
@@ -225,6 +278,16 @@ impl<'src> Item<'src> {
             Item::Struct(item) => Some(&item.body),
             Item::Message(item) => Some(&item.body),
             Item::Enum(_) | Item::Const(_) | Item::Union(_) | Item::Type(_) => None,
+        }
+    }
+}
+
+impl AttributeArg<'_> {
+    pub fn span(&self) -> &Span {
+        match self {
+            AttributeArg::Literal((_, span)) => span,
+            AttributeArg::Path(path) => &path.span,
+            AttributeArg::Call { span, .. } => span,
         }
     }
 }
@@ -342,6 +405,41 @@ impl fmt::Display for Type<'_> {
         }
         Ok(())
     }
+}
+
+impl fmt::Display for Attribute<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "@{}", self.name.0)?;
+        write_args(f, &self.args)
+    }
+}
+
+impl fmt::Display for AttributeArg<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AttributeArg::Literal((literal, _)) => write!(f, "{literal}"),
+            AttributeArg::Path(path) => write!(f, "{path}"),
+            AttributeArg::Call { path, args, .. } => {
+                write!(f, "{path}")?;
+                write_args(f, args)
+            }
+        }
+    }
+}
+
+/// `(a, b)`, or nothing for no arguments.
+fn write_args(f: &mut fmt::Formatter<'_>, args: &[AttributeArg<'_>]) -> fmt::Result {
+    if args.is_empty() {
+        return Ok(());
+    }
+    f.write_str("(")?;
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{arg}")?;
+    }
+    f.write_str(")")
 }
 
 impl fmt::Display for Constraint<'_> {
@@ -519,6 +617,7 @@ mod tests {
     #[test]
     fn items_report_their_name_and_keyword() {
         let item = Item::Message(Message {
+            attrs: Vec::new(),
             direction: (Direction::In, 8..10),
             name: ("MyRequest", 12..21),
             body: Body::default(),
@@ -528,6 +627,7 @@ mod tests {
         assert_eq!(item.body(), Some(&Body::default()));
 
         let item = Item::Enum(Enum {
+            attrs: Vec::new(),
             name: ("Color", 5..10),
             repr: None,
             variants: Vec::new(),
@@ -536,6 +636,7 @@ mod tests {
         assert_eq!(item.body(), None);
 
         let item = Item::Union(Union {
+            attrs: Vec::new(),
             name: ("Op", 6..8),
             variants: Vec::new(),
         });

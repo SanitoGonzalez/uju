@@ -348,7 +348,7 @@ with their variants and each variant's data in declaration order, `type`s
 with their target, each type spelled as in source, qualified, and with its
 constraints, and messages with their direction. A union is listed as
 `union a.U { A { x: u8, }, B(u8), C, }`, and a `type` as
-`type a.Level = u8[max=100];`. Consts follow, sorted the same way, with
+`type a.Level = u8[max=100]`. Consts follow, sorted the same way, with
 their type and value. They never go on the wire, but peers must agree on
 them too.
 

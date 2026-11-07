@@ -3,7 +3,7 @@ pub mod ast;
 use std::fmt;
 
 use chumsky::error::Rich;
-use chumsky::input::{Input, ValueInput};
+use chumsky::input::{Emitter, Input, ValueInput};
 use chumsky::primitive::{any, choice, end, just};
 use chumsky::recovery::{skip_then_retry_until, skip_until};
 use chumsky::recursive::recursive;
@@ -161,20 +161,67 @@ where
     .map_with(|value, e| (value, e.span()))
     .labelled("literal");
 
+    // An attribute's `(a, b)`, or a nested call's. Once the `(` is read the
+    // arguments must follow, rather than leaving a bare name before it.
+    let args = recursive(|args| {
+        let call = path
+            .clone()
+            .then(maybe_args(args))
+            .validate(|(path, args), e, emitter| match args {
+                None => AttributeArg::Path(path),
+                Some(args) => AttributeArg::Call {
+                    args: reject_empty(&path.to_string(), args, emitter),
+                    path,
+                    span: e.span(),
+                },
+            });
+        choice((literal.map(AttributeArg::Literal), call))
+            .labelled("argument")
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::ParenOpen), just(Token::ParenClose))
+            .map_with(|args, e| (args, e.span()))
+            .boxed()
+    });
+
+    let attribute = just(Token::At)
+        .ignore_then(ident.labelled("attribute name"))
+        .then(maybe_args(args))
+        .validate(|(name, args), e, emitter| Attribute {
+            args: args.map_or_else(Vec::new, |args| {
+                reject_empty(&format!("@{}", name.0), args, emitter)
+            }),
+            name,
+            span: e.span(),
+        })
+        .labelled("attribute")
+        .boxed();
+
     let const_item = just(Token::Const)
         .ignore_then(ident)
         .then_ignore(just(Token::Colon))
         .then(ty.clone())
         .then_ignore(just(Token::Equal))
         .then(literal)
-        .then_ignore(just(Token::Semicolon))
-        .map(|((name, ty), value)| Item::Const(Const { name, ty, value }));
+        .map(|((name, ty), value)| {
+            Item::Const(Const {
+                attrs: Vec::new(),
+                name,
+                ty,
+                value,
+            })
+        });
 
-    let field = ident
-        .then_ignore(just(Token::Colon))
-        .then(ty.clone())
-        .map(|(name, ty)| Field { name, ty })
-        .boxed();
+    let field = without_attrs(
+        attribute.clone(),
+        "fields",
+        ident
+            .then_ignore(just(Token::Colon))
+            .then(ty.clone())
+            .map(|(name, ty)| Field { name, ty }),
+    )
+    .boxed();
 
     // `type` and `union` are keywords only where a declaration starts, so
     // they stay usable as names, as in a field `type: u8`.
@@ -182,8 +229,13 @@ where
         .ignore_then(ident)
         .then_ignore(just(Token::Equal))
         .then(ty.clone())
-        .then_ignore(just(Token::Semicolon))
-        .map(|(name, target)| Item::Type(TypeDecl { name, target }));
+        .map(|(name, target)| {
+            Item::Type(TypeDecl {
+                attrs: Vec::new(),
+                name,
+                target,
+            })
+        });
 
     let variant_fields = field
         .clone()
@@ -198,12 +250,16 @@ where
     let variant_type = ty
         .delimited_by(just(Token::ParenOpen), just(Token::ParenClose))
         .map(VariantData::Type);
-    let union_variant = ident
-        .then(choice((variant_fields, variant_type)).or_not())
-        .map(|(name, data)| UnionVariant {
-            name,
-            data: data.unwrap_or(VariantData::Unit),
-        });
+    let union_variant = without_attrs(
+        attribute.clone(),
+        "union variants",
+        ident
+            .then(choice((variant_fields, variant_type)).or_not())
+            .map(|(name, data)| UnionVariant {
+                name,
+                data: data.unwrap_or(VariantData::Unit),
+            }),
+    );
 
     let union_item = just(Token::Ident("union"))
         .ignore_then(ident)
@@ -214,7 +270,13 @@ where
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::BraceOpen), just(Token::BraceClose)),
         )
-        .map(|(name, variants)| Item::Union(Union { name, variants }));
+        .map(|(name, variants)| {
+            Item::Union(Union {
+                attrs: Vec::new(),
+                name,
+                variants,
+            })
+        });
 
     let repr = just(Token::Colon)
         .ignore_then(
@@ -228,13 +290,17 @@ where
         )
         .or_not();
 
-    let variant = ident
-        .then(
-            just(Token::Equal)
-                .ignore_then(select! { Token::Int(value) = e => (value, e.span()) })
-                .or_not(),
-        )
-        .map(|(name, value)| Variant { name, value });
+    let variant = without_attrs(
+        attribute.clone(),
+        "enum variants",
+        ident
+            .then(
+                just(Token::Equal)
+                    .ignore_then(select! { Token::Int(value) = e => (value, e.span()) })
+                    .or_not(),
+            )
+            .map(|(name, value)| Variant { name, value }),
+    );
 
     let enum_item = just(Token::Enum)
         .ignore_then(ident)
@@ -248,6 +314,7 @@ where
         )
         .map(|((name, repr), variants)| {
             Item::Enum(Enum {
+                attrs: Vec::new(),
                 name,
                 repr,
                 variants,
@@ -255,27 +322,39 @@ where
         });
 
     let item = recursive(|item| {
+        // A field takes a comma, except the last one of a body. A field
+        // takes the attributes before it, rejecting them, so it is tried
+        // before them.
         let member = choice((
             item.map(Member::Item),
             field
                 .clone()
-                .then_ignore(just(Token::Comma))
+                .then_ignore(
+                    just(Token::Comma)
+                        .ignored()
+                        .or(just(Token::BraceClose).rewind().ignored()),
+                )
                 .map(Member::Field),
+            attribute.clone().map(Member::Attr),
         ));
 
-        // The last field of a body may leave off its trailing comma.
         let body = member
             .repeated()
             .collect::<Vec<_>>()
-            .then(field.or_not())
             .delimited_by(just(Token::BraceOpen), just(Token::BraceClose))
-            .map(|(members, last)| collect_body(members, last))
+            .validate(|members, _, emitter| collect_body(members, emitter))
             .boxed();
 
         let struct_item = just(Token::Struct)
             .ignore_then(ident)
             .then(body.clone())
-            .map(|(name, body)| Item::Struct(Struct { name, body }));
+            .map(|(name, body)| {
+                Item::Struct(Struct {
+                    attrs: Vec::new(),
+                    name,
+                    body,
+                })
+            });
 
         let direction = ident
             .try_map(|(name, span), _: Span| match Direction::from_name(name) {
@@ -293,6 +372,7 @@ where
             .then(body)
             .map(|((direction, name), body)| {
                 Item::Message(Message {
+                    attrs: Vec::new(),
                     direction,
                     name,
                     body,
@@ -311,21 +391,28 @@ where
         .boxed()
     });
 
-    let namespace = just(Token::Namespace)
-        .ignore_then(path.clone())
-        .then_ignore(just(Token::Semicolon));
+    let namespace = without_attrs(
+        attribute.clone(),
+        "`namespace`",
+        just(Token::Namespace).ignore_then(path.clone()),
+    );
 
-    let use_ = just(Token::Use)
-        .ignore_then(path)
-        .then_ignore(just(Token::Semicolon));
+    let use_ = without_attrs(
+        attribute.clone(),
+        "`use`",
+        just(Token::Use).ignore_then(path),
+    );
+
+    let items = choice((item.map(Member::Item), attribute.map(Member::Attr)))
+        .labelled("declaration")
+        .recover_with(skip_then_retry_until(any().ignored(), end()))
+        .repeated()
+        .collect::<Vec<_>>()
+        .validate(|members, _, emitter| collect_body(members, emitter).items);
 
     namespace
         .then(use_.repeated().collect::<Vec<_>>())
-        .then(
-            item.recover_with(skip_then_retry_until(any().ignored(), end()))
-                .repeated()
-                .collect::<Vec<_>>(),
-        )
+        .then(items)
         .then_ignore(end().recover_with(skip_until(any().ignored(), end(), || ())))
         .map(|((namespace, uses), items)| Schema {
             namespace,
@@ -334,20 +421,90 @@ where
         })
 }
 
+/// `inner`, rejecting any attributes written before it, which are not
+/// allowed on `what`.
+fn without_attrs<'tok, 'src: 'tok, I, O>(
+    attribute: impl Parser<'tok, I, Attribute<'src>, Extra<'tok, 'src>> + Clone,
+    what: &'static str,
+    inner: impl Parser<'tok, I, O, Extra<'tok, 'src>> + Clone,
+) -> impl Parser<'tok, I, O, Extra<'tok, 'src>> + Clone
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = Span>,
+{
+    attribute
+        .repeated()
+        .at_least(1)
+        .ignored()
+        .map_with(|(), e| e.span())
+        .or_not()
+        .then(inner)
+        .validate(move |(attrs, inner), _, emitter| {
+            if let Some(span) = attrs {
+                emitter.emit(Rich::custom(
+                    span,
+                    format!("attributes are not allowed on {what}"),
+                ));
+            }
+            inner
+        })
+}
+
+/// `args`, if a `(` comes next.
+fn maybe_args<'tok, 'src: 'tok, I, O>(
+    args: impl Parser<'tok, I, O, Extra<'tok, 'src>> + Clone,
+) -> impl Parser<'tok, I, Option<O>, Extra<'tok, 'src>> + Clone
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = Span>,
+{
+    choice((args.map(Some), just(Token::ParenOpen).not().map(|()| None)))
+}
+
+/// The arguments in `args`, reporting `()` after `name`.
+fn reject_empty<'tok, 'src, T>(
+    name: &str,
+    (args, span): Spanned<Vec<T>>,
+    emitter: &mut Emitter<Rich<'tok, Token<'src>, Span>>,
+) -> Vec<T> {
+    if args.is_empty() {
+        emitter.emit(Rich::custom(
+            span,
+            format!("empty parentheses; write `{name}` without them"),
+        ));
+    }
+    args
+}
+
+/// What a body, or the top level, is made of: attributes are parsed on
+/// their own and attached to the declaration after them.
 enum Member<'src> {
+    Attr(Attribute<'src>),
     Field(Field<'src>),
     Item(Item<'src>),
 }
 
-fn collect_body<'src>(members: Vec<Member<'src>>, last: Option<Field<'src>>) -> Body<'src> {
+fn collect_body<'tok, 'src>(
+    members: Vec<Member<'src>>,
+    emitter: &mut Emitter<Rich<'tok, Token<'src>, Span>>,
+) -> Body<'src> {
     let mut body = Body::default();
+    let mut attrs = Vec::new();
     for member in members {
         match member {
+            Member::Attr(attr) => attrs.push(attr),
+            // A field already rejected the attributes before it.
             Member::Field(field) => body.fields.push(field),
-            Member::Item(item) => body.items.push(item),
+            Member::Item(mut item) => {
+                *item.attrs_mut() = std::mem::take(&mut attrs);
+                body.items.push(item);
+            }
         }
     }
-    body.fields.extend(last);
+    if let (Some(first), Some(last)) = (attrs.first(), attrs.last()) {
+        emitter.emit(Rich::custom(
+            first.span.start..last.span.end,
+            "an attribute must go above a declaration",
+        ));
+    }
     body
 }
 
@@ -362,7 +519,7 @@ impl std::error::Error for ParseError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::lex;
+    use crate::lexer::{LexError, lex};
 
     fn schema_of(src: &str) -> Schema<'_> {
         let (tokens, lex_errors) = lex(src);
@@ -480,7 +637,7 @@ mod tests {
             .iter()
             .map(|name| format!("f_{name}: {name}, "))
             .collect();
-        let src = format!("namespace a;\nmessage[in] M {{ {body} }}\n");
+        let src = format!("namespace a\nmessage[in] M {{ {body} }}\n");
         let schema = schema_of(&src);
         assert_eq!(
             fields(item(&schema, "M")),
@@ -495,7 +652,7 @@ mod tests {
     #[test]
     fn containers_and_options_nest() {
         let src = concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "message[bi] M {\n",
             "    v: vec<i32>,\n",
             "    s: set<i32>,\n",
@@ -558,7 +715,7 @@ mod tests {
     #[test]
     fn constraints_bind_to_the_type_they_follow() {
         let src = concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "message[in] M {\n",
             "    foo: i32[min=-100, max=100],\n",
             "    f: f32[infinite, min=0.5,],\n",
@@ -596,11 +753,11 @@ mod tests {
     #[test]
     fn malformed_constraints_are_reported() {
         assert_eq!(
-            errors_of("namespace a;\nstruct S { x: i32[] }\n")[0].message,
+            errors_of("namespace a\nstruct S { x: i32[] }\n")[0].message,
             "found ']' expected constraint"
         );
         assert_eq!(
-            errors_of("namespace a;\nstruct S { x: i32[min=] }\n")[0].message,
+            errors_of("namespace a\nstruct S { x: i32[min=] }\n")[0].message,
             "found ']' expected number"
         );
     }
@@ -608,11 +765,11 @@ mod tests {
     #[test]
     fn a_direction_is_required() {
         assert_eq!(
-            errors_of("namespace a;\nmessage M {}\n")[0].message,
+            errors_of("namespace a\nmessage M {}\n")[0].message,
             "found 'M' expected '['"
         );
         assert_eq!(
-            errors_of("namespace a;\nmessage[up] M {}\n")[0].message,
+            errors_of("namespace a\nmessage[up] M {}\n")[0].message,
             "`up` is not a direction; expected `in`, `out`, or `bi`"
         );
     }
@@ -630,16 +787,16 @@ mod tests {
     #[test]
     fn consts_parse_at_the_top_and_in_bodies() {
         let src = concat!(
-            "namespace a;\n",
-            "const Count: u8 = 3;\n",
-            "const Rate: f32 = -0.5;\n",
-            "const On: bool = true;\n",
-            "const Off: bool = false;\n",
-            "const Greeting: string = \"hi\\n\";\n",
+            "namespace a\n",
+            "const Count: u8 = 3\n",
+            "const Rate: f32 = -0.5\n",
+            "const On: bool = true\n",
+            "const Off: bool = false\n",
+            "const Greeting: string = \"hi\\n\"\n",
             "message[in] M {\n",
-            "    const Inner: u16 = 7;\n",
+            "    const Inner: u16 = 7\n",
             "    x: u8,\n",
-            "    const Last: i8 = -1;\n",
+            "    const Last: i8 = -1\n",
             "}\n",
         );
         let schema = schema_of(src);
@@ -664,19 +821,19 @@ mod tests {
     #[test]
     fn malformed_consts_are_reported() {
         assert_eq!(
-            errors_of("namespace a;\nconst A: i32 = 1\n")[0].message,
-            "found end of input expected ';'"
+            errors_of("namespace a\nconst A: i32 =\nstruct S {}\n")[0].message,
+            "found 'struct' expected literal"
         );
         assert_eq!(
-            errors_of("namespace a;\nconst A: i32;\n")[0].message,
-            "found ';' expected '[', or '='"
+            errors_of("namespace a\nconst A: i32\n")[0].message,
+            "found end of input expected '[', or '='"
         );
         assert_eq!(
-            errors_of("namespace a;\nconst A: bool = yes;\n")[0].message,
+            errors_of("namespace a\nconst A: bool = yes\n")[0].message,
             "found 'yes' expected literal"
         );
         assert_eq!(
-            errors_of("namespace a;\nconst A = 1;\n")[0].message,
+            errors_of("namespace a\nconst A = 1\n")[0].message,
             "found '=' expected ':'"
         );
     }
@@ -684,9 +841,9 @@ mod tests {
     #[test]
     fn types_and_unions_parse() {
         let src = concat!(
-            "namespace a;\n",
-            "type PartyId = u64;\n",
-            "type Level = u8[max=100];\n",
+            "namespace a\n",
+            "type PartyId = u64\n",
+            "type Level = u8[max=100]\n",
             "union Op {\n",
             "    Add { item: u32, slot: u8 },\n",
             "    Remove(u8[max=9]),\n",
@@ -694,7 +851,7 @@ mod tests {
             "}\n",
             "union One { Only }\n",
             "message[in] M {\n",
-            "    type Inner = PartyId;\n",
+            "    type Inner = PartyId\n",
             "    union Nested { A(Inner), }\n",
             "    x: Inner,\n",
             "}\n",
@@ -756,11 +913,11 @@ mod tests {
     #[test]
     fn type_and_union_are_keywords_only_where_a_declaration_starts() {
         let src = concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "struct S { type: u8, union: u8 }\n",
             "message[in] M { type: u8, union: u8, }\n",
             "union U { A { type: u8, union: u8 } }\n",
-            "type type = u8;\n",
+            "type type = u8\n",
             "union union { union }\n",
         );
         let schema = schema_of(src);
@@ -777,7 +934,7 @@ mod tests {
     #[test]
     fn empty_braces_parse_as_a_variant_without_fields() {
         // Lowering rejects it, suggesting the bare name.
-        let src = "namespace a;\nunion U { Add {} }\n";
+        let src = "namespace a\nunion U { Add {} }\n";
         let schema = schema_of(src);
         let Item::Union(union) = item(&schema, "U") else {
             panic!("expected a union");
@@ -792,24 +949,321 @@ mod tests {
     #[test]
     fn malformed_types_and_unions_are_reported() {
         assert_eq!(
-            errors_of("namespace a;\ntype T u8;\n")[0].message,
+            errors_of("namespace a\ntype T u8\n")[0].message,
             "found 'u8' expected '='"
         );
         assert_eq!(
-            errors_of("namespace a;\ntype T = u8\n")[0].message,
-            "found end of input expected '[', or ';'"
+            errors_of("namespace a\ntype T =\nstruct S {}\n")[0].message,
+            "found 'struct' expected type"
         );
         assert_eq!(
-            errors_of("namespace a;\nunion U { A(u8, u8) }\n")[0].message,
+            errors_of("namespace a\nunion U { A(u8, u8) }\n")[0].message,
             "found ',' expected '[', or ')'"
         );
         assert_eq!(
-            errors_of("namespace a;\nunion U { A() }\n")[0].message,
+            errors_of("namespace a\nunion U { A() }\n")[0].message,
             "found ')' expected type"
         );
         assert_eq!(
-            errors_of("namespace a;\nunion U { A B }\n")[0].message,
+            errors_of("namespace a\nunion U { A B }\n")[0].message,
             "found 'B' expected '{', '(', ',', or '}'"
+        );
+    }
+
+    #[test]
+    fn declarations_take_no_terminator() {
+        let src = "namespace a use b type A = u8 type B = u16[max=9] const C: u8 = 1 struct S {}\n";
+        let schema = schema_of(src);
+        assert_eq!(schema.uses.len(), 1);
+        assert_eq!(
+            schema
+                .items
+                .iter()
+                .map(|item| item.name().0)
+                .collect::<Vec<_>>(),
+            ["A", "B", "C", "S"]
+        );
+
+        let src = "namespace a\nstruct S { type T = u8 const C: u8 = 1 x: T, type: u8 }\n";
+        let schema = schema_of(src);
+        let s = item(&schema, "S");
+        assert_eq!(fields(s), ["x: T", "type: u8"]);
+        assert_eq!(
+            s.body()
+                .unwrap()
+                .items
+                .iter()
+                .map(Item::keyword)
+                .collect::<Vec<_>>(),
+            ["type", "const"]
+        );
+    }
+
+    #[test]
+    fn a_semicolon_is_rejected() {
+        let src = "namespace a;\nconst C: u8 = 1;\nstruct S {};\n";
+        let (tokens, lex_errors) = lex(src);
+        assert_eq!(
+            lex_errors
+                .iter()
+                .map(|(error, span)| (*error, &src[span.clone()]))
+                .collect::<Vec<_>>(),
+            [(LexError::UnexpectedChar, ";"); 3]
+        );
+        // The lexer reports each `;` once; the parser never sees it.
+        let (schema, errors) = parse(src, &tokens);
+        assert_eq!(errors, []);
+        assert_eq!(schema.expect("a schema").items.len(), 2);
+    }
+
+    fn attrs<'src>(item: &Item<'src>) -> Vec<String> {
+        item.attrs().iter().map(Attribute::to_string).collect()
+    }
+
+    #[test]
+    fn attributes_attach_to_the_declaration_below() {
+        let src = concat!(
+            "namespace a\n",
+            "@visibility(Faction)\n",
+            "@halo(false)\n",
+            "@replicate(patch)\n",
+            "struct S {\n",
+            "    @replicate(ops(InventoryOp))\n",
+            "    struct Inner {}\n",
+            "    x: u8,\n",
+            "    @timeout_ms(1000)\n",
+            "    const C: u8 = 1\n",
+            "    y: u8,\n",
+            "}\n",
+            "@large\n",
+            "message[in] M {}\n",
+            "@lock(Inventory, Gold)\n",
+            "enum E { A }\n",
+            "@lock(Inventory, Gold,)\n",
+            "union U { A }\n",
+            "@t\n",
+            "type T = u8\n",
+            "@x\n",
+            "const K: u8 = 1\n",
+            "struct Plain {}\n",
+        );
+        let schema = schema_of(src);
+        let s = item(&schema, "S");
+        assert_eq!(
+            attrs(s),
+            ["@visibility(Faction)", "@halo(false)", "@replicate(patch)"]
+        );
+        assert_eq!(fields(s), ["x: u8", "y: u8"]);
+        let nested = &s.body().unwrap().items;
+        assert_eq!(attrs(&nested[0]), ["@replicate(ops(InventoryOp))"]);
+        assert_eq!(attrs(&nested[1]), ["@timeout_ms(1000)"]);
+        assert_eq!(attrs(item(&schema, "M")), ["@large"]);
+        assert_eq!(attrs(item(&schema, "E")), ["@lock(Inventory, Gold)"]);
+        assert_eq!(attrs(item(&schema, "U")), ["@lock(Inventory, Gold)"]);
+        assert_eq!(attrs(item(&schema, "T")), ["@t"]);
+        assert_eq!(attrs(item(&schema, "K")), ["@x"]);
+        assert!(item(&schema, "Plain").attrs().is_empty());
+
+        let attr = &item(&schema, "S").attrs()[0];
+        assert_eq!(&src[attr.span.clone()], "@visibility(Faction)");
+        assert_eq!(&src[attr.name.1.clone()], "visibility");
+        assert_eq!(&src[attr.args[0].span().clone()], "Faction");
+    }
+
+    #[test]
+    fn attribute_arguments_are_literals_paths_or_calls() {
+        let src =
+            "namespace a\n@a(-1, 2.5, \"s\", true, false, B, c.d.E, f(g(1), h.I,)) struct S {}\n";
+        let schema = schema_of(src);
+        let [attr] = item(&schema, "S").attrs() else {
+            panic!("expected one attribute");
+        };
+        assert_eq!(attr.name.0, "a");
+        let [
+            AttributeArg::Literal((Literal::Int(-1), _)),
+            AttributeArg::Literal((Literal::Float(2.5), _)),
+            AttributeArg::Literal((Literal::String(string), _)),
+            AttributeArg::Literal((Literal::Bool(true), _)),
+            AttributeArg::Literal((Literal::Bool(false), _)),
+            AttributeArg::Path(b),
+            AttributeArg::Path(e),
+            AttributeArg::Call { path, args, span },
+        ] = &attr.args[..]
+        else {
+            panic!("unexpected arguments: {:?}", attr.args);
+        };
+        assert_eq!(string, "s");
+        assert_eq!(b.to_string(), "B");
+        assert_eq!(e.to_string(), "c.d.E");
+        assert_eq!(path.to_string(), "f");
+        assert_eq!(&src[span.clone()], "f(g(1), h.I,)");
+        let [
+            AttributeArg::Call {
+                path: g, args: one, ..
+            },
+            AttributeArg::Path(i),
+        ] = &args[..]
+        else {
+            panic!("unexpected arguments: {args:?}");
+        };
+        assert_eq!(g.to_string(), "g");
+        assert!(matches!(
+            one[..],
+            [AttributeArg::Literal((Literal::Int(1), _))]
+        ));
+        assert_eq!(i.to_string(), "h.I");
+        assert_eq!(
+            attr.to_string(),
+            "@a(-1, 2.5, \"s\", true, false, B, c.d.E, f(g(1), h.I))"
+        );
+    }
+
+    #[test]
+    fn line_breaks_carry_no_meaning_around_attributes() {
+        let src =
+            "namespace a @a @b(1) struct S {} @c\n(\n2\n)\nstruct T { @d enum E { A } x: u8 }\n";
+        let schema = schema_of(src);
+        assert_eq!(attrs(item(&schema, "S")), ["@a", "@b(1)"]);
+        assert_eq!(attrs(item(&schema, "T")), ["@c(2)"]);
+        assert_eq!(attrs(&item(&schema, "T").body().unwrap().items[0]), ["@d"]);
+    }
+
+    #[test]
+    fn malformed_attributes_are_reported() {
+        let error = |src: &str| {
+            let errors = errors_of(src);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            (
+                src[errors[0].span.clone()].to_string(),
+                errors[0].message.clone(),
+            )
+        };
+        assert_eq!(
+            error("namespace a\n@\nstruct S {}\n"),
+            (
+                "struct".into(),
+                "found 'struct' expected attribute name".into()
+            )
+        );
+        assert_eq!(
+            error("namespace a\n@1 struct S {}\n"),
+            ("1".into(), "found '1' expected attribute name".into())
+        );
+        assert_eq!(
+            error("namespace a\n@a(\n"),
+            (
+                "".into(),
+                "found end of input expected argument, or ')'".into()
+            )
+        );
+        assert_eq!(
+            error("namespace a\nstruct S {}\n@a.b struct T {}\n"),
+            (".".into(), "found '.' expected '(', or declaration".into())
+        );
+        assert_eq!(
+            error("namespace a\n@a(1 2) struct S {}\n"),
+            ("2".into(), "found '2' expected ',', or ')'".into())
+        );
+        assert_eq!(
+            error("namespace a\n@a(,) struct S {}\n"),
+            (",".into(), "found ',' expected argument, or ')'".into())
+        );
+        assert_eq!(
+            error("namespace a\n@a() struct S {}\n"),
+            (
+                "()".into(),
+                "empty parentheses; write `@a` without them".into()
+            )
+        );
+        assert_eq!(
+            error("namespace a\n@a(ops()) struct S {}\n"),
+            (
+                "()".into(),
+                "empty parentheses; write `ops` without them".into()
+            )
+        );
+    }
+
+    #[test]
+    fn an_attribute_must_go_above_a_declaration() {
+        let error = |src: &str| {
+            let errors = errors_of(src);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            (
+                src[errors[0].span.clone()].to_string(),
+                errors[0].message.clone(),
+            )
+        };
+        let dangling = "an attribute must go above a declaration".to_string();
+        assert_eq!(error("namespace a\n@a"), ("@a".into(), dangling.clone()));
+        assert_eq!(
+            error("namespace a\nstruct S {}\n@a @b(1)\n"),
+            ("@a @b(1)".into(), dangling.clone())
+        );
+        assert_eq!(
+            error("namespace a\nstruct S { x: u8, @a }\n"),
+            ("@a".into(), dangling.clone())
+        );
+        assert_eq!(
+            error("namespace a\nstruct S { @a }\nstruct T {}\n"),
+            ("@a".into(), dangling)
+        );
+    }
+
+    #[test]
+    fn attributes_are_only_allowed_on_declarations() {
+        let error = |src: &str| {
+            let (tokens, _) = lex(src);
+            let (schema, errors) = parse(src, &tokens);
+            assert!(schema.is_some(), "parsing goes on");
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            (
+                src[errors[0].span.clone()].to_string(),
+                errors[0].message.clone(),
+            )
+        };
+        assert_eq!(
+            error("@a @b namespace a\n"),
+            (
+                "@a @b".into(),
+                "attributes are not allowed on `namespace`".into()
+            )
+        );
+        assert_eq!(
+            error("namespace a\n@a use b\nstruct S {}\n"),
+            ("@a".into(), "attributes are not allowed on `use`".into())
+        );
+        for body in ["{ @a x: u8, y: u8 }", "{ x: u8, @a y: u8 }"] {
+            assert_eq!(
+                error(&format!("namespace a\nstruct S {body}\n")),
+                ("@a".into(), "attributes are not allowed on fields".into())
+            );
+        }
+        assert_eq!(
+            error("namespace a\nunion U { A { @a x: u8 } }\n"),
+            ("@a".into(), "attributes are not allowed on fields".into())
+        );
+        assert_eq!(
+            error("namespace a\nenum E { A, @a(1) B }\n"),
+            (
+                "@a(1)".into(),
+                "attributes are not allowed on enum variants".into()
+            )
+        );
+        assert_eq!(
+            error("namespace a\nunion U { @a A(u8) }\n"),
+            (
+                "@a".into(),
+                "attributes are not allowed on union variants".into()
+            )
+        );
+    }
+
+    #[test]
+    fn stray_tokens_after_a_declaration_are_reported() {
+        assert_eq!(
+            errors_of("namespace a\nconst A: i32 = 1 x\nstruct S {}\n")[0].message,
+            "found 'x' expected declaration"
         );
     }
 
@@ -829,7 +1283,7 @@ mod tests {
 
     #[test]
     fn spans_point_back_at_the_source() {
-        let src = "namespace a;\nstruct S {\n    m: map<u32, vec<Position>>,\n}\n";
+        let src = "namespace a\nstruct S {\n    m: map<u32, vec<Position>>,\n}\n";
         let schema = schema_of(src);
         let field = &item(&schema, "S").body().expect("a body").fields[0];
 
@@ -845,11 +1299,11 @@ mod tests {
     #[test]
     fn a_trailing_comma_is_optional() {
         for body in ["{ a: i32, b: i32 }", "{ a: i32, b: i32, }"] {
-            let src = format!("namespace a;\nstruct S {body}\n");
+            let src = format!("namespace a\nstruct S {body}\n");
             assert_eq!(fields(item(&schema_of(&src), "S")), ["a: i32", "b: i32"]);
         }
         assert_eq!(
-            errors_of("namespace a;\nstruct S { a: i32 b: i32 }\n")[0].message,
+            errors_of("namespace a\nstruct S { a: i32 b: i32 }\n")[0].message,
             "found 'b' expected '[', ',', or '}'"
         );
     }
@@ -857,26 +1311,26 @@ mod tests {
     #[test]
     fn malformed_types_are_reported() {
         assert_eq!(
-            errors_of("namespace a;\nstruct S { v: vec }\n")[0].message,
+            errors_of("namespace a\nstruct S { v: vec }\n")[0].message,
             "found '}' expected '<'"
         );
         assert_eq!(
-            errors_of("namespace a;\nstruct S { o: option }\n")[0].message,
+            errors_of("namespace a\nstruct S { o: option }\n")[0].message,
             "found '}' expected '<'"
         );
         assert_eq!(
-            errors_of("namespace a;\nstruct S { v: array<i32, -1> }\n")[0].message,
+            errors_of("namespace a\nstruct S { v: array<i32, -1> }\n")[0].message,
             "`-1` is not a valid array length"
         );
         assert_eq!(
-            errors_of("namespace a;\nenum E: Color { A }\n")[0].message,
+            errors_of("namespace a\nenum E: Color { A }\n")[0].message,
             "`Color` is not a builtin type"
         );
     }
 
     #[test]
     fn parsing_resumes_at_the_next_declaration() {
-        let src = "namespace a;\nstruct Bad { x: }\nstruct Good { y: i32 }\n";
+        let src = "namespace a\nstruct Bad { x: }\nstruct Good { y: i32 }\n";
         let (tokens, _) = lex(src);
         let (schema, errors) = parse(src, &tokens);
 

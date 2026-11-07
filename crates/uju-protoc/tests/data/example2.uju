@@ -1,9 +1,9 @@
 // The shared test schema's second namespace; see example1.uju.
 
-namespace hello;
-// namespace; // empty namespace is legal
+namespace hello
+// namespace // empty namespace is legal
 
-use foo.bar;
+use foo.bar
 
 message[in] ExternalTypes {
     color: Color,

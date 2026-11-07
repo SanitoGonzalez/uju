@@ -95,6 +95,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
     }
 
     fn lower_def(&mut self, id: TypeId, site: &TypeSite<'a, 'src>) -> Def {
+        self.check_attrs(site.source, site.item.attrs());
         let kind = match site.item {
             ast::Item::Enum(item) => DefKind::Enum(self.lower_enum(site.source, item)),
             ast::Item::Struct(item) => DefKind::Struct(self.lower_struct(site.source, id, item)),
@@ -111,11 +112,26 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         }
     }
 
+    /// Check a declaration's attributes, each given once. No attribute is
+    /// defined yet, so every one is unknown.
+    fn check_attrs(&mut self, source: SourceId, attrs: &[ast::Attribute<'src>]) {
+        let mut seen = HashSet::new();
+        for attr in attrs {
+            let (name, span) = &attr.name;
+            if !seen.insert(*name) {
+                self.error(source, span, format!("duplicate attribute `{name}`"));
+                continue;
+            }
+            self.error(source, span, format!("unknown attribute `{name}`"));
+        }
+    }
+
     /// Check a const's type, which must be a number, `bool`, or `string`
     /// without constraints, and its value against the type.
     fn lower_const(&mut self, site: &ConstSite<'a, 'src>) -> Const {
         let source = site.source;
         let item = site.item;
+        self.check_attrs(source, &item.attrs);
         let lowered = |ty, value| Const {
             namespace: site.namespace,
             parent: site.parent,
@@ -1086,7 +1102,7 @@ mod tests {
     #[test]
     fn container_types_lower() {
         let schema = compiled(&[concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "struct Position { x: f32 }\n",
             "message[in] NonScalars {\n",
             "    v: vec<i32>,\n",
@@ -1142,7 +1158,7 @@ mod tests {
 
     #[test]
     fn nested_declarations_shadow_outer_ones() {
-        let src = "namespace a;\nenum R { X }\nmessage[in] M {\n    enum R { Y }\n    r: R,\n}\n";
+        let src = "namespace a\nenum R { X }\nmessage[in] M {\n    enum R { Y }\n    r: R,\n}\n";
         let schema = compiled(&[src]);
         let (_, message) = def(&schema, "M");
         let DefKind::Message(message) = &message.kind else {
@@ -1154,44 +1170,44 @@ mod tests {
         assert!(schema.def(id).parent.is_some(), "the nested enum wins");
 
         // The nested declaration is reachable from outside by its path.
-        compiled(&["namespace a;\nmessage[in] M { enum R { Y } r: R, }\nstruct S { r: M.R }\n"]);
+        compiled(&["namespace a\nmessage[in] M { enum R { Y } r: R, }\nstruct S { r: M.R }\n"]);
     }
 
     #[test]
     fn unknown_names_are_reported() {
         assert_eq!(
-            messages(&["namespace a;\nstruct S { p: Position }\n"]),
+            messages(&["namespace a\nstruct S { p: Position }\n"]),
             ["cannot find `Position` in this scope"]
         );
         assert_eq!(
-            messages(&["namespace a;\nuse b;\n"]),
+            messages(&["namespace a\nuse b\n"]),
             ["unknown namespace `b`"]
         );
         assert_eq!(
             messages(&[
-                "namespace a;\nstruct T {}\n",
-                "namespace b;\nuse a;\nstruct S { t: a.X }\n",
+                "namespace a\nstruct T {}\n",
+                "namespace b\nuse a\nstruct S { t: a.X }\n",
             ]),
             ["no `X` in namespace `a`"]
         );
         assert_eq!(
-            messages(&["namespace a;\nenum E { X }\nstruct S { e: E.X }\n"]),
+            messages(&["namespace a\nenum E { X }\nstruct S { e: E.X }\n"]),
             ["`E` has no nested declaration `X`"]
         );
     }
 
     #[test]
     fn qualified_paths_need_a_use() {
-        let a = "namespace a;\nstruct T {}\n";
-        let b = "namespace b;\nstruct S { t: a.T }\n";
+        let a = "namespace a\nstruct T {}\n";
+        let b = "namespace b\nstruct S { t: a.T }\n";
         assert_eq!(messages(&[a, b]), ["cannot find `a` in this scope"]);
     }
 
     #[test]
     fn unqualified_imports_can_be_ambiguous() {
-        let a = "namespace a;\nstruct T {}\n";
-        let b = "namespace b;\nstruct T {}\n";
-        let c = "namespace c;\nuse a;\nuse b;\nstruct S { t: T }\n";
+        let a = "namespace a\nstruct T {}\n";
+        let b = "namespace b\nstruct T {}\n";
+        let c = "namespace c\nuse a\nuse b\nstruct S { t: T }\n";
         let messages = messages(&[a, b, c]);
         assert_eq!(
             messages,
@@ -1202,44 +1218,94 @@ mod tests {
     #[test]
     fn duplicate_declarations_are_reported() {
         assert_eq!(
-            messages(&["namespace a;\nstruct S {}\nenum S { A }\n"]),
+            messages(&["namespace a\nstruct S {}\nenum S { A }\n"]),
             ["the name `S` is declared more than once in this scope"]
         );
         assert_eq!(
-            messages(&["namespace a;\nstruct S { x: i32, x: i32 }\n"]),
+            messages(&["namespace a\nstruct S { x: i32, x: i32 }\n"]),
             ["duplicate field `x`"]
         );
         // The same name in two files sharing a namespace also collides.
         assert_eq!(
-            messages(&["namespace a;\nstruct S {}\n", "namespace a;\nstruct S {}\n"]),
+            messages(&["namespace a\nstruct S {}\n", "namespace a\nstruct S {}\n"]),
             ["the name `S` is declared more than once in this scope"]
         );
     }
 
     #[test]
+    fn every_attribute_is_unknown_for_now() {
+        let src = concat!(
+            "namespace a\n",
+            "@visibility(Faction)\n",
+            "struct S {\n",
+            "    @replicate(ops(Op))\n",
+            "    enum E { A }\n",
+            "    x: u8,\n",
+            "}\n",
+            "@large message[in] M {}\n",
+            "@lock(Inventory, Gold) union U { A }\n",
+            "@halo(false) type T = u8\n",
+            "@timeout_ms(1000) const C: u8 = 1\n",
+        );
+        let errors = compile(&[src]).expect_err("expected errors");
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| (&src[error.span.clone()], error.message.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("visibility", "unknown attribute `visibility`"),
+                ("replicate", "unknown attribute `replicate`"),
+                ("large", "unknown attribute `large`"),
+                ("lock", "unknown attribute `lock`"),
+                ("halo", "unknown attribute `halo`"),
+                ("timeout_ms", "unknown attribute `timeout_ms`"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_attribute_is_given_once() {
+        let src = "namespace a\n@a @b\n@a(1) struct S {}\n";
+        let errors = compile(&[src]).expect_err("expected errors");
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| (error.span.start, error.message.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (13, "unknown attribute `a`"),
+                (16, "unknown attribute `b`"),
+                (19, "duplicate attribute `a`"),
+            ]
+        );
+        assert_eq!(&src[19..21], "a(", "the second occurrence");
+    }
+
+    #[test]
     fn enums_are_validated() {
         assert_eq!(
-            messages(&["namespace a;\nenum E: i32 { A }\n"]),
+            messages(&["namespace a\nenum E: i32 { A }\n"]),
             ["enum `E` cannot be backed by `i32`; only unsigned integers are allowed"]
         );
         assert_eq!(
-            messages(&["namespace a;\nenum E: u8 { A = 256 }\n"]),
+            messages(&["namespace a\nenum E: u8 { A = 256 }\n"]),
             ["`256` is out of range for `u8`"]
         );
         assert_eq!(
-            messages(&["namespace a;\nenum E: u8 { A = 255, B }\n"]),
+            messages(&["namespace a\nenum E: u8 { A = 255, B }\n"]),
             ["variant value exceeds the maximum of `u8`"]
         );
         assert_eq!(
-            messages(&["namespace a;\nenum E { A, B = 0 }\n"]),
+            messages(&["namespace a\nenum E { A, B = 0 }\n"]),
             ["`A` and `B` share the value 0"]
         );
         assert_eq!(
-            messages(&["namespace a;\nenum E { A, A }\n"]),
+            messages(&["namespace a\nenum E { A, A }\n"]),
             ["duplicate variant `A`"]
         );
         assert_eq!(
-            messages(&["namespace a;\nenum E {}\n"]),
+            messages(&["namespace a\nenum E {}\n"]),
             ["enum `E` needs at least one variant"]
         );
     }
@@ -1255,17 +1321,17 @@ mod tests {
     #[test]
     fn consts_lower_with_their_type_and_scope() {
         let schema = compiled(&[concat!(
-            "namespace a;\n",
-            "const Count: u8 = 255;\n",
-            "const Low: i64 = -9223372036854775808;\n",
-            "const Big: u64 = 18446744073709551615;\n",
-            "const Rate: f32 = 0.1;\n",
-            "const Whole: f64 = 2;\n",
-            "const On: bool = true;\n",
-            "const Greeting: string = \"héllo\";\n",
+            "namespace a\n",
+            "const Count: u8 = 255\n",
+            "const Low: i64 = -9223372036854775808\n",
+            "const Big: u64 = 18446744073709551615\n",
+            "const Rate: f32 = 0.1\n",
+            "const Whole: f64 = 2\n",
+            "const On: bool = true\n",
+            "const Greeting: string = \"héllo\"\n",
             "message[in] M {\n",
-            "    struct Inner { const Deep: u8 = 1; }\n",
-            "    const MaxLength: u16 = 16;\n",
+            "    struct Inner { const Deep: u8 = 1 }\n",
+            "    const MaxLength: u16 = 16\n",
             "}\n",
         )]);
         let value = |name| {
@@ -1313,50 +1379,50 @@ mod tests {
     #[test]
     fn const_types_and_values_are_checked() {
         let cases = [
-            ("const A: u8 = 256;", "`256` is out of range for `u8`"),
-            ("const A: u32 = -1;", "`-1` is out of range for `u32`"),
+            ("const A: u8 = 256", "`256` is out of range for `u8`"),
+            ("const A: u32 = -1", "`-1` is out of range for `u32`"),
             (
-                "const A: f32 = 1000000000000000000000000000000000000000.0;",
+                "const A: f32 = 1000000000000000000000000000000000000000.0",
                 "`1e39` is out of range for `f32`",
             ),
-            ("const A: u8 = 1.5;", "`u8` takes an integer, found a float"),
+            ("const A: u8 = 1.5", "`u8` takes an integer, found a float"),
             (
-                "const A: i32 = \"1\";",
+                "const A: i32 = \"1\"",
                 "`i32` takes an integer, found a string",
             ),
-            ("const A: f64 = true;", "`f64` takes a number, found a bool"),
+            ("const A: f64 = true", "`f64` takes a number, found a bool"),
             (
-                "const A: bool = 1;",
+                "const A: bool = 1",
                 "`bool` takes `true` or `false`, found an integer",
             ),
             (
-                "const A: string = 1;",
+                "const A: string = 1",
                 "`string` takes a string, found an integer",
             ),
             (
-                "const A: u8[max=3] = 1;",
+                "const A: u8[max=3] = 1",
                 "a const's type takes no constraints",
             ),
             (
-                "const A: bytes = \"x\";",
+                "const A: bytes = \"x\"",
                 "a const cannot be `bytes`; it takes an integer, a float, `bool`, or `string`",
             ),
             (
-                "const A: timestamp = 0;",
+                "const A: timestamp = 0",
                 "a const cannot be `timestamp`; it takes an integer, a float, `bool`, or `string`",
             ),
             (
-                "enum E { X }\nconst A: E = 0;",
+                "enum E { X }\nconst A: E = 0",
                 "a const cannot be `E`; it takes an integer, a float, `bool`, or `string`",
             ),
             (
-                "const A: vec<u8> = 0;",
+                "const A: vec<u8> = 0",
                 "a const cannot be `vec<u8>`; it takes an integer, a float, `bool`, or `string`",
             ),
         ];
         for (src, expected) in cases {
             assert_eq!(
-                messages(&[&format!("namespace a;\n{src}\n")]),
+                messages(&[&format!("namespace a\n{src}\n")]),
                 [expected],
                 "{src}"
             );
@@ -1366,31 +1432,31 @@ mod tests {
     #[test]
     fn consts_share_scopes_with_types() {
         assert_eq!(
-            messages(&["namespace a;\nstruct A {}\nconst A: u8 = 1;\n"]),
+            messages(&["namespace a\nstruct A {}\nconst A: u8 = 1\n"]),
             ["the name `A` is declared more than once in this scope"]
         );
         assert_eq!(
-            messages(&["namespace a;\nmessage[in] M { const A: u8 = 1; enum A { X } }\n"]),
+            messages(&["namespace a\nmessage[in] M { const A: u8 = 1 enum A { X } }\n"]),
             ["the name `A` is declared more than once in this scope"]
         );
         // The same name in different scopes is fine.
-        compiled(&["namespace a;\nconst A: u8 = 1;\nstruct S { const A: u8 = 2; }\n"]);
+        compiled(&["namespace a\nconst A: u8 = 1\nstruct S { const A: u8 = 2 }\n"]);
 
         assert_eq!(
-            messages(&["namespace a;\nconst A: u8 = 1;\nstruct S { a: A }\n"]),
+            messages(&["namespace a\nconst A: u8 = 1\nstruct S { a: A }\n"]),
             ["`A` is a const, not a type"]
         );
         assert_eq!(
-            messages(&["namespace a;\nconst A: u8 = 1;\nstruct S { a: A.B }\n"]),
+            messages(&["namespace a\nconst A: u8 = 1\nstruct S { a: A.B }\n"]),
             ["`A` is a const and has no nested declarations"]
         );
         assert_eq!(
-            messages(&["namespace a;\nstruct T { const C: u8 = 1; }\nstruct S { c: T.C }\n"]),
+            messages(&["namespace a\nstruct T { const C: u8 = 1 }\nstruct S { c: T.C }\n"]),
             ["`T.C` is a const, not a type"]
         );
         // The innermost name wins, even when it is a const.
         assert_eq!(
-            messages(&["namespace a;\nstruct R {}\nmessage[in] M { const R: u8 = 1; r: R }\n"]),
+            messages(&["namespace a\nstruct R {}\nmessage[in] M { const R: u8 = 1 r: R }\n"]),
             ["`R` is a const, not a type"]
         );
     }
@@ -1398,24 +1464,24 @@ mod tests {
     #[test]
     fn messages_are_standalone() {
         assert_eq!(
-            messages(&["namespace a;\nmessage[in] M {}\nstruct S { m: M }\n"]),
+            messages(&["namespace a\nmessage[in] M {}\nstruct S { m: M }\n"]),
             ["`M` is a message; messages are standalone and cannot be used as a type"]
         );
         assert_eq!(
-            messages(&["namespace a;\nmessage[in] M {}\nmessage[out] N { v: vec<M> }\n"]).len(),
+            messages(&["namespace a\nmessage[in] M {}\nmessage[out] N { v: vec<M> }\n"]).len(),
             1
         );
     }
 
     #[test]
     fn structs_can_hold_variable_size_and_optional_fields() {
-        compiled(&["namespace a;\nstruct S { v: vec<i32>, s: string, x: option<i32> }\n"]);
+        compiled(&["namespace a\nstruct S { v: vec<i32>, s: string, x: option<i32> }\n"]);
     }
 
     #[test]
     fn fixed_size_depends_on_the_fields() {
         let prelude = concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "struct Var { s: string }\n",
             "struct Optional { x: option<u8> }\n",
             "struct Flags { a: option<bool> }\n",
@@ -1450,28 +1516,28 @@ mod tests {
     #[test]
     fn lengths_fit_a_message() {
         assert_eq!(
-            messages(&["namespace a;\nmessage[in] M { s: string[max_length=65536] }\n"]),
+            messages(&["namespace a\nmessage[in] M { s: string[max_length=65536] }\n"]),
             ["`max_length` must be at most 65535, the size of a message"]
         );
-        compiled(&["namespace a;\nmessage[in] M { s: vec<u8>[max_length=65535] }\n"]);
+        compiled(&["namespace a\nmessage[in] M { s: vec<u8>[max_length=65535] }\n"]);
     }
 
     #[test]
     fn containers_need_fixed_size_items() {
         assert_eq!(
-            messages(&["namespace a;\nmessage[in] M { a: array<vec<i32>, 2> }\n"]),
+            messages(&["namespace a\nmessage[in] M { a: array<vec<i32>, 2> }\n"]),
             ["`vec<i32>` is variable-size; an array item must be fixed-size"]
         );
         assert_eq!(
-            messages(&["namespace a;\nmessage[in] M { s: set<string> }\n"]),
+            messages(&["namespace a\nmessage[in] M { s: set<string> }\n"]),
             ["`string` is variable-size; a set item must be fixed-size"]
         );
         assert_eq!(
-            messages(&["namespace a;\nmessage[in] M { m: map<string, i32> }\n"]),
+            messages(&["namespace a\nmessage[in] M { m: map<string, i32> }\n"]),
             ["`string` is variable-size; a map key must be fixed-size"]
         );
         // Map values may be variable-size.
-        compiled(&["namespace a;\nmessage[in] M { m: map<i32, vec<i32>> }\n"]);
+        compiled(&["namespace a\nmessage[in] M { m: map<i32, vec<i32>> }\n"]);
     }
 
     #[test]
@@ -1479,7 +1545,7 @@ mod tests {
         for ty in ["vec<i32>", "set<i32>", "map<i32, i32>", "array<i32, 2>"] {
             assert_eq!(
                 messages(&[&format!(
-                    "namespace a;\nmessage[in] M {{ o: option<{ty}> }}\n"
+                    "namespace a\nmessage[in] M {{ o: option<{ty}> }}\n"
                 )]),
                 [format!(
                     "`{ty}` is a collection; collections cannot be optional"
@@ -1488,7 +1554,7 @@ mod tests {
         }
         // Variable-size scalars and user types may be.
         compiled(&[concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "struct P { x: f32 }\n",
             "enum E { A }\n",
             "message[in] M { s: option<string>, b: option<bytes>, p: option<P>, e: option<E> }\n",
@@ -1498,7 +1564,7 @@ mod tests {
     #[test]
     fn floats_cannot_be_keys() {
         let prelude = concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "struct Position { x: i32, y: f32 }\n",
             "struct Outer { id: u8, p: array<Position, 2> }\n",
         );
@@ -1531,7 +1597,7 @@ mod tests {
 
         // Floats are fine as map values, and float-free structs as keys.
         compiled(&[concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "struct Cell { x: i32, y: i32 }\n",
             "message[in] M { m: map<Cell, f32[nan]>, s: set<Cell> }\n",
         )]);
@@ -1568,7 +1634,7 @@ mod tests {
         assert!(!numbers.fields[1].ty.constraints.infinite);
 
         let schema = compiled(&[concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "message[in] M {\n",
             "    f: f32[min=0, max=1.5],\n",
             "    o: option<string[max_length=3]>,\n",
@@ -1656,12 +1722,12 @@ mod tests {
             ),
         ];
         for (ty, expected) in cases {
-            let src = format!("namespace a;\nmessage[in] M {{ x: {ty} }}\n");
+            let src = format!("namespace a\nmessage[in] M {{ x: {ty} }}\n");
             assert_eq!(messages(&[&src]), [expected], "{ty}");
         }
         // User types take no constraints either.
         assert_eq!(
-            messages(&["namespace a;\nenum E { A }\nmessage[in] M { e: E[max=1] }\n"]),
+            messages(&["namespace a\nenum E { A }\nmessage[in] M { e: E[max=1] }\n"]),
             ["`E` takes no constraints"]
         );
     }
@@ -1669,11 +1735,11 @@ mod tests {
     #[test]
     fn options_only_wrap_a_field() {
         assert_eq!(
-            messages(&["namespace a;\nmessage[in] M { v: vec<option<i32>> }\n"]),
+            messages(&["namespace a\nmessage[in] M { v: vec<option<i32>> }\n"]),
             ["`option<i32>` is nested; `option` is only allowed as a field's own type"]
         );
         assert_eq!(
-            messages(&["namespace a;\nmessage[in] M { o: option<option<i32>> }\n"]),
+            messages(&["namespace a\nmessage[in] M { o: option<option<i32>> }\n"]),
             ["`option<i32>` is nested; `option` is only allowed as a field's own type"]
         );
     }
@@ -1681,7 +1747,7 @@ mod tests {
     #[test]
     fn unions_lower_their_variants_in_order() {
         let schema = compiled(&[concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "struct Item { id: u32 }\n",
             "union Op {\n",
             "    Add { item: Item, slot: u8, note: option<string> },\n",
@@ -1719,13 +1785,13 @@ mod tests {
     #[test]
     fn types_lower_onto_their_target() {
         let schema = compiled(&[concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "enum Color: u8 { Red }\n",
-            "type PartyId = u64;\n",
-            "type Level = u8[max=100];\n",
-            "type Hue = Color;\n",
-            "type Leader = PartyId;\n",
-            "message[in] M { type Local = bool; p: PartyId, l: Local }\n",
+            "type PartyId = u64\n",
+            "type Level = u8[max=100]\n",
+            "type Hue = Color\n",
+            "type Leader = PartyId\n",
+            "message[in] M { type Local = bool p: PartyId, l: Local }\n",
         )]);
         let target = |name: &str| {
             let (_, def) = def(&schema, name);
@@ -1786,7 +1852,7 @@ mod tests {
         ];
         for (src, expected) in cases {
             assert_eq!(
-                messages(&[&format!("namespace a;\n{src}\n")]),
+                messages(&[&format!("namespace a\n{src}\n")]),
                 [expected],
                 "{src}"
             );
@@ -1797,7 +1863,7 @@ mod tests {
     fn unions_hold_at_most_65535_variants() {
         let union = |count: usize| {
             let variants: Vec<String> = (0..count).map(|index| format!("V{index}")).collect();
-            format!("namespace a;\nunion U {{ {} }}\n", variants.join(", "))
+            format!("namespace a\nunion U {{ {} }}\n", variants.join(", "))
         };
         assert_eq!(
             messages(&[&union(65536)]),
@@ -1810,7 +1876,7 @@ mod tests {
     fn types_stand_for_scalars() {
         let scalar = "is not a scalar; a `type` stands for an integer, a float, `bool`, \
                       `timestamp`, `duration`, `entity`, `uentity`, `uuid`, an enum, or another `type`";
-        let prelude = "namespace a;\nstruct S { x: u8 }\nunion U { A }\n";
+        let prelude = "namespace a\nstruct S { x: u8 }\nunion U { A }\n";
         for target in [
             "string",
             "string[min_length=2, max_length=2]",
@@ -1823,42 +1889,42 @@ mod tests {
             "U",
         ] {
             assert_eq!(
-                messages(&[&format!("{prelude}type T = {target};\n")]),
+                messages(&[&format!("{prelude}type T = {target}\n")]),
                 [format!("`{target}` {scalar}")],
                 "{target}"
             );
         }
         assert_eq!(
-            messages(&[&format!("{prelude}type T = option<u8>;\n")]),
+            messages(&[&format!("{prelude}type T = option<u8>\n")]),
             ["a `type` cannot be optional; make the field holding it optional instead"]
         );
         // Through another `type`, it is the target that is checked.
         assert_eq!(
-            messages(&[&format!("{prelude}type T = string;\ntype V = T;\n")]),
+            messages(&[&format!("{prelude}type T = string\ntype V = T\n")]),
             [format!("`string` {scalar}")]
         );
 
         compiled(&[concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "enum E { A }\n",
-            "type A = u8;\n",
-            "type B = i64[min=-5, max=5];\n",
-            "type C = f32[nan];\n",
-            "type D = f64;\n",
-            "type F = bool;\n",
-            "type G = timestamp;\n",
-            "type H = duration;\n",
-            "type I = entity;\n",
-            "type J = uentity;\n",
-            "type K = uuid;\n",
-            "type L = E;\n",
-            "type M = A;\n",
+            "type A = u8\n",
+            "type B = i64[min=-5, max=5]\n",
+            "type C = f32[nan]\n",
+            "type D = f64\n",
+            "type F = bool\n",
+            "type G = timestamp\n",
+            "type H = duration\n",
+            "type I = entity\n",
+            "type J = uentity\n",
+            "type K = uuid\n",
+            "type L = E\n",
+            "type M = A\n",
         )]);
     }
 
     #[test]
     fn named_types_take_no_constraints() {
-        let prelude = "namespace a;\ntype PartyId = u64;\nunion U { A }\n";
+        let prelude = "namespace a\ntype PartyId = u64\nunion U { A }\n";
         let cases = [
             ("p: PartyId[max=3]", "`PartyId` takes no constraints"),
             ("v: vec<PartyId[min=1]>", "`PartyId` takes no constraints"),
@@ -1873,7 +1939,7 @@ mod tests {
             ["`PartyId` takes no constraints"]
         );
         assert_eq!(
-            messages(&[&format!("{prelude}type T = PartyId[max=3];\n")]),
+            messages(&[&format!("{prelude}type T = PartyId[max=3]\n")]),
             ["`PartyId` takes no constraints"]
         );
     }
@@ -1881,10 +1947,10 @@ mod tests {
     #[test]
     fn unions_are_variable_size_and_types_are_their_target() {
         let prelude = concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "union U { A }\n",
-            "type PartyId = u64;\n",
-            "type Weight = f32;\n",
+            "type PartyId = u64\n",
+            "type Weight = f32\n",
             "struct Holder { u: U }\n",
         );
         let cases = [
@@ -1930,7 +1996,7 @@ mod tests {
     #[test]
     fn wire_errors_in_unions_point_at_the_variant() {
         let src = concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "union U {\n",
             "    Big(array<u64, 9000>),\n",
             "    Wide { a: u8, b: array<u64, 9000> },\n",
@@ -1968,29 +2034,26 @@ mod tests {
     #[test]
     fn recursion_is_reported() {
         let recursive = "`S` refers to itself; recursive types are not allowed";
-        assert_eq!(
-            messages(&["namespace a;\nstruct S { s: S }\n"]),
-            [recursive]
-        );
+        assert_eq!(messages(&["namespace a\nstruct S { s: S }\n"]), [recursive]);
         // Collections and options don't make it acceptable.
         assert_eq!(
-            messages(&["namespace a;\nstruct S { x: u8, s: vec<S> }\n"]),
+            messages(&["namespace a\nstruct S { x: u8, s: vec<S> }\n"]),
             [recursive]
         );
         assert_eq!(
-            messages(&["namespace a;\nstruct S { x: u8, s: map<u8, S> }\n"]),
+            messages(&["namespace a\nstruct S { x: u8, s: map<u8, S> }\n"]),
             [recursive]
         );
         assert_eq!(
-            messages(&["namespace a;\nstruct A { b: B }\nstruct B { a: array<A, 2> }\n"]).len(),
+            messages(&["namespace a\nstruct A { b: B }\nstruct B { a: array<A, 2> }\n"]).len(),
             1
         );
         assert_eq!(
-            messages(&["namespace a;\nstruct A { b: option<B> }\nstruct B { a: vec<A> }\n"]).len(),
+            messages(&["namespace a\nstruct A { b: option<B> }\nstruct B { a: vec<A> }\n"]).len(),
             1
         );
 
-        compiled(&["namespace a;\nstruct S { x: i32 }\nmessage[in] M { v: vec<S> }\n"]);
+        compiled(&["namespace a\nstruct S { x: i32 }\nmessage[in] M { v: vec<S> }\n"]);
     }
 
     #[test]
@@ -2000,12 +2063,12 @@ mod tests {
             ("union U { A, B { v: vec<U> } }", "U"),
             ("union U { A(map<u8, U>) }", "U"),
             ("union U { A(S) }\nstruct S { u: option<U> }", "U"),
-            ("type A = A;", "A"),
-            ("type A = B;\ntype B = A;", "A"),
+            ("type A = A", "A"),
+            ("type A = B\ntype B = A", "A"),
         ];
         for (src, name) in cases {
             assert_eq!(
-                messages(&[&format!("namespace a;\n{src}\n")]),
+                messages(&[&format!("namespace a\n{src}\n")]),
                 [format!(
                     "`{name}` refers to itself; recursive types are not allowed"
                 )],
@@ -2014,8 +2077,8 @@ mod tests {
         }
         // Unions and types may refer to others, as long as nothing loops.
         compiled(&[concat!(
-            "namespace a;\n",
-            "type Id = u32;\n",
+            "namespace a\n",
+            "type Id = u32\n",
             "union Inner { A(Id), B }\n",
             "union Outer { I(Inner), L { all: vec<Inner>, id: Id } }\n",
         )]);

@@ -121,12 +121,12 @@ mod tests {
 
     #[test]
     fn every_kind_of_name_is_checked() {
-        let warnings = warnings(&["namespace Game.my_ns;\n\
+        let warnings = warnings(&["namespace Game.my_ns\n\
              enum color { light_red }\n\
              struct Foo_Bar { HitPoints: u8 }\n\
-             message[in] spawn { struct inner { _: u8 } const max_len: u8 = 1; }\n\
-             const HTTP_PORT: u16 = 80;\n\
-             type party_id = u64;\n\
+             message[in] spawn { struct inner { _: u8 } const max_len: u8 = 1 }\n\
+             const HTTP_PORT: u16 = 80\n\
+             type party_id = u64\n\
              union op { add_item { SlotIndex: u8 }, remove(u8) }\n"]);
         assert_eq!(
             warnings,
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn warnings_accompany_errors() {
-        let diagnostics = compile(&["namespace a;\nstruct s { x: Missing }\n"]).unwrap_err();
+        let diagnostics = compile(&["namespace a\nstruct s { x: Missing }\n"]).unwrap_err();
         assert!(diagnostics.iter().any(|d| d.is_error()));
         assert!(
             diagnostics

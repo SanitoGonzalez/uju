@@ -713,7 +713,7 @@ fn canonical(schema: &Schema) -> String {
                 out.push_str(" }");
             }
             DefKind::Type(item) => {
-                let _ = write!(out, "type {name} = {};", schema.type_name(&item.target));
+                let _ = write!(out, "type {name} = {}", schema.type_name(&item.target));
             }
         }
         out.push('\n');
@@ -742,7 +742,7 @@ fn canonical(schema: &Schema) -> String {
                 let _ = write!(out, "{value}");
             }
         }
-        out.push_str(";\n");
+        out.push('\n');
     }
     out
 }
@@ -802,9 +802,9 @@ mod tests {
             .ty
     }
 
-    /// The layout of the only message of `M`, after a `namespace a;` header.
+    /// The layout of the only message of `M`, after a `namespace a` header.
     fn message(body: &str) -> (Schema, Wire, TypeId) {
-        let (schema, wire) = compiled(&[&format!("namespace a;\n{body}\n")]);
+        let (schema, wire) = compiled(&[&format!("namespace a\n{body}\n")]);
         let id = id(&schema, "M");
         (schema, wire, id)
     }
@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn structs_pack_bools_into_a_bitmap() {
         let (schema, wire) = compiled(&[
-            "namespace a;\nstruct S { a: bool, x: u16, b: bool, y: f64, flags: array<bool, 2> }\n",
+            "namespace a\nstruct S { a: bool, x: u16, b: bool, y: f64, flags: array<bool, 2> }\n",
         ]);
         let layout = wire.layout(id(&schema, "S"));
         assert_eq!(layout.bitmap, 1);
@@ -992,7 +992,7 @@ mod tests {
     #[test]
     fn structs_can_hold_variable_size_fields() {
         let (schema, wire) = compiled(&[concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "struct Named { id: u32, name: string[max_length=8] }\n",
             "message[out] M { all: vec<Named>[max_length=4] }\n",
         )]);
@@ -1051,7 +1051,7 @@ mod tests {
     #[test]
     fn unions_take_a_tag_then_their_largest_variant() {
         let (schema, wire) = compiled(&[concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "union U {\n",
             "    Clear,\n",
             "    Remove(u32),\n",
@@ -1122,7 +1122,7 @@ mod tests {
         let tag = |count: usize| {
             let variants: Vec<String> = (0..count).map(|index| format!("V{index}")).collect();
             let (schema, wire) = compiled(&[&format!(
-                "namespace a;\nunion U {{ {} }}\n",
+                "namespace a\nunion U {{ {} }}\n",
                 variants.join(", ")
             )]);
             let layout = wire.union(id(&schema, "U"));
@@ -1140,12 +1140,12 @@ mod tests {
         let (schema, wire, m) = message(concat!(
             "enum E: u16 { A }\n",
             "struct P { x: f32, y: f32 }\n",
-            "type Level = u8[max=100];\n",
-            "type Big = i64[min=0, max=70000];\n",
-            "type Id = uuid;\n",
-            "type Hue = E;\n",
-            "type Alias = Level;\n",
-            "type Flag = bool;\n",
+            "type Level = u8[max=100]\n",
+            "type Big = i64[min=0, max=70000]\n",
+            "type Id = uuid\n",
+            "type Hue = E\n",
+            "type Alias = Level\n",
+            "type Flag = bool\n",
             "message[in] M { level: Level, big: Big, id: Id, hue: Hue, alias: Alias, ",
             "ids: vec<Id>, keyed: map<Big, P>, grid: array<Level, 3> }",
         ));
@@ -1196,9 +1196,9 @@ mod tests {
     #[test]
     fn types_over_bool_take_bitmap_bits() {
         let (schema, wire) = compiled(&[concat!(
-            "namespace a;\n",
-            "type Flag = bool;\n",
-            "type Ready = Flag;\n",
+            "namespace a\n",
+            "type Flag = bool\n",
+            "type Ready = Flag\n",
             "struct S { a: Flag, x: u8, b: option<Ready>, c: bool, all: array<Flag, 2> }\n",
             "union U { A { f: Flag }, B(Flag) }\n",
         )]);
@@ -1230,15 +1230,15 @@ mod tests {
     #[test]
     fn canonical_text_spells_out_unions_and_types() {
         let (schema, _) = compiled(&[concat!(
-            "namespace a;\n",
-            "type PartyId = u64;\n",
+            "namespace a\n",
+            "type PartyId = u64\n",
             "union Op { Add { id: PartyId, note: option<string> }, Remove(u8[max=9]), Clear }\n",
         )]);
         assert_eq!(
             canonical(&schema),
             concat!(
                 "union a.Op { Add { id: a.PartyId, note: option<string>, }, Remove(u8[max=9]), Clear, }\n",
-                "type a.PartyId = u64;\n",
+                "type a.PartyId = u64\n",
             )
         );
     }
@@ -1246,38 +1246,38 @@ mod tests {
     #[test]
     fn fingerprints_cover_unions_and_types() {
         let fingerprint = |src: &str| {
-            compiled(&[&format!("namespace a;\n{src}\n")])
+            compiled(&[&format!("namespace a\n{src}\n")])
                 .1
                 .fingerprint()
         };
         let base = fingerprint(concat!(
-            "type Id = u32;\n",
+            "type Id = u32\n",
             "union U { A { x: Id }, B(u8), C }\n",
         ));
         assert_eq!(
             base,
             fingerprint(concat!(
                 "union U { A { x: Id, }, B(u8), C, }\n",
-                "type Id = u32;\n",
+                "type Id = u32\n",
             )),
             "declaration order and trailing commas do not matter"
         );
         for changed in [
             // Variants: order, names, and forms.
-            "type Id = u32;\nunion U { B(u8), A { x: Id }, C }",
-            "type Id = u32;\nunion U { A { x: Id }, B(u8), D }",
-            "type Id = u32;\nunion U { A { y: Id }, B(u8), C }",
-            "type Id = u32;\nunion U { A(Id), B(u8), C }",
-            "type Id = u32;\nunion U { A { x: Id }, B(u16), C }",
-            "type Id = u32;\nunion U { A { x: Id }, B(u8[max=9]), C }",
-            "type Id = u32;\nunion U { A { x: Id }, B(u8), C, D }",
-            "type Id = u32;\nunion V { A { x: Id }, B(u8), C }",
+            "type Id = u32\nunion U { B(u8), A { x: Id }, C }",
+            "type Id = u32\nunion U { A { x: Id }, B(u8), D }",
+            "type Id = u32\nunion U { A { y: Id }, B(u8), C }",
+            "type Id = u32\nunion U { A(Id), B(u8), C }",
+            "type Id = u32\nunion U { A { x: Id }, B(u16), C }",
+            "type Id = u32\nunion U { A { x: Id }, B(u8[max=9]), C }",
+            "type Id = u32\nunion U { A { x: Id }, B(u8), C, D }",
+            "type Id = u32\nunion V { A { x: Id }, B(u8), C }",
             // A type's target and name.
-            "type Id = u64;\nunion U { A { x: Id }, B(u8), C }",
-            "type Id = u32[max=9];\nunion U { A { x: Id }, B(u8), C }",
-            "type Key = u32;\nunion U { A { x: Key }, B(u8), C }",
+            "type Id = u64\nunion U { A { x: Id }, B(u8), C }",
+            "type Id = u32[max=9]\nunion U { A { x: Id }, B(u8), C }",
+            "type Key = u32\nunion U { A { x: Key }, B(u8), C }",
             // A type, or the scalar it stands for.
-            "type Id = u32;\nunion U { A { x: u32 }, B(u8), C }",
+            "type Id = u32\nunion U { A { x: u32 }, B(u8), C }",
         ] {
             assert_ne!(base, fingerprint(changed), "{changed}");
         }
@@ -1286,7 +1286,7 @@ mod tests {
     #[test]
     fn messages_take_dense_ids_per_direction() {
         let (schema, wire) = compiled(&[concat!(
-            "namespace a;\n",
+            "namespace a\n",
             "message[in] C {}\n",
             "message[bi] B {}\n",
             "message[out] D {}\n",
@@ -1322,7 +1322,7 @@ mod tests {
     #[test]
     fn fingerprints_cover_names_layout_and_constraints() {
         let fingerprint = |src: &str| {
-            compiled(&[&format!("namespace a;\n{src}\n")])
+            compiled(&[&format!("namespace a\n{src}\n")])
                 .1
                 .fingerprint()
         };
@@ -1336,8 +1336,8 @@ mod tests {
             "message[in] M { x: u8[max=9], y: u16 }",
             "message[in] M { x: option<u8>, y: u16 }",
             "message[in] M { x: u8, y: u16 }\nenum E { A }",
-            "message[in] M { x: u8, y: u16 }\nconst C: u8 = 1;",
-            "message[in] M { const C: u8 = 1; x: u8, y: u16 }",
+            "message[in] M { x: u8, y: u16 }\nconst C: u8 = 1",
+            "message[in] M { const C: u8 = 1 x: u8, y: u16 }",
         ] {
             assert_ne!(base, fingerprint(changed), "{changed}");
         }
@@ -1346,29 +1346,29 @@ mod tests {
     #[test]
     fn fingerprints_cover_const_values() {
         let fingerprint = |src: &str| {
-            compiled(&[&format!("namespace a;\n{src}\n")])
+            compiled(&[&format!("namespace a\n{src}\n")])
                 .1
                 .fingerprint()
         };
-        let base = fingerprint("const C: u8 = 1;\nconst S: string = \"a\";");
+        let base = fingerprint("const C: u8 = 1\nconst S: string = \"a\"");
         for changed in [
-            "const C: u8 = 2;\nconst S: string = \"a\";",
-            "const C: u16 = 1;\nconst S: string = \"a\";",
-            "const D: u8 = 1;\nconst S: string = \"a\";",
-            "const C: u8 = 1;\nconst S: string = \"b\";",
+            "const C: u8 = 2\nconst S: string = \"a\"",
+            "const C: u16 = 1\nconst S: string = \"a\"",
+            "const D: u8 = 1\nconst S: string = \"a\"",
+            "const C: u8 = 1\nconst S: string = \"b\"",
         ] {
             assert_ne!(base, fingerprint(changed), "{changed}");
         }
         // Unescaped, the first would read exactly as the second.
         assert_ne!(
-            fingerprint(r#"const A: string = "x\";\nconst a.B: string = \"y";"#),
-            fingerprint("const A: string = \"x\";\nconst B: string = \"y\";"),
+            fingerprint(r#"const A: string = "x\"\nconst a.B: string = \"y""#),
+            fingerprint("const A: string = \"x\"\nconst B: string = \"y\""),
         );
     }
 
     #[test]
     fn oversized_values_are_reported() {
-        let schema = compile(&["namespace a;\nstruct S { a: array<u64, 9000> }\n"]);
+        let schema = compile(&["namespace a\nstruct S { a: array<u64, 9000> }\n"]);
         let messages: Vec<_> = schema
             .expect_err("expected errors")
             .into_iter()
@@ -1381,7 +1381,7 @@ mod tests {
         );
 
         let schema =
-            compile(&["namespace a;\nstruct S { a: array<u64, 5000>, b: array<u64, 5000> }\n"]);
+            compile(&["namespace a\nstruct S { a: array<u64, 5000>, b: array<u64, 5000> }\n"]);
         let messages: Vec<_> = schema
             .expect_err("expected errors")
             .into_iter()

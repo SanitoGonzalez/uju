@@ -56,9 +56,6 @@ pub enum Token<'src> {
     #[token(":")]
     Colon,
 
-    #[token(";")]
-    Semicolon,
-
     #[token(",")]
     Comma,
 
@@ -67,6 +64,9 @@ pub enum Token<'src> {
 
     #[token("=")]
     Equal,
+
+    #[token("@")]
+    At,
 
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice())]
     Ident(&'src str),
@@ -229,10 +229,10 @@ impl fmt::Display for Token<'_> {
             Token::Lt => f.write_str("<"),
             Token::Gt => f.write_str(">"),
             Token::Colon => f.write_str(":"),
-            Token::Semicolon => f.write_str(";"),
             Token::Comma => f.write_str(","),
             Token::Dot => f.write_str("."),
             Token::Equal => f.write_str("="),
+            Token::At => f.write_str("@"),
             Token::Ident(s) => f.write_str(s),
             Token::Int(x) => write!(f, "{x}"),
             Token::Float(x) => write!(f, "{x}"),
@@ -287,7 +287,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            tokens("{ } [ ] ( ) < > : ; , . ="),
+            tokens("{ } [ ] ( ) < > : , . = @"),
             [
                 Token::BraceOpen,
                 Token::BraceClose,
@@ -298,10 +298,10 @@ mod tests {
                 Token::Lt,
                 Token::Gt,
                 Token::Colon,
-                Token::Semicolon,
                 Token::Comma,
                 Token::Dot,
                 Token::Equal,
+                Token::At,
             ]
         );
     }
@@ -438,6 +438,27 @@ mod tests {
     }
 
     #[test]
+    fn attributes() {
+        assert_eq!(
+            tokens("@replicate(ops(a.Op)) @large"),
+            [
+                Token::At,
+                Token::Ident("replicate"),
+                Token::ParenOpen,
+                Token::Ident("ops"),
+                Token::ParenOpen,
+                Token::Ident("a"),
+                Token::Dot,
+                Token::Ident("Op"),
+                Token::ParenClose,
+                Token::ParenClose,
+                Token::At,
+                Token::Ident("large"),
+            ]
+        );
+    }
+
+    #[test]
     fn paths_are_not_floats() {
         assert_eq!(
             tokens("foo.bar.Position"),
@@ -495,6 +516,9 @@ mod tests {
                 (LexError::UnexpectedChar, 5..6),
             ]
         );
+
+        // Nor is `;`: declarations take no terminator.
+        assert_eq!(errors("namespace a;"), [(LexError::UnexpectedChar, 11..12)]);
     }
 
     #[test]

@@ -74,7 +74,7 @@ fn ids_live_in_the_root() {
 
 #[test]
 fn raw_namespaces_name_their_files_plainly() {
-    let files = files(&["namespace a.type;\nstruct S {}\n"], None);
+    let files = files(&["namespace a.type\nstruct S {}\n"], None);
     assert!(file(&files, "a/mod.rs").contains("pub mod r#type;\n"));
     assert!(file(&files, "a/type/mod.rs").contains("pub struct S {}"));
 }
@@ -130,7 +130,7 @@ fn shared_message_names_qualify_their_variants() {
 
 #[test]
 fn colliding_names_are_reported() {
-    let schema = compile(&["namespace a;\nstruct B {}\nstruct BView {}\n"])
+    let schema = compile(&["namespace a\nstruct B {}\nstruct BView {}\n"])
         .unwrap()
         .schema;
     let error = Rust { direction: None }.generate(&schema).unwrap_err();
@@ -157,8 +157,8 @@ fn nested_types_get_a_module_named_after_their_parent() {
 fn qualified_variants_are_pascal_case() {
     let contents = generated(
         &[
-            "namespace my_ns;\nmessage[in] M {}\n",
-            "namespace other;\nmessage[in] M {}\n",
+            "namespace my_ns\nmessage[in] M {}\n",
+            "namespace other\nmessage[in] M {}\n",
         ],
         None,
     );
@@ -169,8 +169,8 @@ fn qualified_variants_are_pascal_case() {
 #[test]
 fn colliding_variants_are_reported() {
     let schema = compile(&[
-        "namespace aB.c;\nmessage[in] M {}\n",
-        "namespace a.bC;\nmessage[in] M {}\n",
+        "namespace aB.c\nmessage[in] M {}\n",
+        "namespace a.bC\nmessage[in] M {}\n",
     ])
     .unwrap()
     .schema;
@@ -189,11 +189,10 @@ fn colliding_variants_are_reported() {
 
 #[test]
 fn unsupported_types_are_reported() {
-    let schema = compile(&[
-        "namespace a;\nmessage[in] M { id: uuid, ids: vec<uuid>, u: option<uentity> }\n",
-    ])
-    .unwrap()
-    .schema;
+    let schema =
+        compile(&["namespace a\nmessage[in] M { id: uuid, ids: vec<uuid>, u: option<uentity> }\n"])
+            .unwrap()
+            .schema;
     let error = Rust { direction: None }.generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
@@ -206,8 +205,8 @@ fn unsupported_types_are_reported() {
 #[test]
 fn nested_modules_collide_with_namespaces() {
     let schema = compile(&[
-        "namespace a;\nstruct Foo { enum E { X } e: E }\n",
-        "namespace a.foo;\nstruct Bar {}\n",
+        "namespace a\nstruct Foo { enum E { X } e: E }\n",
+        "namespace a.foo\nstruct Bar {}\n",
     ])
     .unwrap()
     .schema;
@@ -219,8 +218,8 @@ fn nested_modules_collide_with_namespaces() {
 
     // A const alone opens the module.
     let schema = compile(&[
-        "namespace a;\nstruct Foo { const C: u8 = 1; }\n",
-        "namespace a.foo;\nstruct Bar {}\n",
+        "namespace a\nstruct Foo { const C: u8 = 1 }\n",
+        "namespace a.foo\nstruct Bar {}\n",
     ])
     .unwrap()
     .schema;
@@ -235,20 +234,20 @@ fn nested_modules_collide_with_namespaces() {
 fn consts_are_shouty_beside_their_scope() {
     let files = files(
         &[concat!(
-            "namespace a;\n",
-            "const MaxHp: u32 = 100;\n",
-            "const HTTPPort: u16 = 80;\n",
-            "const Low: i64 = -9223372036854775808;\n",
-            "const Big: u64 = 18446744073709551615;\n",
-            "const Rate: f32 = 0.1;\n",
-            "const Whole: f64 = 2;\n",
-            "const On: bool = false;\n",
-            "const Text: string = \"say \\\"hi\\\"\\n\\u{7}é\";\n",
+            "namespace a\n",
+            "const MaxHp: u32 = 100\n",
+            "const HTTPPort: u16 = 80\n",
+            "const Low: i64 = -9223372036854775808\n",
+            "const Big: u64 = 18446744073709551615\n",
+            "const Rate: f32 = 0.1\n",
+            "const Whole: f64 = 2\n",
+            "const On: bool = false\n",
+            "const Text: string = \"say \\\"hi\\\"\\n\\u{7}é\"\n",
             "message[in] SetName {\n",
-            "    const MaxLength: u8 = 16;\n",
+            "    const MaxLength: u8 = 16\n",
             "    name: string,\n",
             "}\n",
-            "struct Limits { const Slots: u8 = 4; }\n",
+            "struct Limits { const Slots: u8 = 4 }\n",
         )],
         None,
     );
@@ -275,7 +274,7 @@ fn consts_are_shouty_beside_their_scope() {
 
 #[test]
 fn colliding_consts_are_reported() {
-    let schema = compile(&["namespace a;\nconst MaxHp: u8 = 1;\nconst MAXHp: u8 = 2;\n"])
+    let schema = compile(&["namespace a\nconst MaxHp: u8 = 1\nconst MAXHp: u8 = 2\n"])
         .unwrap()
         .schema;
     let error = Rust { direction: None }.generate(&schema).unwrap_err();
@@ -285,14 +284,14 @@ fn colliding_consts_are_reported() {
     );
 
     // Values and types live apart in Rust.
-    files(&["namespace a;\nconst AB: u8 = 1;\nstruct Ab {}\n"], None);
+    files(&["namespace a\nconst AB: u8 = 1\nstruct Ab {}\n"], None);
 
-    let schema = compile(&["namespace a;\nconst _: u8 = 1;\nconst _1: u8 = 2;\n"])
+    let schema = compile(&["namespace a\nconst _: u8 = 1\nconst _1: u8 = 2\n"])
         .unwrap()
         .schema;
     let error = Rust { direction: None }.generate(&schema).unwrap_err();
     assert_eq!(error.message, "`a._` has no words to name a Rust constant");
-    let schema = compile(&["namespace a;\nconst _1: u8 = 2;\n"])
+    let schema = compile(&["namespace a\nconst _1: u8 = 2\n"])
         .unwrap()
         .schema;
     let files = Rust { direction: None }.generate(&schema).unwrap();
@@ -310,8 +309,8 @@ fn output_ignores_source_order() {
 #[test]
 fn types_are_newtypes_read_by_value() {
     let contents = generated(
-        &["namespace a;\n\
-           type PartyId = u64;\n\
+        &["namespace a\n\
+           type PartyId = u64\n\
            message[in] M { id: PartyId, ids: vec<PartyId>, owners: map<PartyId, u8>, opt: option<PartyId> }\n"],
         None,
     );
@@ -340,7 +339,7 @@ fn types_are_newtypes_read_by_value() {
 
     // Only a peer that decodes a type reads it through a cell.
     let server = generated(
-        &["namespace a;\ntype Id = u64;\nmessage[out] M { id: Id }\n"],
+        &["namespace a\ntype Id = u64\nmessage[out] M { id: Id }\n"],
         Some(Direction::In),
     );
     assert!(server.contains("pub struct Id(pub u64);"));
@@ -350,9 +349,9 @@ fn types_are_newtypes_read_by_value() {
 #[test]
 fn types_over_bool_are_bits() {
     let contents = generated(
-        &["namespace a;\n\
-           type Flag = bool;\n\
-           type Strong = Flag;\n\
+        &["namespace a\n\
+           type Flag = bool\n\
+           type Strong = Flag\n\
            struct S { on: Flag, strong: Strong, maybe: option<Strong>, flags: vec<Flag> }\n"],
         None,
     );
@@ -376,11 +375,11 @@ fn types_over_bool_are_bits() {
 #[test]
 fn types_derive_what_their_target_supports() {
     let contents = generated(
-        &["namespace a;\n\
-           type Ratio = f32;\n\
-           type Owner = entity;\n\
+        &["namespace a\n\
+           type Ratio = f32\n\
+           type Owner = entity\n\
            enum Color { Red = 1 }\n\
-           type Hue = Color;\n\
+           type Hue = Color\n\
            struct S { r: Ratio, o: Owner }\n"],
         None,
     );
@@ -402,8 +401,8 @@ fn types_derive_what_their_target_supports() {
 #[test]
 fn times_are_std_times_checked_against_their_range() {
     let contents = generated(
-        &["namespace a;\n\
-           type At = timestamp;\n\
+        &["namespace a\n\
+           type At = timestamp\n\
            union U { A, B(duration) }\n\
            struct S { at: At, t: timestamp, mt: option<timestamp>, ds: vec<duration>, u: U }\n\
            struct D { d: duration }\n"],
@@ -445,9 +444,9 @@ fn times_are_std_times_checked_against_their_range() {
 #[test]
 fn type_constraints_hold_wherever_it_is_used() {
     let contents = generated(
-        &["namespace a;\n\
-           type Level = u8[max=100];\n\
-           type Depth = i32[min=-5, max=5];\n\
+        &["namespace a\n\
+           type Level = u8[max=100]\n\
+           type Depth = i32[min=-5, max=5]\n\
            struct S { l: Level, ls: vec<Level>, d: Depth }\n"],
         None,
     );
@@ -466,12 +465,12 @@ fn type_constraints_hold_wherever_it_is_used() {
 
 #[test]
 fn type_names_claim_no_view() {
-    files(&["namespace a;\ntype A = u8;\nstruct AView {}\n"], None);
+    files(&["namespace a\ntype A = u8\nstruct AView {}\n"], None);
 }
 
 #[test]
 fn unsupported_types_behind_a_type_or_in_a_union_are_reported() {
-    let schema = compile(&["namespace a;\ntype Owner = uentity;\ntype Id = uuid;\n\
+    let schema = compile(&["namespace a\ntype Owner = uentity\ntype Id = uuid\n\
          union U { A, B(uuid), C { at: uentity } }\nstruct S { owner: Owner }\n"])
     .unwrap()
     .schema;
@@ -485,7 +484,7 @@ fn unsupported_types_behind_a_type_or_in_a_union_are_reported() {
     );
 }
 
-const INVENTORY: &str = "namespace a;\n\
+const INVENTORY: &str = "namespace a\n\
     struct Item { id: u32, name: string }\n\
     struct Point { x: f32, y: f32 }\n\
     union InventoryOp {\n\
@@ -532,10 +531,7 @@ fn unions_are_enums_written_after_their_tag() {
     }
     assert!(!contents.contains("Default)]\npub enum InventoryOp"));
 
-    let contents = generated(
-        &["namespace a;\nunion U { A, B(u8), C { x: u16 } }\n"],
-        None,
-    );
+    let contents = generated(&["namespace a\nunion U { A, B(u8), C { x: u16 } }\n"], None);
     assert!(contents.contains("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\npub enum U {"));
 }
 
@@ -617,14 +613,14 @@ fn variant_views_live_in_the_unions_module() {
         assert!(!module.contains(method), "`{method}` in\n{module}");
     }
     // No module without a variant with fields.
-    let contents = generated(&["namespace a;\nunion U { A, B(u8) }\n"], None);
+    let contents = generated(&["namespace a\nunion U { A, B(u8) }\n"], None);
     assert!(!contents.contains("pub mod u {"));
 }
 
 #[test]
 fn union_views_borrow_only_when_a_variant_does() {
     let contents = generated(
-        &["namespace a;\n\
+        &["namespace a\n\
            union Small { On, Level(u8) }\n\
            union Inner { Text(string), Small(Small) }\n\
            struct S { s: Small, i: Inner, maybe: option<Small>, all: vec<Small>, inners: vec<Inner> }\n"],
@@ -657,12 +653,12 @@ fn union_views_borrow_only_when_a_variant_does() {
     }
 
     // Without data to check, `b` is not bound.
-    let contents = generated(&["namespace a;\nunion U { A(bytes) }\n"], None);
+    let contents = generated(&["namespace a\nunion U { A(bytes) }\n"], None);
     assert!(contents.contains("match __w::de::plain::<u8>(buf, 0) {\n            1 => {}"));
     assert!(contents.contains("_ => return __w::de::tag(at, \"U\"),"));
     assert!(!contents.contains("let (b, at) = (&buf[1..], at + 1);"));
     // Without data, nothing is read past the tag.
-    let contents = generated(&["namespace a;\nunion U { A, B }\n"], None);
+    let contents = generated(&["namespace a\nunion U { A, B }\n"], None);
     assert!(!contents.contains("let b = &bytes[1..];"));
 }
 
@@ -670,7 +666,7 @@ fn union_views_borrow_only_when_a_variant_does() {
 fn unions_of_many_variants_take_a_u16_tag() {
     let variants: Vec<String> = (0..300).map(|i| format!("V{i}")).collect();
     let source = format!(
-        "namespace a;\nunion U {{ {}, Last(u8) }}\n",
+        "namespace a\nunion U {{ {}, Last(u8) }}\n",
         variants.join(", ")
     );
     let contents = generated(&[&source], None);
@@ -691,7 +687,7 @@ fn unions_of_many_variants_take_a_u16_tag() {
 
 #[test]
 fn unions_follow_the_peers_roles() {
-    let source = "namespace a;\n\
+    let source = "namespace a\n\
         union In { A { x: u8 }, B }\n\
         union Out { A { x: u8 }, B }\n\
         message[in] Req { u: In }\n\
@@ -708,8 +704,8 @@ fn unions_follow_the_peers_roles() {
 #[test]
 fn variant_modules_collide_with_namespaces() {
     let schema = compile(&[
-        "namespace a;\nunion Foo { A { x: u8 } }\n",
-        "namespace a.foo;\nstruct Bar {}\n",
+        "namespace a\nunion Foo { A { x: u8 } }\n",
+        "namespace a.foo\nstruct Bar {}\n",
     ])
     .unwrap()
     .schema;
@@ -721,13 +717,13 @@ fn variant_modules_collide_with_namespaces() {
     // Without fields, no module.
     files(
         &[
-            "namespace a;\nunion Foo { A(u8) }\n",
-            "namespace a.foo;\nstruct Bar {}\n",
+            "namespace a\nunion Foo { A(u8) }\n",
+            "namespace a.foo\nstruct Bar {}\n",
         ],
         None,
     );
     // The view is claimed too.
-    let schema = compile(&["namespace a;\nunion U { A }\nstruct UView {}\n"])
+    let schema = compile(&["namespace a\nunion U { A }\nstruct UView {}\n"])
         .unwrap()
         .schema;
     let error = Rust { direction: None }.generate(&schema).unwrap_err();

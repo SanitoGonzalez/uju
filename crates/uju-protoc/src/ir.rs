@@ -98,7 +98,7 @@ pub enum VariantData {
     Fields(Vec<Field>),
 }
 
-/// `type Name = Target;`: a scalar under a name of its own, laid out as
+/// `type Name = Target`: a scalar under a name of its own, laid out as
 /// the scalar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeDef {

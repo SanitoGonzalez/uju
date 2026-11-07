@@ -1,9 +1,50 @@
 # Schema
 
-> **Status.** Only naming, consts, types, unions, and the planned component
-> declarations are written up here. Until the rest of the language is,
-> `crates/uju-protoc/tests/data/example1.uju` shows every declaration kind,
-> type and constraint.
+> **Status.** Only attributes, naming, consts, types, unions, and the
+> planned component declarations are written up here. Until the rest of the
+> language is, `crates/uju-protoc/tests/data/example1.uju` shows every
+> declaration kind, type and constraint.
+
+## Declarations
+
+Declarations, `namespace`, `use`, `const` and `type` included, take no
+terminator. Each starts with a keyword or an [attribute](#attributes),
+which ends the one before it, so `type A = u8 type B = u16` declares two
+types. A `;` is an error.
+
+## Attributes
+
+Attributes go above the declaration they describe, each as `@name` or
+`@name(args)`:
+
+```
+@timeout_ms(1000)
+@lock(Inventory, Gold)
+@replicate(ops(InventoryOp))
+struct Trade {
+    gold: u32,
+}
+```
+
+- An argument is a literal (`1000`, `-0.5`, `"text"`, `true`), a path
+  (`Gold`, `demo.items.Gold`), or a call of a path with arguments
+  (`ops(InventoryOp)`). Arguments are separated by commas, and a trailing
+  comma is allowed.
+- Parentheses hold at least one argument: write `@large`, not `@large()`.
+- One `@` holds one attribute. Lists go inside its parentheses, as in
+  `@lock(Inventory, Gold)`. The same attribute given twice on a declaration
+  is an error.
+- Line breaks carry no meaning, but by convention each attribute takes a
+  line of its own.
+- Attributes go on `const`, `type`, `enum`, `union`, `struct` and `message`
+  declarations, at the top of a namespace or nested. They are not allowed on
+  `namespace`, `use`, fields or variants, and one with no declaration
+  after it is an error.
+
+Constraints keep their brackets after the type, as in `u8[max=10]`. They
+belong to the type, while attributes describe the declaration.
+
+No attribute is defined yet, so `ujuc` reports each one as unknown.
 
 ## Naming
 
@@ -12,13 +53,13 @@ name has a convention:
 
 | Name | Convention | Example |
 |---|---|---|
-| Namespace segment | `snake_case` | `namespace demo.character;` |
+| Namespace segment | `snake_case` | `namespace demo.character` |
 | Enum, struct, message | `PascalCase` | `message[out] SpawnPlayer` |
 | Enum variant | `PascalCase` | `Blue` |
 | Union | `PascalCase` | `union InventoryOp` |
 | Union variant | `PascalCase` | `Remove(u8)` |
-| Type | `PascalCase` | `type PartyId = u64;` |
-| Const | `PascalCase` | `const MaxHp: u32 = 100;` |
+| Type | `PascalCase` | `type PartyId = u64` |
+| Const | `PascalCase` | `const MaxHp: u32 = 100` |
 | Field | `snake_case` | `max_hp: u32` |
 | Union variant field | `snake_case` | `Add { slot_index: u8 }` |
 
@@ -69,15 +110,15 @@ A const names a value both peers agree on, such as a limit a client checks
 before sending:
 
 ```
-namespace demo.chat;
+namespace demo.chat
 
-const MaxNameLength: u16 = 16;
-const TickRate: f32 = 30.0;
-const PvpEnabled: bool = true;
-const Greeting: string = "Welcome!\n";
+const MaxNameLength: u16 = 16
+const TickRate: f32 = 30.0
+const PvpEnabled: bool = true
+const Greeting: string = "Welcome!\n"
 
 message[in] SetName {
-    const MinLength: u8 = 2;
+    const MinLength: u8 = 2
     name: string[max_length=16],
 }
 ```
@@ -112,10 +153,10 @@ A `type` gives a scalar a name of its own, so that an id or a key can't be
 mixed up with another value of the same width:
 
 ```
-namespace demo.party;
+namespace demo.party
 
-type PartyId = u64;
-type Level = u8[max=100];
+type PartyId = u64
+type Level = u8[max=100]
 
 struct Member {
     party: PartyId,
@@ -147,7 +188,7 @@ A union holds one of several variants, each of which may carry data. A
 variant takes one of Rust's three forms:
 
 ```
-namespace demo.inventory;
+namespace demo.inventory
 
 union InventoryOp {
     Add { item: u32, slot: u8 },  // fields
@@ -193,7 +234,7 @@ and clients, and also the ones sent to another shard on
 storage. Components that never leave their shard are written by hand in Rust.
 
 ```
-namespace demo.character;
+namespace demo.character
 
 component Health {
     hp: u32,

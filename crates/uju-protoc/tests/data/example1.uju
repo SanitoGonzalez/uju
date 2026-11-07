@@ -12,7 +12,7 @@
 //
 // `uentity` and `uuid` are left out until the Rust backend supports them.
 
-namespace foo.bar;
+namespace foo.bar
 
 // enum can only derive unsigned integers
 enum Color: u8 {
@@ -34,18 +34,18 @@ enum Big: u64 {
 }
 
 // Consts never go on the wire; backends emit them beside the types.
-const MaxPlayers: u16 = 64;
-const MinHeight: i32 = -100;
-const Gravity: f32 = -9.81;
-const PvpEnabled: bool = true;
-const Motd: string = "Welcome!\n\u{1F44B}";
+const MaxPlayers: u16 = 64
+const MinHeight: i32 = -100
+const Gravity: f32 = -9.81
+const PvpEnabled: bool = true
+const Motd: string = "Welcome!\n\u{1F44B}"
 
 // A `type` is laid out as the scalar it names, constraints included.
-type PartyId = u64;
-type Level = u8[max=100];
+type PartyId = u64
+type Level = u8[max=100]
 // Over `bool`, a field of it takes a bitmap bit, as a `bool` does.
-type Ready = bool;
-type Deadline = timestamp;
+type Ready = bool
+type Deadline = timestamp
 
 struct EmptyStruct {}
 
@@ -113,7 +113,7 @@ message[bi] Party {
 
 message[in] MyRequest {
     // A const nested in a message, like a nested type.
-    const MaxAddresses: u8 = 14;
+    const MaxAddresses: u8 = 14
 
     foo: i32[min=-100, max=100],
     name: string[min_length=2, max_length=12],
