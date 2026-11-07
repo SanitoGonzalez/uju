@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::backend::{self, Backend, Error, GeneratedFile};
+use crate::case;
 use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, Width, Wire};
 use crate::ir::{Constraints, DefKind, Direction, Field, Number, Schema, Type, TypeId, TypeKind};
 
@@ -187,6 +188,26 @@ impl<'a> Generator<'a> {
         ] {
             if generated {
                 claim(&[], name.to_string(), format!("the generated `{name}`"));
+            }
+        }
+        // A variant qualified by its namespace can still meet another
+        // message's: `aB.c.M` and `a.bC.M` are both `ABCM`.
+        for (way, messages, name) in [
+            (Direction::In, self.wire.inbound(), "InboundMessage"),
+            (Direction::Out, self.wire.outbound(), "OutboundMessage"),
+        ] {
+            if !self.dispatches(way) {
+                continue;
+            }
+            let mut seen = BTreeMap::new();
+            for (variant, id) in self.variants(messages).into_iter().zip(messages) {
+                if let Some(previous) = seen.insert(variant.clone(), *id) {
+                    errors.push(format!(
+                        "`{}` and `{}` both generate `{name}::{variant}`",
+                        self.schema.qualified(previous),
+                        self.schema.qualified(*id)
+                    ));
+                }
             }
         }
         if !errors.is_empty() {
@@ -528,7 +549,7 @@ impl<'a> Generator<'a> {
     }
 
     /// Dispatch variant names: each message's Rust name, or its qualified
-    /// name in camel case where two namespaces share a name.
+    /// name in Pascal case where two namespaces share a name.
     fn variants(&self, messages: &[TypeId]) -> Vec<String> {
         messages
             .iter()
@@ -543,7 +564,7 @@ impl<'a> Generator<'a> {
                     return name.clone();
                 }
                 let namespace = self.schema.namespace(self.schema.def(*id).namespace);
-                let mut variant: String = namespace.name.iter().map(|s| capitalize(s)).collect();
+                let mut variant: String = namespace.name.iter().map(|s| case::pascal(s)).collect();
                 variant.push_str(name);
                 variant
             })
@@ -2240,14 +2261,6 @@ fn optional(e: &str, inner: &str) -> String {
     }
 }
 
-fn capitalize(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
-}
-
 /// `name` as a Rust identifier: raw for keywords, with a trailing `_` for
 /// the few that cannot be raw.
 fn ident(name: &str) -> String {
@@ -2267,29 +2280,10 @@ fn ident(name: &str) -> String {
     }
 }
 
-/// `name` in snake case, for a module: `MyResponse` becomes `my_response`,
-/// and `HTTPServer` becomes `http_server`.
+/// `name` in snake case as a Rust identifier, for a module: `MyResponse`
+/// becomes `my_response`, and `Type` becomes `r#type`.
 fn snake(name: &str) -> String {
-    let chars: Vec<char> = name.chars().collect();
-    let mut out = String::new();
-    for (index, &ch) in chars.iter().enumerate() {
-        if ch.is_uppercase() {
-            let previous = index.checked_sub(1).map(|index| chars[index]);
-            let next = chars.get(index + 1);
-            let word = previous.is_some_and(|previous| {
-                previous.is_lowercase()
-                    || previous.is_ascii_digit()
-                    || (previous.is_uppercase() && next.is_some_and(|next| next.is_lowercase()))
-            });
-            if word && !out.ends_with('_') {
-                out.push('_');
-            }
-            out.extend(ch.to_lowercase());
-        } else {
-            out.push(ch);
-        }
-    }
-    ident(&out)
+    ident(&case::snake(name))
 }
 
 /// A field's accessor on a view, kept clear of the view's own methods.
@@ -2453,6 +2447,39 @@ mod tests {
         assert_eq!(snake("HTTPDetail"), "http_detail");
         assert_eq!(snake("Vec2D"), "vec2_d");
         assert_eq!(snake("Type"), "r#type");
+    }
+
+    #[test]
+    fn qualified_variants_are_pascal_case() {
+        let contents = generated(
+            &[
+                "namespace my_ns;\nmessage[in] M {}\n",
+                "namespace other;\nmessage[in] M {}\n",
+            ],
+            None,
+        );
+        assert!(contents.contains("MyNsM(&'a self::my_ns::MView)"));
+        assert!(contents.contains("OtherM(&'a self::other::MView)"));
+    }
+
+    #[test]
+    fn colliding_variants_are_reported() {
+        let schema = compile(&[
+            "namespace aB.c;\nmessage[in] M {}\n",
+            "namespace a.bC;\nmessage[in] M {}\n",
+        ])
+        .unwrap();
+        let error = Rust { direction: None }.generate(&schema).unwrap_err();
+        assert_eq!(
+            error.message,
+            "`a.bC.M` and `aB.c.M` both generate `InboundMessage::ABCM`"
+        );
+        // A peer that never decodes them has no dispatch enum to collide in.
+        let generated = Rust {
+            direction: Some(Direction::Out),
+        }
+        .generate(&schema);
+        assert!(generated.is_ok());
     }
 
     #[test]
