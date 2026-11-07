@@ -352,7 +352,7 @@ fn kind_name(kind: &TypeKind) -> &'static str {
         TypeKind::F64 => "f64",
         TypeKind::Bool => "bool",
         TypeKind::Timestamp => "timestamp",
-        TypeKind::Interval => "interval",
+        TypeKind::Duration => "duration",
         TypeKind::Entity => "entity",
         TypeKind::UEntity => "uentity",
         TypeKind::Uuid => "uuid",

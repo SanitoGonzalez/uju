@@ -190,14 +190,14 @@ fn colliding_variants_are_reported() {
 #[test]
 fn unsupported_types_are_reported() {
     let schema = compile(&[
-        "namespace a;\nmessage[in] M { t: timestamp, ids: vec<uuid>, u: option<uentity> }\n",
+        "namespace a;\nmessage[in] M { id: uuid, ids: vec<uuid>, u: option<uentity> }\n",
     ])
     .unwrap()
     .schema;
     let error = Rust { direction: None }.generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
-        "`a.M.t`: the Rust backend does not support `timestamp` yet\n\
+        "`a.M.id`: the Rust backend does not support `uuid` yet\n\
          `a.M.ids`: the Rust backend does not support `uuid` yet\n\
          `a.M.u`: the Rust backend does not support `uentity` yet"
     );
@@ -400,6 +400,49 @@ fn types_derive_what_their_target_supports() {
 }
 
 #[test]
+fn times_are_std_times_checked_against_their_range() {
+    let contents = generated(
+        &["namespace a;\n\
+           type At = timestamp;\n\
+           union U { A, B(duration) }\n\
+           struct S { at: At, t: timestamp, mt: option<timestamp>, ds: vec<duration>, u: U }\n\
+           struct D { d: duration }\n"],
+        None,
+    );
+    for line in [
+        // `SystemTime` has no `Default`; `Duration` does.
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]\n\
+         pub struct At(pub ::std::time::SystemTime);",
+        "type Cell = __w::TimestampCell;",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\npub enum U {\n    \
+         A,\n    B(::std::time::Duration),\n}",
+        "#[derive(Debug, Clone, PartialEq, Eq, Hash)]\npub struct S {\n    \
+         pub at: At,\n    pub t: ::std::time::SystemTime,\n    \
+         pub mt: ::core::option::Option<::std::time::SystemTime>,\n    \
+         pub ds: ::std::vec::Vec<::std::time::Duration>,\n    pub u: U,\n}",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]\npub struct D {",
+        // Encoders convert and range check.
+        "w.put(&__w::en::timestamp(*v, \"S.at\")?)?;",
+        "w.put(&__w::en::timestamp(*v, \"S.t\")?)?;",
+        "w.put(&__w::en::timestamp(*v, \"S.mt\")?)?;",
+        "w.put(&__w::en::duration(*v, \"S.ds\")?)?;",
+        "w.put(&__w::en::duration(*v, \"U.B\")?)?;",
+        // Views read them by value, once validated.
+        "pub fn t(&self) -> ::std::time::SystemTime {",
+        "unsafe { __w::read::<__w::TimestampCell>(b, at) }",
+        "pub fn ds(&self) -> __w::Packed<'a, __w::DurationCell> {",
+        "Self::B(unsafe { __w::read::<__w::DurationCell>(b, 0) })",
+        "__w::de::timestamp(b, at, \"S.at\")?;",
+        "__w::de::timestamp(b, at, \"S.t\")?;",
+        "__w::de::timestamp(b, at, \"S.mt\")?;",
+        "__w::de::duration(b, at, \"S.ds\")?;",
+        "__w::de::duration(b, at, \"U.B\")?;",
+    ] {
+        assert!(contents.contains(line), "no `{line}` in\n{contents}");
+    }
+}
+
+#[test]
 fn type_constraints_hold_wherever_it_is_used() {
     let contents = generated(
         &["namespace a;\n\
@@ -428,16 +471,16 @@ fn type_names_claim_no_view() {
 
 #[test]
 fn unsupported_types_behind_a_type_or_in_a_union_are_reported() {
-    let schema = compile(&["namespace a;\ntype At = timestamp;\ntype Id = uuid;\n\
-         union U { A, B(interval), C { at: uentity } }\nstruct S { at: At }\n"])
+    let schema = compile(&["namespace a;\ntype Owner = uentity;\ntype Id = uuid;\n\
+         union U { A, B(uuid), C { at: uentity } }\nstruct S { owner: Owner }\n"])
     .unwrap()
     .schema;
     let error = Rust { direction: None }.generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
-        "`a.At`: the Rust backend does not support `timestamp` yet\n\
+        "`a.Owner`: the Rust backend does not support `uentity` yet\n\
          `a.Id`: the Rust backend does not support `uuid` yet\n\
-         `a.U.B`: the Rust backend does not support `interval` yet\n\
+         `a.U.B`: the Rust backend does not support `uuid` yet\n\
          `a.U.C.at`: the Rust backend does not support `uentity` yet"
     );
 }

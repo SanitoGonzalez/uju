@@ -448,6 +448,7 @@ mod tests {
             [
                 VariantData::Fields { .. },
                 VariantData::Type(_),
+                VariantData::Type(_),
                 VariantData::Unit
             ]
         ));
@@ -468,7 +469,7 @@ mod tests {
             "f32",
             "f64",
             "timestamp",
-            "interval",
+            "duration",
             "entity",
             "uentity",
             "uuid",

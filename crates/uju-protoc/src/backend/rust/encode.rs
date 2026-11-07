@@ -271,6 +271,12 @@ impl Generator<'_> {
                 out.line(format!("w.put(&{v}.to_le_bytes())?;"));
             }
             TypeKind::Bool => out.line(format!("w.put(&[*{v} as u8])?;")),
+            TypeKind::Timestamp => {
+                out.line(format!("w.put(&__w::en::timestamp(*{v}, {label})?)?;"));
+            }
+            TypeKind::Duration => {
+                out.line(format!("w.put(&__w::en::duration(*{v}, {label})?)?;"));
+            }
             TypeKind::Entity => {
                 out.line(format!("w.put(&{v}.to_bits().to_le_bytes())?;"));
             }

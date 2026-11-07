@@ -76,6 +76,8 @@ impl Generator<'_> {
             TypeKind::F32 => "f32".to_string(),
             TypeKind::F64 => "f64".to_string(),
             TypeKind::Bool => "bool".to_string(),
+            TypeKind::Timestamp => "::std::time::SystemTime".to_string(),
+            TypeKind::Duration => "::std::time::Duration".to_string(),
             TypeKind::Entity => "__w::Entity".to_string(),
             TypeKind::String => STRING.to_string(),
             TypeKind::Bytes => match ty.constraints.fixed_length() {
@@ -106,6 +108,8 @@ impl Generator<'_> {
             TypeKind::F32 => "__w::F32".to_string(),
             TypeKind::F64 => "__w::F64".to_string(),
             TypeKind::Bool => "__w::Bool".to_string(),
+            TypeKind::Timestamp => "__w::TimestampCell".to_string(),
+            TypeKind::Duration => "__w::DurationCell".to_string(),
             TypeKind::Entity => "__w::EntityCell".to_string(),
             TypeKind::String => format!("__w::FixedStr<{}>", self.fixed_size(ty)),
             TypeKind::Bytes => format!("[u8; {}]", self.fixed_size(ty)),

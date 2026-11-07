@@ -176,7 +176,7 @@ A type is a tree:
 ```
 
 `kind` is a scalar (`i8` to `i64`, `u8` to `u64`, `f32`, `f64`, `bool`,
-`timestamp`, `interval`, `entity`, `uentity`, `uuid`, `string`, `bytes`) or
+`timestamp`, `duration`, `entity`, `uentity`, `uuid`, `string`, `bytes`) or
 one of these:
 
 | `kind` | Other keys |

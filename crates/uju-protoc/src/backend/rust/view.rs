@@ -403,6 +403,8 @@ impl Generator<'_> {
                 None => Vec::new(),
             },
             TypeKind::Bool => vec![format!("__w::de::boolean(b[0], at, {label})?;")],
+            TypeKind::Timestamp => vec![format!("__w::de::timestamp(b, at, {label})?;")],
+            TypeKind::Duration => vec![format!("__w::de::duration(b, at, {label})?;")],
             TypeKind::Entity => vec![format!("__w::de::entity(b, at, {label})?;")],
             TypeKind::String => vec![format!("__w::de::utf8(b, at, {label})?;")],
             TypeKind::Array(item, len) => {

@@ -580,7 +580,7 @@ fn type_size(ty: &Type, def: &mut impl FnMut(TypeId) -> Size) -> Size {
         // A `bool` outside a bitmap, as in a `vec<bool>`, takes a byte.
         TypeKind::Bool => 1,
         TypeKind::F32 => 4,
-        TypeKind::F64 | TypeKind::Timestamp | TypeKind::Interval | TypeKind::Entity => 8,
+        TypeKind::F64 | TypeKind::Timestamp | TypeKind::Duration | TypeKind::Entity => 8,
         TypeKind::UEntity => 12,
         TypeKind::Uuid => 16,
         TypeKind::String | TypeKind::Bytes => match ty.constraints.fixed_length() {
@@ -848,7 +848,7 @@ mod tests {
     fn scalars_have_fixed_sizes() {
         let (schema, wire, m) = message(concat!(
             "enum E: u16 { A }\n",
-            "message[in] M { a: f32, b: timestamp, c: interval, d: entity, e: uentity, ",
+            "message[in] M { a: f32, b: timestamp, c: duration, d: entity, e: uentity, ",
             "f: uuid, g: E, h: string[min_length=3, max_length=3], i: array<u16, 3>, ",
             "j: bytes[max_length=4] }",
         ));

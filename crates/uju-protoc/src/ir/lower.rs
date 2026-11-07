@@ -451,7 +451,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                 source,
                 &written.span,
                 format!(
-                    "`{written}` is not a scalar; a `type` stands for an integer, a float, `bool`, `timestamp`, `interval`, `entity`, `uentity`, `uuid`, an enum, or another `type`"
+                    "`{written}` is not a scalar; a `type` stands for an integer, a float, `bool`, `timestamp`, `duration`, `entity`, `uentity`, `uuid`, an enum, or another `type`"
                 ),
             );
         }
@@ -978,7 +978,7 @@ fn prim_type(prim: ast::Prim) -> TypeKind {
         ast::Prim::F64 => TypeKind::F64,
         ast::Prim::Bool => TypeKind::Bool,
         ast::Prim::Timestamp => TypeKind::Timestamp,
-        ast::Prim::Interval => TypeKind::Interval,
+        ast::Prim::Duration => TypeKind::Duration,
         ast::Prim::Entity => TypeKind::Entity,
         ast::Prim::UEntity => TypeKind::UEntity,
         ast::Prim::Uuid => TypeKind::Uuid,
@@ -1809,7 +1809,7 @@ mod tests {
     #[test]
     fn types_stand_for_scalars() {
         let scalar = "is not a scalar; a `type` stands for an integer, a float, `bool`, \
-                      `timestamp`, `interval`, `entity`, `uentity`, `uuid`, an enum, or another `type`";
+                      `timestamp`, `duration`, `entity`, `uentity`, `uuid`, an enum, or another `type`";
         let prelude = "namespace a;\nstruct S { x: u8 }\nunion U { A }\n";
         for target in [
             "string",
@@ -1847,7 +1847,7 @@ mod tests {
             "type D = f64;\n",
             "type F = bool;\n",
             "type G = timestamp;\n",
-            "type H = interval;\n",
+            "type H = duration;\n",
             "type I = entity;\n",
             "type J = uentity;\n",
             "type K = uuid;\n",

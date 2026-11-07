@@ -45,8 +45,8 @@ characters. Collection lengths count **items**.
 | `i8` `i16` `i32` `i64` | 1, 2, 4, 8 | Two's complement, or narrowed |
 | `f32` `f64` | 4, 8 | IEEE 754 |
 | `bool` | 1 bit or 1 byte | A bit in an object's [bitmap](#objects); a byte (`0` or `1`) inside an `array` or collection |
-| `timestamp` | 8 | `i64` milliseconds since the Unix epoch, UTC |
-| `interval` | 8 | `i64` milliseconds |
+| `timestamp` | 8 | `u64` microseconds since the Unix epoch, UTC (see [Time](#time)) |
+| `duration` | 8 | `u64` microseconds (see [Time](#time)) |
 | `entity` | 8 | Index `u32`, then generation `u32` (non-zero) |
 | `uentity` | 12 | Serial `u64`, then node `u16`, then shard `u16` |
 | `uuid` | 16 | RFC 9562 byte order, as in its text form (the one big-endian value) |
@@ -70,6 +70,19 @@ is stored as declared.
 
 Floats and enums are never narrowed. Float `min`/`max` and the finite/non-NaN
 rules are only checked.
+
+### Time
+
+| Type | Valid range | Raw |
+|---|---|---|
+| `timestamp` | 1970-01-01T00:00:00Z ..= 9999-12-31T23:59:59.999999Z | `0 ..= 253_402_300_799_999_999` |
+| `duration` | 0 ..= 10000 Julian years (365.25 days each) | `0 ..= 315_576_000_000_000_000` |
+
+A decoder rejects a value outside its range. Microseconds fit both ranges in
+8 bytes, where nanoseconds would not. The 1970 floor and the 9999 ceiling keep
+every value representable on every target (Windows `SystemTime` can't go
+before 1601, C# `DateTimeOffset` stops at 9999). Neither type takes
+constraints.
 
 ### Types
 
@@ -356,6 +369,9 @@ because the id determines it.
 - `length=N` constraint as shorthand for `min_length=N, max_length=N`.
 - Float quantization: `f32[min=..., max=..., step=...]`, stored as a biased
   integer, possibly narrowed to any width from 1 to 8 bytes.
+- Time narrowing: a `resolution` constraint on `timestamp` and `duration`
+  (such as `duration[resolution=1ms, max=1h]`) that, together with `max`,
+  narrows them as [integers](#integers) are.
 - `struct[patch]` attribute: generate a patch struct (every field optional)
   with `diff` and `apply`, for replicating ECS components.
 - Component ids: the compiler assigns every component declared in the

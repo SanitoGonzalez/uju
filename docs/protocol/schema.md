@@ -124,7 +124,7 @@ struct Member {
 ```
 
 - The target is a scalar: an integer, a float, `bool`, `timestamp`,
-  `interval`, `entity`, `uentity`, `uuid`, an enum, or another `type`.
+  `duration`, `entity`, `uentity`, `uuid`, an enum, or another `type`.
   Strings, `bytes`, arrays, collections, structs and unions are rejected.
 - The target can't be optional. Make the field holding the type optional
   instead, as in `leader: option<PartyId>`.

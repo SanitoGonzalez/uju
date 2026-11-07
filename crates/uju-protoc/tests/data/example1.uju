@@ -2,7 +2,7 @@
 // constraint, and layout the compiler handles.
 //
 // types
-// scalars: u8-64, i8-64, f32-64 (f16 TBA), bool, timestamp, interval, entity, uentity, uuid
+// scalars: u8-64, i8-64, f32-64 (f16 TBA), bool, timestamp, duration, entity, uentity, uuid
 // variants: string, bytes
 // collections: vec<T>, set<T>, map<T>, array<T, N>
 // option<T>: collections cannot be optional
@@ -10,8 +10,7 @@
 // type: a scalar under a name of its own
 // union: one of several variants, each with fields, a value, or nothing
 //
-// `timestamp`, `interval`, `uentity`, and `uuid` are left out until the Rust
-// backend supports them.
+// `uentity` and `uuid` are left out until the Rust backend supports them.
 
 namespace foo.bar;
 
@@ -46,6 +45,7 @@ type PartyId = u64;
 type Level = u8[max=100];
 // Over `bool`, a field of it takes a bitmap bit, as a `bool` does.
 type Ready = bool;
+type Deadline = timestamp;
 
 struct EmptyStruct {}
 
@@ -96,6 +96,7 @@ struct Member {
 union PartyOp {
     Invite { who: PartyId, level: Level, note: option<string[max_length=32]> },
     Kick(PartyId),
+    Mute(duration),
     Disband,
 }
 
@@ -155,6 +156,9 @@ message[in] Everything {
     g: f32[nan, infinite],
     flag: bool,
     who: entity,
+    at: timestamp,
+    cooldown: duration,
+    deadline: Deadline,
     key: bytes[min_length=4, max_length=4],
     big: Big,
     tile: Tile,
@@ -166,8 +170,10 @@ message[in] Everything {
     maybe_tile: option<Tile>,
     maybe_count: option<u32>,
     maybe_name: option<string[max_length=20]>,
+    maybe_at: option<timestamp>,
     blob: bytes,
     raw: vec<u8>,
+    waits: vec<duration>,
     flags: vec<bool>[min_length=1, max_length=8],
     points: vec<Position>,
     empties: vec<EmptyStruct>[max_length=9],

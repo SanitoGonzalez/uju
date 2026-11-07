@@ -489,8 +489,6 @@ struct Module {
 fn unsupported(schema: &Schema) -> Result<(), Error> {
     fn find(ty: &Type) -> Option<&'static str> {
         match &ty.kind {
-            TypeKind::Timestamp => Some("timestamp"),
-            TypeKind::Interval => Some("interval"),
             TypeKind::UEntity => Some("uentity"),
             TypeKind::Uuid => Some("uuid"),
             TypeKind::Array(item, _) | TypeKind::Vec(item) | TypeKind::Set(item) => find(item),
@@ -791,8 +789,8 @@ fn type_traits(ty: &Type, traits: &[Traits]) -> Traits {
             hash: false,
             ..ALL
         },
-        // The runtime's identities have no default.
-        TypeKind::Entity => Traits {
+        // The runtime's identities and `SystemTime` have no default.
+        TypeKind::Entity | TypeKind::Timestamp => Traits {
             default: false,
             ..ALL
         },
