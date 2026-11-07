@@ -73,14 +73,101 @@ pub trait Message {
     const NAME: &'static str;
 }
 
-/// A message a server receives: `in` and `bi` messages.
-pub trait Inbound: Message {
-    const INBOUND_ID: u16;
+/// A role a message names as an endpoint, as `role::Sim`.
+pub trait Role {
+    /// The name in the schema: `sim`.
+    const NAME: &'static str;
 }
 
-/// A message a server sends: `out` and `bi` messages.
-pub trait Outbound: Message {
-    const OUTBOUND_ID: u16;
+/// The roles a message names as endpoints.
+pub mod role {
+    macro_rules! roles {
+        ($($(#[$doc:meta])* $role:ident = $name:literal,)*) => {
+            $(
+                $(#[$doc])*
+                #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+                pub struct $role;
+
+                impl super::Role for $role {
+                    const NAME: &'static str = $name;
+                }
+            )*
+        };
+    }
+
+    roles! {
+        /// A player's game.
+        Client = "client",
+        /// The server clients log in through.
+        Entry = "entry",
+        /// The server clients stay connected to, relaying to sims and hubs.
+        Edge = "edge",
+        /// A server simulating cells of the world.
+        Sim = "sim",
+        /// A server holding hub objects.
+        Hub = "hub",
+    }
+}
+
+/// A message travelling from `From` to `To`. Each role pair numbers its
+/// messages densely from 1, by qualified name.
+pub trait Link<From: Role, To: Role>: Message {
+    const ID: u16;
+}
+
+/// A hub kind, declared as `hub(Key) Name { ... }`. Its body is the
+/// object's state, and the type implementing this. A hub object is found by
+/// its kind and key.
+pub trait HubKind {
+    /// The key naming one object of the kind.
+    type Key;
+    /// The kind's id, dense from 1 over every hub kind by qualified name.
+    const ID: u16;
+    /// The fully qualified name: `foo.bar.Guild`.
+    const NAME: &'static str;
+}
+
+/// A message to a hub kind's objects, sent with the key of the object it
+/// goes to, as `send_hub(key, &msg)`. A role sending one need not have the
+/// kind, so this names only the key.
+pub trait ToHub: Message {
+    /// The receiving kind's key.
+    type Key;
+}
+
+/// A message to a hub kind's objects, where the kind is known: on hubs,
+/// which store it, and on sims, which cache it. The kind's id and the key
+/// find the object's slot.
+pub trait HubMessage: ToHub {
+    type Kind: HubKind<Key = Self::Key>;
+}
+
+/// What an edge needs to relay one message without reading its body. A
+/// relay table holds one per message of a role pair, at index `id - 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Relay {
+    /// The body's size when every encoding has it, `None` when it varies.
+    pub size: Option<u32>,
+    /// Where a message to a hub goes, `None` for any other.
+    pub hub: Option<HubRoute>,
+}
+
+/// The hub kind a message goes to, and the size of the key that follows
+/// its id in the envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HubRoute {
+    /// The kind's id, as [`HubKind::ID`].
+    pub kind: u16,
+    /// The key's encoded size, which is fixed.
+    pub key_size: u32,
+}
+
+impl Relay {
+    /// The entry for message `id` in `table`, `None` when no message has
+    /// that id.
+    pub fn find(table: &[Relay], id: u16) -> Option<&Relay> {
+        table.get(usize::from(id).checked_sub(1)?)
+    }
 }
 
 /// A fixed-size value read in place.
@@ -360,6 +447,12 @@ unsafe impl Cell for EntityCell {
     fn get(&self) -> Entity {
         // Little-endian index then generation is exactly `to_bits`.
         Entity::from_bits(u64::from_le_bytes(self.0))
+    }
+}
+
+impl fmt::Debug for EntityCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.get(), f)
     }
 }
 
@@ -1924,5 +2017,26 @@ mod tests {
         assert_eq!(error, EncodeError::new("t", EncodeErrorKind::Buffer));
         assert_eq!(w.pos(), 2);
         assert_eq!(w.len(1, 256).unwrap_err().kind, EncodeErrorKind::TooLarge);
+    }
+
+    #[test]
+    fn relays_are_found_by_id_from_1() {
+        let table = [
+            Relay {
+                size: Some(4),
+                hub: None,
+            },
+            Relay {
+                size: None,
+                hub: Some(HubRoute {
+                    kind: 2,
+                    key_size: 8,
+                }),
+            },
+        ];
+        assert_eq!(Relay::find(&table, 0), None, "no message is 0");
+        assert_eq!(Relay::find(&table, 1), Some(&table[0]));
+        assert_eq!(Relay::find(&table, 2), Some(&table[1]));
+        assert_eq!(Relay::find(&table, 3), None);
     }
 }
