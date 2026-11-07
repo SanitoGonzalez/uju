@@ -151,6 +151,25 @@ where
         .boxed()
     });
 
+    let literal = select! {
+        Token::Int(value) => Literal::Int(value),
+        Token::Float(value) => Literal::Float(value),
+        Token::Str(value) => Literal::String(value),
+        Token::Ident("true") => Literal::Bool(true),
+        Token::Ident("false") => Literal::Bool(false),
+    }
+    .map_with(|value, e| (value, e.span()))
+    .labelled("literal");
+
+    let const_item = just(Token::Const)
+        .ignore_then(ident)
+        .then_ignore(just(Token::Colon))
+        .then(ty.clone())
+        .then_ignore(just(Token::Equal))
+        .then(literal)
+        .then_ignore(just(Token::Semicolon))
+        .map(|((name, ty), value)| Item::Const(Const { name, ty, value }));
+
     let field = ident
         .then_ignore(just(Token::Colon))
         .then(ty)
@@ -240,7 +259,7 @@ where
                 })
             });
 
-        choice((enum_item, struct_item, message_item))
+        choice((enum_item, struct_item, message_item, const_item))
             .labelled("declaration")
             .boxed()
     });
@@ -531,11 +550,67 @@ mod tests {
         );
     }
 
+    fn const_of<'a, 'src>(items: &'a [Item<'src>], name: &str) -> &'a Const<'src> {
+        items
+            .iter()
+            .find_map(|item| match item {
+                Item::Const(item) if item.name.0 == name => Some(item),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no const named `{name}`"))
+    }
+
     #[test]
-    fn constants_are_not_declarations() {
+    fn consts_parse_at_the_top_and_in_bodies() {
+        let src = concat!(
+            "namespace a;\n",
+            "const Count: u8 = 3;\n",
+            "const Rate: f32 = -0.5;\n",
+            "const On: bool = true;\n",
+            "const Off: bool = false;\n",
+            "const Greeting: string = \"hi\\n\";\n",
+            "message[in] M {\n",
+            "    const Inner: u16 = 7;\n",
+            "    x: u8,\n",
+            "    const Last: i8 = -1;\n",
+            "}\n",
+        );
+        let schema = schema_of(src);
+        let value = |item: &Const<'_>| item.value.0.clone();
+        assert_eq!(value(const_of(&schema.items, "Count")), Literal::Int(3));
+        assert_eq!(value(const_of(&schema.items, "Rate")), Literal::Float(-0.5));
+        assert_eq!(value(const_of(&schema.items, "On")), Literal::Bool(true));
+        assert_eq!(value(const_of(&schema.items, "Off")), Literal::Bool(false));
+        let greeting = const_of(&schema.items, "Greeting");
+        assert_eq!(value(greeting), Literal::String("hi\n".into()));
+        assert_eq!(greeting.ty.to_string(), "string");
+        assert_eq!(&src[greeting.value.1.clone()], "\"hi\\n\"");
+
+        let message = item(&schema, "M");
+        assert_eq!(fields(message), ["x: u8"]);
+        let body = &message.body().unwrap().items;
+        assert_eq!(value(const_of(body, "Inner")), Literal::Int(7));
+        assert_eq!(value(const_of(body, "Last")), Literal::Int(-1));
+        assert_eq!(message.body().unwrap().items[0].keyword(), "const");
+    }
+
+    #[test]
+    fn malformed_consts_are_reported() {
         assert_eq!(
-            errors_of("namespace a;\nconst A: i32 = 1;\n")[0].message,
-            "found 'const' expected 'use', declaration, or end of input"
+            errors_of("namespace a;\nconst A: i32 = 1\n")[0].message,
+            "found end of input expected ';'"
+        );
+        assert_eq!(
+            errors_of("namespace a;\nconst A: i32;\n")[0].message,
+            "found ';' expected '[', or '='"
+        );
+        assert_eq!(
+            errors_of("namespace a;\nconst A: bool = yes;\n")[0].message,
+            "found 'yes' expected literal"
+        );
+        assert_eq!(
+            errors_of("namespace a;\nconst A = 1;\n")[0].message,
+            "found '=' expected ':'"
         );
     }
 

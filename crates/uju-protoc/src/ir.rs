@@ -13,12 +13,17 @@ pub struct NamespaceId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(pub usize);
 
+/// Index of a [`Const`] in [`Schema::consts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConstId(pub usize);
+
 /// A set of schema sources lowered into one unit. Sources sharing a
 /// `namespace` are merged into a single [`Namespace`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
     pub namespaces: Vec<Namespace>,
     pub defs: Vec<Def>,
+    pub consts: Vec<Const>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +78,29 @@ pub struct Struct {
 pub struct Message {
     pub direction: Direction,
     pub fields: Vec<Field>,
+}
+
+/// A named value. Consts never go on the wire, but they are part of the
+/// schema peers agree on, so they count toward the fingerprint.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Const {
+    pub namespace: NamespaceId,
+    /// The declaration this one is nested in, if any.
+    pub parent: Option<TypeId>,
+    pub name: String,
+    /// An integer, a float, [`TypeKind::Bool`], or [`TypeKind::String`].
+    pub ty: TypeKind,
+    pub value: ConstValue,
+}
+
+/// A const's value, checked against its type. A float keeps the `f64`
+/// written in source; an `f32` const is that value rounded to `f32`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstValue {
+    Int(i128),
+    Float(f64),
+    Bool(bool),
+    String(String),
 }
 
 /// Which way a message travels.
@@ -176,6 +204,10 @@ impl Schema {
         path
     }
 
+    pub fn constant(&self, id: ConstId) -> &Const {
+        &self.consts[id.0]
+    }
+
     /// A declaration's namespace, the declarations it is nested in, and its
     /// own name, joined with `.`: `foo.bar.MyResponse.Result`.
     pub fn qualified(&self, id: TypeId) -> String {
@@ -187,10 +219,28 @@ impl Schema {
         name
     }
 
+    /// A const's name, qualified as in [`Schema::qualified`]:
+    /// `foo.bar.MyRequest.MaxLength`.
+    pub fn const_qualified(&self, id: ConstId) -> String {
+        let item = self.constant(id);
+        let mut name = match item.parent {
+            Some(parent) => self.qualified(parent),
+            None => self.namespace(item.namespace).name.join("."),
+        };
+        name.push('.');
+        name.push_str(&item.name);
+        name
+    }
+
     /// The type as it would be written in source, with named types qualified
     /// and constraints in canonical order: `vec<foo.bar.Position>[max_length=8]`.
     pub fn type_name(&self, ty: &Type) -> String {
-        let name = match &ty.kind {
+        format!("{}{}", self.kind_name(&ty.kind), ty.constraints)
+    }
+
+    /// [`Schema::type_name`] without constraints.
+    pub fn kind_name(&self, kind: &TypeKind) -> String {
+        match kind {
             TypeKind::I8 => "i8".to_string(),
             TypeKind::I16 => "i16".to_string(),
             TypeKind::I32 => "i32".to_string(),
@@ -216,8 +266,7 @@ impl Schema {
                 format!("map<{}, {}>", self.type_name(key), self.type_name(value))
             }
             TypeKind::Named(id) => self.qualified(*id),
-        };
-        format!("{name}{}", ty.constraints)
+        }
     }
 
     /// Whether every value of `ty` encodes to the same number of bytes. A
@@ -319,6 +368,19 @@ impl EnumRepr {
 impl fmt::Display for EnumRepr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+/// Prints as written in source: `16`, `0.5`, `true`, `"hi\n"`.
+impl fmt::Display for ConstValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConstValue::Int(value) => write!(f, "{value}"),
+            // `{:?}` keeps the fraction of whole floats: `1.0`, not `1`.
+            ConstValue::Float(value) => write!(f, "{value:?}"),
+            ConstValue::Bool(value) => write!(f, "{value}"),
+            ConstValue::String(value) => write!(f, "{value:?}"),
+        }
     }
 }
 

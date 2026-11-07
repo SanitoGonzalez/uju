@@ -1,7 +1,7 @@
 # Schema
 
-> **Status.** Only naming and the planned component declarations are written
-> up here. Until the rest of the language is,
+> **Status.** Only naming, consts, and the planned component declarations
+> are written up here. Until the rest of the language is,
 > `crates/uju-protoc/tests/data/example1.uju` shows every declaration kind,
 > type and constraint.
 
@@ -15,6 +15,7 @@ name has a convention:
 | Namespace segment | `snake_case` | `namespace demo.character;` |
 | Enum, struct, message | `PascalCase` | `message[out] SpawnPlayer` |
 | Enum variant | `PascalCase` | `Blue` |
+| Const | `PascalCase` | `const MaxHp: u32 = 100;` |
 | Field | `snake_case` | `max_hp: u32` |
 
 `ujuc` warns about a name that breaks its convention and suggests one that
@@ -43,6 +44,13 @@ Digits stay with the word before them. So `HTTPDetail` is `HTTP Detail`,
 acronym as written, so `HTTPDetail` and `IOError` already follow the
 convention.
 
+Consts are PascalCase rather than `SCREAMING_SNAKE_CASE` because only that
+direction converts without loss. `MaxHp` and `HTTPPort` become `MAX_HP` and
+`HTTP_PORT` in Rust. `MAX_HP` has no case left to recover words from, so it
+could only become `MAXHP` or, lowercasing every word, `MaxHp`, which turns
+`HTTP_PORT` into `HttpPort`. C# and Unreal both name constants in
+PascalCase.
+
 ### Collisions
 
 Different names can convert to the same generated name. `HTTPDetail` and
@@ -50,6 +58,49 @@ Different names can convert to the same generated name. `HTTPDetail` and
 namespaces `aB.c` and `a.bC` both become the dispatch variant `ABCM`. A
 backend reports every collision as an error and generates nothing.
 Following the convention makes collisions rare but doesn't rule them out.
+
+## Consts
+
+A const names a value both peers agree on, such as a limit a client checks
+before sending:
+
+```
+namespace demo.chat;
+
+const MaxNameLength: u16 = 16;
+const TickRate: f32 = 30.0;
+const PvpEnabled: bool = true;
+const Greeting: string = "Welcome!\n";
+
+message[in] SetName {
+    const MinLength: u8 = 2;
+    name: string[max_length=16],
+}
+```
+
+- The type is an integer (`i8` to `i64`, `u8` to `u64`), a float (`f32`,
+  `f64`), `bool`, or `string`, without constraints.
+- An integer must fit its type. A float takes an integer or a float literal
+  (`2` or `2.0`) and must be finite in its type. NaN and infinities can't be
+  written.
+- A string takes the escapes `\"`, `\\`, `\n`, `\r`, `\t`, `\0`, and
+  `\u{1F600}` (one to six hex digits), and can hold any UTF-8. Its length is
+  not capped, since it never goes on the wire.
+- `true` and `false` are only literals where a value is expected, so they
+  stay usable as names.
+
+A const goes at the top of a namespace or in a struct or message, like a
+nested type. Consts and types share each scope, so a const can't have the
+name of a type declared beside it, and a type path that reaches a const is
+an error. Consts never go on the wire, but they count toward the
+[fingerprint](wire-format.md#fingerprint).
+
+The Rust backend emits `pub const MAX_NAME_LENGTH: u16 = 16;` in the
+namespace's module, and a nested const in its parent's module, as
+`set_name::MIN_LENGTH`. A string is a `&str`.
+
+> **TODO.** Constraints and array lengths can't refer to consts yet, as in
+> `string[max_length=MaxNameLength]` or `array<u32, SlotCount>`.
 
 ## Components
 

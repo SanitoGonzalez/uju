@@ -22,6 +22,7 @@ pub enum Item<'src> {
     Enum(Enum<'src>),
     Struct(Struct<'src>),
     Message(Message<'src>),
+    Const(Const<'src>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +50,23 @@ pub struct Message<'src> {
     pub direction: Spanned<Direction>,
     pub name: Ident<'src>,
     pub body: Body<'src>,
+}
+
+/// `const Name: Type = value;`, at the top level or in a struct or message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Const<'src> {
+    pub name: Ident<'src>,
+    pub ty: Type<'src>,
+    pub value: Spanned<Literal>,
+}
+
+/// A const's value, as written.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    Int(i128),
+    Float(f64),
+    Bool(bool),
+    String(String),
 }
 
 /// Which way a message travels, as written in `message[in]`.
@@ -147,6 +165,7 @@ impl<'src> Item<'src> {
             Item::Enum(item) => &item.name,
             Item::Struct(item) => &item.name,
             Item::Message(item) => &item.name,
+            Item::Const(item) => &item.name,
         }
     }
 
@@ -155,6 +174,7 @@ impl<'src> Item<'src> {
             Item::Enum(_) => "enum",
             Item::Struct(_) => "struct",
             Item::Message(_) => "message",
+            Item::Const(_) => "const",
         }
     }
 
@@ -162,7 +182,7 @@ impl<'src> Item<'src> {
         match self {
             Item::Struct(item) => Some(&item.body),
             Item::Message(item) => Some(&item.body),
-            Item::Enum(_) => None,
+            Item::Enum(_) | Item::Const(_) => None,
         }
     }
 }
@@ -297,6 +317,17 @@ impl fmt::Display for Number {
         match self {
             Number::Int(value) => write!(f, "{value}"),
             Number::Float(value) => write!(f, "{value:?}"),
+        }
+    }
+}
+
+impl fmt::Display for Literal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Literal::Int(value) => write!(f, "{value}"),
+            Literal::Float(value) => write!(f, "{value:?}"),
+            Literal::Bool(value) => write!(f, "{value}"),
+            Literal::String(value) => write!(f, "{value:?}"),
         }
     }
 }

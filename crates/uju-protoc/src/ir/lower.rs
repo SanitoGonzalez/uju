@@ -5,7 +5,7 @@ use crate::ir::wire::{self, Wire};
 use crate::ir::*;
 use crate::lexer::Span;
 use crate::parser::ast;
-use crate::resolve::{Resolver, TypeSite};
+use crate::resolve::{ConstSite, Resolver, TypeSite};
 
 /// Lower parsed schemas into the IR, resolving every name and validating
 /// every declaration. `schemas` are compiled together and indexed by
@@ -24,6 +24,11 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
         .enumerate()
         .map(|(index, site)| lowerer.lower_def(TypeId(index), site))
         .collect();
+    let consts: Vec<Const> = resolver
+        .consts
+        .iter()
+        .map(|site| lowerer.lower_const(site))
+        .collect();
 
     let schema = Schema {
         namespaces: (0..resolver.namespace_len())
@@ -36,6 +41,7 @@ pub fn lower(schemas: &[ast::Schema<'_>]) -> Result<Schema, Vec<Diagnostic>> {
             })
             .collect(),
         defs,
+        consts,
     };
 
     // Whether a struct is fixed-size depends on its fields, so these wait
@@ -93,6 +99,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             ast::Item::Enum(item) => DefKind::Enum(self.lower_enum(site.source, item)),
             ast::Item::Struct(item) => DefKind::Struct(self.lower_struct(site.source, id, item)),
             ast::Item::Message(item) => DefKind::Message(self.lower_message(site.source, id, item)),
+            ast::Item::Const(_) => unreachable!("consts are not type sites"),
         };
         Def {
             namespace: site.namespace,
@@ -100,6 +107,102 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             name: site.item.name().0.to_string(),
             kind,
         }
+    }
+
+    /// Check a const's type, which must be a number, `bool`, or `string`
+    /// without constraints, and its value against the type.
+    fn lower_const(&mut self, site: &ConstSite<'a, 'src>) -> Const {
+        let source = site.source;
+        let item = site.item;
+        let lowered = |ty, value| Const {
+            namespace: site.namespace,
+            parent: site.parent,
+            name: item.name.0.to_string(),
+            ty,
+            value,
+        };
+        if let Some(constraint) = item.ty.constraints.first() {
+            self.error(
+                source,
+                &constraint.span,
+                "a const's type takes no constraints",
+            );
+        }
+        let ty = match &item.ty.kind {
+            ast::TypeKind::Prim(prim)
+                if prim.is_int()
+                    || matches!(
+                        prim,
+                        ast::Prim::F32 | ast::Prim::F64 | ast::Prim::Bool | ast::Prim::String
+                    ) =>
+            {
+                prim_type(*prim)
+            }
+            kind => {
+                self.error(
+                    source,
+                    &item.ty.span,
+                    format!(
+                        "a const cannot be `{kind}`; it takes an integer, a float, `bool`, or `string`"
+                    ),
+                );
+                return lowered(TypeKind::Bool, ConstValue::Bool(false));
+            }
+        };
+
+        let (literal, span) = &item.value;
+        let kind_name = &item.ty.kind;
+        let (value, expected) = match (constraint_class(&ty), literal) {
+            (Class::Int(min, max), ast::Literal::Int(value)) => {
+                if !(min..=max).contains(value) {
+                    self.error(
+                        source,
+                        span,
+                        format!("`{value}` is out of range for `{kind_name}`"),
+                    );
+                }
+                (Some(ConstValue::Int(*value)), "")
+            }
+            (Class::Int(..), _) => (None, "an integer"),
+            // Integers widen, as in a float's `min` and `max`.
+            (Class::Float(limit), ast::Literal::Int(_) | ast::Literal::Float(_)) => {
+                let value = match *literal {
+                    ast::Literal::Int(value) => value as f64,
+                    ast::Literal::Float(value) => value,
+                    _ => unreachable!("matched a number"),
+                };
+                if value.abs() > limit {
+                    self.error(
+                        source,
+                        span,
+                        format!("`{value:?}` is out of range for `{kind_name}`"),
+                    );
+                }
+                (Some(ConstValue::Float(value)), "")
+            }
+            (Class::Float(_), _) => (None, "a number"),
+            _ => match (&ty, literal) {
+                (TypeKind::Bool, ast::Literal::Bool(value)) => (Some(ConstValue::Bool(*value)), ""),
+                (TypeKind::Bool, _) => (None, "`true` or `false`"),
+                (_, ast::Literal::String(value)) => (Some(ConstValue::String(value.clone())), ""),
+                _ => (None, "a string"),
+            },
+        };
+        let value = value.unwrap_or_else(|| {
+            let found = match literal {
+                ast::Literal::Int(_) => "an integer",
+                ast::Literal::Float(_) => "a float",
+                ast::Literal::Bool(_) => "a bool",
+                ast::Literal::String(_) => "a string",
+            };
+            self.error(
+                source,
+                span,
+                format!("`{kind_name}` takes {expected}, found {found}"),
+            );
+            ConstValue::Bool(false)
+        });
+        lowered(ty, value)
     }
 
     fn lower_enum(&mut self, source: SourceId, item: &ast::Enum<'src>) -> Enum {
@@ -808,6 +911,13 @@ mod tests {
         };
         assert_eq!(numbers.repr, EnumRepr::U32, "the repr defaults to u32");
         assert_eq!(numbers.variants[2].value, 1_000_000_000);
+
+        assert_eq!(
+            constant(&schema, "Motd").value,
+            ConstValue::String("Welcome!\n\u{1F44B}".into())
+        );
+        let (request, _) = def(&schema, "MyRequest");
+        assert_eq!(constant(&schema, "MaxAddresses").parent, Some(request));
     }
 
     #[test]
@@ -991,6 +1101,157 @@ mod tests {
         assert_eq!(
             messages(&["namespace a;\nenum E {}\n"]),
             ["enum `E` needs at least one variant"]
+        );
+    }
+
+    fn constant<'a>(schema: &'a Schema, name: &str) -> &'a Const {
+        schema
+            .consts
+            .iter()
+            .find(|item| item.name == name)
+            .unwrap_or_else(|| panic!("no const named `{name}`"))
+    }
+
+    #[test]
+    fn consts_lower_with_their_type_and_scope() {
+        let schema = compiled(&[concat!(
+            "namespace a;\n",
+            "const Count: u8 = 255;\n",
+            "const Low: i64 = -9223372036854775808;\n",
+            "const Big: u64 = 18446744073709551615;\n",
+            "const Rate: f32 = 0.1;\n",
+            "const Whole: f64 = 2;\n",
+            "const On: bool = true;\n",
+            "const Greeting: string = \"héllo\";\n",
+            "message[in] M {\n",
+            "    struct Inner { const Deep: u8 = 1; }\n",
+            "    const MaxLength: u16 = 16;\n",
+            "}\n",
+        )]);
+        let value = |name| {
+            (
+                constant(&schema, name).ty.clone(),
+                constant(&schema, name).value.clone(),
+            )
+        };
+        assert_eq!(value("Count"), (TypeKind::U8, ConstValue::Int(255)));
+        assert_eq!(
+            value("Low"),
+            (TypeKind::I64, ConstValue::Int(i64::MIN as i128))
+        );
+        assert_eq!(
+            value("Big"),
+            (TypeKind::U64, ConstValue::Int(u64::MAX as i128))
+        );
+        assert_eq!(value("Rate"), (TypeKind::F32, ConstValue::Float(0.1)));
+        assert_eq!(value("Whole"), (TypeKind::F64, ConstValue::Float(2.0)));
+        assert_eq!(value("On"), (TypeKind::Bool, ConstValue::Bool(true)));
+        assert_eq!(
+            value("Greeting"),
+            (TypeKind::String, ConstValue::String("héllo".into()))
+        );
+
+        let (message, _) = def(&schema, "M");
+        let (inner, _) = def(&schema, "Inner");
+        assert_eq!(constant(&schema, "Count").parent, None);
+        assert_eq!(constant(&schema, "MaxLength").parent, Some(message));
+        assert_eq!(constant(&schema, "Deep").parent, Some(inner));
+        let id = |name| {
+            ConstId(
+                schema
+                    .consts
+                    .iter()
+                    .position(|item| item.name == name)
+                    .unwrap(),
+            )
+        };
+        assert_eq!(schema.const_qualified(id("Count")), "a.Count");
+        assert_eq!(schema.const_qualified(id("MaxLength")), "a.M.MaxLength");
+        assert_eq!(schema.const_qualified(id("Deep")), "a.M.Inner.Deep");
+    }
+
+    #[test]
+    fn const_types_and_values_are_checked() {
+        let cases = [
+            ("const A: u8 = 256;", "`256` is out of range for `u8`"),
+            ("const A: u32 = -1;", "`-1` is out of range for `u32`"),
+            (
+                "const A: f32 = 1000000000000000000000000000000000000000.0;",
+                "`1e39` is out of range for `f32`",
+            ),
+            ("const A: u8 = 1.5;", "`u8` takes an integer, found a float"),
+            (
+                "const A: i32 = \"1\";",
+                "`i32` takes an integer, found a string",
+            ),
+            ("const A: f64 = true;", "`f64` takes a number, found a bool"),
+            (
+                "const A: bool = 1;",
+                "`bool` takes `true` or `false`, found an integer",
+            ),
+            (
+                "const A: string = 1;",
+                "`string` takes a string, found an integer",
+            ),
+            (
+                "const A: u8[max=3] = 1;",
+                "a const's type takes no constraints",
+            ),
+            (
+                "const A: bytes = \"x\";",
+                "a const cannot be `bytes`; it takes an integer, a float, `bool`, or `string`",
+            ),
+            (
+                "const A: timestamp = 0;",
+                "a const cannot be `timestamp`; it takes an integer, a float, `bool`, or `string`",
+            ),
+            (
+                "enum E { X }\nconst A: E = 0;",
+                "a const cannot be `E`; it takes an integer, a float, `bool`, or `string`",
+            ),
+            (
+                "const A: vec<u8> = 0;",
+                "a const cannot be `vec<u8>`; it takes an integer, a float, `bool`, or `string`",
+            ),
+        ];
+        for (src, expected) in cases {
+            assert_eq!(
+                messages(&[&format!("namespace a;\n{src}\n")]),
+                [expected],
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn consts_share_scopes_with_types() {
+        assert_eq!(
+            messages(&["namespace a;\nstruct A {}\nconst A: u8 = 1;\n"]),
+            ["the name `A` is declared more than once in this scope"]
+        );
+        assert_eq!(
+            messages(&["namespace a;\nmessage[in] M { const A: u8 = 1; enum A { X } }\n"]),
+            ["the name `A` is declared more than once in this scope"]
+        );
+        // The same name in different scopes is fine.
+        compiled(&["namespace a;\nconst A: u8 = 1;\nstruct S { const A: u8 = 2; }\n"]);
+
+        assert_eq!(
+            messages(&["namespace a;\nconst A: u8 = 1;\nstruct S { a: A }\n"]),
+            ["`A` is a const, not a type"]
+        );
+        assert_eq!(
+            messages(&["namespace a;\nconst A: u8 = 1;\nstruct S { a: A.B }\n"]),
+            ["`A` is a const and has no nested declarations"]
+        );
+        assert_eq!(
+            messages(&["namespace a;\nstruct T { const C: u8 = 1; }\nstruct S { c: T.C }\n"]),
+            ["`T.C` is a const, not a type"]
+        );
+        // The innermost name wins, even when it is a const.
+        assert_eq!(
+            messages(&["namespace a;\nstruct R {}\nmessage[in] M { const R: u8 = 1; r: R }\n"]),
+            ["`R` is a const, not a type"]
         );
     }
 

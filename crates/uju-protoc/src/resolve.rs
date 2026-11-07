@@ -1,7 +1,9 @@
 //! Name collection and resolution over parsed schemas.
 //!
 //! A [`Resolver`] walks every schema once, assigning a [`TypeId`] to each
-//! declaration, and can then resolve paths from any scope. A name is looked up first through the lexical scopes
+//! type declaration and a [`ConstId`] to each const, and can then resolve
+//! paths from any scope. Types and consts share their scopes: one name
+//! means one thing. A name is looked up first through the lexical scopes
 //! (enclosing declarations, then the source's namespace), then as a path
 //! qualified by a visible namespace's full name, and finally as an
 //! unqualified name from a `use`d namespace.
@@ -9,18 +11,34 @@
 use std::collections::HashMap;
 
 use crate::diagnostic::{Diagnostic, SourceId};
-use crate::ir::{NamespaceId, TypeId};
+use crate::ir::{ConstId, NamespaceId, TypeId};
 use crate::parser::ast;
 
-type Scope<'src> = HashMap<&'src str, TypeId>;
+/// What a name in a scope refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Symbol {
+    Type(TypeId),
+    Const(ConstId),
+}
+
+type Scope<'src> = HashMap<&'src str, Symbol>;
 
 /// A type declaration, with everything needed to lower it.
 pub struct TypeSite<'a, 'src> {
     pub source: SourceId,
     pub namespace: NamespaceId,
     pub parent: Option<TypeId>,
+    /// Never an [`ast::Item::Const`]; those are [`ConstSite`]s.
     pub item: &'a ast::Item<'src>,
     scope: Scope<'src>,
+}
+
+/// A const declaration, with everything needed to lower it.
+pub struct ConstSite<'a, 'src> {
+    pub source: SourceId,
+    pub namespace: NamespaceId,
+    pub parent: Option<TypeId>,
+    pub item: &'a ast::Const<'src>,
 }
 
 struct NamespaceSite<'src> {
@@ -37,6 +55,7 @@ pub struct Resolver<'a, 'src> {
     namespaces: Vec<NamespaceSite<'src>>,
     sources: Vec<SourceSite>,
     pub types: Vec<TypeSite<'a, 'src>>,
+    pub consts: Vec<ConstSite<'a, 'src>>,
 }
 
 impl<'a, 'src> Resolver<'a, 'src> {
@@ -47,6 +66,7 @@ impl<'a, 'src> Resolver<'a, 'src> {
             namespaces: Vec::new(),
             sources: Vec::new(),
             types: Vec::new(),
+            consts: Vec::new(),
         };
         let mut diagnostics = Vec::new();
 
@@ -58,8 +78,7 @@ impl<'a, 'src> Resolver<'a, 'src> {
                 uses: Vec::new(),
             });
             for item in &schema.items {
-                let id = resolver.collect(source, namespace, None, item, &mut diagnostics);
-                resolver.declare(source, namespace, None, item.name(), id, &mut diagnostics);
+                resolver.collect(source, namespace, None, item, &mut diagnostics);
             }
         }
 
@@ -94,14 +113,31 @@ impl<'a, 'src> Resolver<'a, 'src> {
         &self.namespaces[id.0].name
     }
 
-    /// Resolve `path` as seen from `scope` (the innermost enclosing type
-    /// declaration, if any) within `source`.
+    /// Resolve `path` to a type, as seen from `scope` (the innermost
+    /// enclosing type declaration, if any) within `source`.
     pub fn resolve(
         &self,
         source: SourceId,
         scope: Option<TypeId>,
         path: &ast::Path<'src>,
     ) -> Result<TypeId, Diagnostic> {
+        match self.resolve_symbol(source, scope, path)? {
+            Symbol::Type(id) => Ok(id),
+            Symbol::Const(_) => Err(Diagnostic::new(
+                source,
+                path.span.clone(),
+                format!("`{path}` is a const, not a type"),
+            )),
+        }
+    }
+
+    /// Resolve `path` to whatever it names, as in [`Resolver::resolve`].
+    pub fn resolve_symbol(
+        &self,
+        source: SourceId,
+        scope: Option<TypeId>,
+        path: &ast::Path<'src>,
+    ) -> Result<Symbol, Diagnostic> {
         let (first, first_span) = &path.segments[0];
 
         // Lexical scopes: enclosing declarations innermost-first, then the
@@ -113,8 +149,8 @@ impl<'a, 'src> Resolver<'a, 'src> {
                 Some(id) => &self.types[id.0].scope,
                 None => &self.namespaces[self.sources[source.0].namespace.0].scope,
             };
-            if let Some(&id) = entries.get(first) {
-                return self.walk(source, path, id, 1);
+            if let Some(&symbol) = entries.get(first) {
+                return self.walk(source, path, symbol, 1);
             }
             match cursor {
                 Some(id) => cursor = self.types[id.0].parent,
@@ -140,7 +176,7 @@ impl<'a, 'src> Resolver<'a, 'src> {
             let namespace = &self.namespaces[id.0];
             let (name, span) = &path.segments[namespace.name.len()];
             return match namespace.scope.get(name) {
-                Some(&id) => self.walk(source, path, id, namespace.name.len() + 1),
+                Some(&symbol) => self.walk(source, path, symbol, namespace.name.len() + 1),
                 None => Err(Diagnostic::new(
                     source,
                     span.clone(),
@@ -178,17 +214,29 @@ impl<'a, 'src> Resolver<'a, 'src> {
         }
     }
 
-    /// Follow the segments of `path` from `from` onwards, starting at `id`.
+    /// Follow the segments of `path` from `from` onwards, starting at
+    /// `symbol`, which the segment before `from` names.
     fn walk(
         &self,
         source: SourceId,
         path: &ast::Path<'src>,
-        mut id: TypeId,
+        mut symbol: Symbol,
         from: usize,
-    ) -> Result<TypeId, Diagnostic> {
-        for (name, span) in &path.segments[from..] {
+    ) -> Result<Symbol, Diagnostic> {
+        for (index, (name, span)) in path.segments.iter().enumerate().skip(from) {
+            let id = match symbol {
+                Symbol::Type(id) => id,
+                Symbol::Const(_) => {
+                    let (outer, outer_span) = &path.segments[index - 1];
+                    return Err(Diagnostic::new(
+                        source,
+                        outer_span.clone(),
+                        format!("`{outer}` is a const and has no nested declarations"),
+                    ));
+                }
+            };
             let site = &self.types[id.0];
-            id = *site.scope.get(name).ok_or_else(|| {
+            symbol = *site.scope.get(name).ok_or_else(|| {
                 Diagnostic::new(
                     source,
                     span.clone(),
@@ -199,9 +247,11 @@ impl<'a, 'src> Resolver<'a, 'src> {
                 )
             })?;
         }
-        Ok(id)
+        Ok(symbol)
     }
 
+    /// Register `item`, and what is nested in it, and declare its name in
+    /// the scope of `parent`, or of `namespace` at the top level.
     fn collect(
         &mut self,
         source: SourceId,
@@ -209,29 +259,34 @@ impl<'a, 'src> Resolver<'a, 'src> {
         parent: Option<TypeId>,
         item: &'a ast::Item<'src>,
         diagnostics: &mut Vec<Diagnostic>,
-    ) -> TypeId {
-        let id = TypeId(self.types.len());
-        self.types.push(TypeSite {
-            source,
-            namespace,
-            parent,
-            item,
-            scope: Scope::new(),
-        });
-        if let Some(body) = item.body() {
-            for nested in &body.items {
-                let nested_id = self.collect(source, namespace, Some(id), nested, diagnostics);
-                self.declare(
+    ) {
+        let symbol = match item {
+            ast::Item::Const(item) => {
+                let id = ConstId(self.consts.len());
+                self.consts.push(ConstSite {
                     source,
                     namespace,
-                    Some(id),
-                    nested.name(),
-                    nested_id,
-                    diagnostics,
-                );
+                    parent,
+                    item,
+                });
+                Symbol::Const(id)
             }
-        }
-        id
+            _ => {
+                let id = TypeId(self.types.len());
+                self.types.push(TypeSite {
+                    source,
+                    namespace,
+                    parent,
+                    item,
+                    scope: Scope::new(),
+                });
+                for nested in item.body().map_or(&[][..], |body| &body.items) {
+                    self.collect(source, namespace, Some(id), nested, diagnostics);
+                }
+                Symbol::Type(id)
+            }
+        };
+        self.declare(source, namespace, parent, item.name(), symbol, diagnostics);
     }
 
     fn declare(
@@ -240,14 +295,14 @@ impl<'a, 'src> Resolver<'a, 'src> {
         namespace: NamespaceId,
         owner: Option<TypeId>,
         name: &ast::Ident<'src>,
-        id: TypeId,
+        symbol: Symbol,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         let scope = match owner {
             Some(id) => &mut self.types[id.0].scope,
             None => &mut self.namespaces[namespace.0].scope,
         };
-        if scope.insert(name.0, id).is_some() {
+        if scope.insert(name.0, symbol).is_some() {
             diagnostics.push(Diagnostic::new(
                 source,
                 name.1.clone(),

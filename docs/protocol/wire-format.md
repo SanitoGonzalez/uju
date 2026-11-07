@@ -277,10 +277,12 @@ FNV-1a hash of a canonical text listing every declaration, sorted by fully
 qualified name, with every name included: enums with their repr and variant
 values, structs and messages with their fields in declaration order, each
 field's type spelled as in source, qualified, and with its constraints, and
-messages with their direction.
+messages with their direction. Consts follow, sorted the same way, with
+their type and value. They never go on the wire, but peers must agree on
+them too.
 
-Renaming anything, reordering fields, or changing a constraint changes the
-fingerprint. The order in which sources are compiled does not. FNV-1a is not
+Renaming anything, reordering fields, or changing a constraint or a const
+changes the fingerprint. The order in which sources are compiled does not. FNV-1a is not
 collision-resistant against an attacker, and it doesn't need to be: it only
 catches peers built from different schemas.
 

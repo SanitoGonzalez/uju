@@ -6,7 +6,10 @@
 
 use crate::backend::{self, Backend, Error, GeneratedFile};
 use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, Width, Wire};
-use crate::ir::{self, Constraints, DefKind, Field, NamespaceId, Number, Type, TypeId, TypeKind};
+use crate::ir::{
+    self, ConstId, ConstValue, Constraints, DefKind, Field, NamespaceId, Number, Type, TypeId,
+    TypeKind,
+};
 
 /// The file holding what spans namespaces. Namespace files sit in their own
 /// directory, so no namespace name can collide with it.
@@ -73,6 +76,16 @@ fn namespace(schema: &ir::Schema, wire: &Wire, id: NamespaceId, name: &str) -> S
     }
     json.end(']');
 
+    json.key("consts");
+    json.begin('[');
+    for (index, item) in schema.consts.iter().enumerate() {
+        if item.namespace == id {
+            json.item();
+            const_json(&mut json, schema, ConstId(index));
+        }
+    }
+    json.end(']');
+
     json.end('}');
     json.finish()
 }
@@ -119,6 +132,26 @@ fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
         }
     }
 
+    json.end('}');
+}
+
+fn const_json(json: &mut Json, schema: &ir::Schema, id: ConstId) {
+    let item = schema.constant(id);
+    json.begin('{');
+    json.entry("name", &item.name);
+    json.entry("path", &schema.const_qualified(id));
+    match item.parent {
+        Some(parent) => json.entry("parent", &schema.qualified(parent)),
+        None => json.entry_null("parent"),
+    }
+    json.entry("type", kind_name(&item.ty));
+    match &item.value {
+        ConstValue::Int(value) => json.entry_num("value", value),
+        // `{:?}` keeps the fraction of whole floats: `1.0`, not `1`.
+        ConstValue::Float(value) => json.entry_num("value", format!("{value:?}")),
+        ConstValue::Bool(value) => json.entry_bool("value", *value),
+        ConstValue::String(value) => json.entry("value", value),
+    }
     json.end('}');
 }
 
@@ -550,6 +583,39 @@ mod tests {
     }
 
     #[test]
+    fn consts_carry_their_type_and_value() {
+        let files = generated(&[concat!(
+            "namespace a;\n",
+            "const Count: u64 = 18446744073709551615;\n",
+            "const Low: i8 = -128;\n",
+            "const Whole: f32 = 2;\n",
+            "const On: bool = true;\n",
+            "const Text: string = \"say \\\"hi\\\"\\n\";\n",
+            "message[in] M { const Inner: u16 = 7; }\n",
+        )]);
+        let namespace = file(&files, "namespaces/a.json");
+        assert_eq!(
+            namespace["consts"],
+            json!([
+                {"name": "Count", "path": "a.Count", "parent": null, "type": "u64", "value": u64::MAX},
+                {"name": "Low", "path": "a.Low", "parent": null, "type": "i8", "value": -128},
+                {"name": "Whole", "path": "a.Whole", "parent": null, "type": "f32", "value": 2.0},
+                {"name": "On", "path": "a.On", "parent": null, "type": "bool", "value": true},
+                {"name": "Text", "path": "a.Text", "parent": null, "type": "string", "value": "say \"hi\"\n"},
+                {"name": "Inner", "path": "a.M.Inner", "parent": "a.M", "type": "u16", "value": 7},
+            ])
+        );
+        assert!(files[1].contents.contains(r#""value": 2.0"#));
+        assert!(
+            namespace["defs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|def| def["kind"] != "const")
+        );
+    }
+
+    #[test]
     fn messages_carry_their_direction_and_ids() {
         let sources = [concat!(
             "namespace a;\n",
@@ -726,7 +792,8 @@ mod tests {
     fn empty_containers_stay_on_one_line() {
         let files = generated(&["namespace a;\nstruct S {}\n"]);
         assert!(
-            files[1].contents.contains(r#""fields": []"#),
+            files[1].contents.contains(r#""fields": []"#)
+                && files[1].contents.contains(r#""consts": []"#),
             "{}",
             files[1].contents
         );

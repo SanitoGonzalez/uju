@@ -6,8 +6,8 @@ use crate::diagnostic::{Diagnostic, SourceId};
 use crate::parser::ast;
 
 /// Warns about names that break the schema's naming convention:
-/// namespaces and fields in `snake_case`, types and enum variants in
-/// `PascalCase`. Backends convert names into their own conventions, which
+/// namespaces and fields in `snake_case`, types, enum variants, and consts
+/// in `PascalCase`. Backends convert names into their own conventions, which
 /// is only predictable from a consistent starting point.
 pub fn naming(source: SourceId, schema: &ast::Schema<'_>, out: &mut Vec<Diagnostic>) {
     for segment in &schema.namespace.segments {
@@ -34,6 +34,7 @@ fn item_naming(source: SourceId, item: &ast::Item<'_>, out: &mut Vec<Diagnostic>
             expect(source, "message", &item.name, Style::Pascal, out);
             body_naming(source, &item.body, out);
         }
+        ast::Item::Const(item) => expect(source, "const", &item.name, Style::Pascal, out),
     }
 }
 
@@ -61,7 +62,7 @@ fn expect(
 ) {
     let (suggestion, style) = match style {
         Style::Snake => (case::snake(name), "snake_case"),
-        Style::Pascal => (case::pascal(name), "PascalCase"),
+        Style::Pascal => (pascal_suggestion(name), "PascalCase"),
     };
     if suggestion == *name {
         return;
@@ -72,6 +73,17 @@ fn expect(
         message.push_str(&format!(", like `{suggestion}`"));
     }
     out.push(Diagnostic::warning(source, span.clone(), message));
+}
+
+/// The PascalCase spelling of `name` to suggest. A SCREAMING_SNAKE_CASE
+/// name, which has no word boundaries but its underscores, gets each word
+/// capitalized (`MAX_LEN` as `MaxLen`); [`case::pascal`] would keep every
+/// word as an acronym and suggest `MAXLEN`.
+fn pascal_suggestion(name: &str) -> String {
+    if !name.contains('_') || name.bytes().any(|byte| byte.is_ascii_lowercase()) {
+        return case::pascal(name);
+    }
+    case::pascal(&name.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -100,7 +112,8 @@ mod tests {
         let warnings = warnings(&["namespace Game.my_ns;\n\
              enum color { light_red }\n\
              struct Foo_Bar { HitPoints: u8 }\n\
-             message[in] spawn { struct inner { _: u8 } }\n"]);
+             message[in] spawn { struct inner { _: u8 } const max_len: u8 = 1; }\n\
+             const HTTP_PORT: u16 = 80;\n"]);
         assert_eq!(
             warnings,
             [
@@ -112,6 +125,8 @@ mod tests {
                 "message `spawn` should be PascalCase, like `Spawn`",
                 "struct `inner` should be PascalCase, like `Inner`",
                 "field `_` should be snake_case",
+                "const `max_len` should be PascalCase, like `MaxLen`",
+                "const `HTTP_PORT` should be PascalCase, like `HttpPort`",
             ]
         );
     }

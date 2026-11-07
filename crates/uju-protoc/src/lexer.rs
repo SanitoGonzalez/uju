@@ -26,6 +26,9 @@ pub enum Token<'src> {
     #[token("message")]
     Message,
 
+    #[token("const")]
+    Const,
+
     #[token("{")]
     BraceOpen,
 
@@ -68,6 +71,11 @@ pub enum Token<'src> {
 
     #[regex(r"-?[0-9]+\.[0-9]+", float)]
     Float(f64),
+
+    /// A string literal, with its escapes resolved.
+    #[regex(r#""([^"\\\n]|\\[^\n])*""#, string)]
+    #[regex(r#""([^"\\\n]|\\[^\n])*"#, unterminated_string)]
+    Str(String),
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +86,8 @@ pub enum LexError {
     FloatOverflow,
     UnterminatedComment,
     MalformedNumber,
+    UnterminatedString,
+    InvalidEscape,
 }
 
 /// Tokenize `src`, returning every token that could be read along with every
@@ -113,6 +123,54 @@ fn float<'src>(lex: &mut logos::Lexer<'src, Token<'src>>) -> Callback<f64> {
         Ok(value) if value.is_finite() => Ok(value),
         _ => Err(LexError::FloatOverflow),
     }
+}
+
+/// Resolve the escapes of a string literal: `\"`, `\\`, `\n`, `\r`, `\t`,
+/// `\0`, and `\u{...}` with one to six hex digits naming a Unicode scalar
+/// value.
+fn string<'src>(lex: &mut logos::Lexer<'src, Token<'src>>) -> Callback<String> {
+    let slice = lex.slice();
+    let mut chars = slice[1..slice.len() - 1].chars();
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        out.push(match chars.next() {
+            Some('"') => '"',
+            Some('\\') => '\\',
+            Some('n') => '\n',
+            Some('r') => '\r',
+            Some('t') => '\t',
+            Some('0') => '\0',
+            Some('u') => unicode_escape(&mut chars).ok_or(LexError::InvalidEscape)?,
+            _ => return Err(LexError::InvalidEscape),
+        });
+    }
+    Ok(out)
+}
+
+/// The scalar value of `{...}` after `\u`.
+fn unicode_escape(chars: &mut std::str::Chars<'_>) -> Option<char> {
+    if chars.next()? != '{' {
+        return None;
+    }
+    let mut digits = String::new();
+    loop {
+        match chars.next()? {
+            '}' => break,
+            ch => digits.push(ch),
+        }
+    }
+    if digits.is_empty() || digits.len() > 6 {
+        return None;
+    }
+    char::from_u32(u32::from_str_radix(&digits, 16).ok()?)
+}
+
+fn unterminated_string<'src>(_: &mut logos::Lexer<'src, Token<'src>>) -> Callback<String> {
+    Err(LexError::UnterminatedString)
 }
 
 fn malformed_number<'src>(_: &mut logos::Lexer<'src, Token<'src>>) -> Callback<i128> {
@@ -155,6 +213,7 @@ impl fmt::Display for Token<'_> {
             Token::Enum => f.write_str("enum"),
             Token::Struct => f.write_str("struct"),
             Token::Message => f.write_str("message"),
+            Token::Const => f.write_str("const"),
             Token::BraceOpen => f.write_str("{"),
             Token::BraceClose => f.write_str("}"),
             Token::BracketOpen => f.write_str("["),
@@ -169,6 +228,7 @@ impl fmt::Display for Token<'_> {
             Token::Ident(s) => f.write_str(s),
             Token::Int(x) => write!(f, "{x}"),
             Token::Float(x) => write!(f, "{x}"),
+            Token::Str(x) => write!(f, "{x:?}"),
         }
     }
 }
@@ -181,6 +241,8 @@ impl fmt::Display for LexError {
             LexError::FloatOverflow => f.write_str("float literal out of range"),
             LexError::UnterminatedComment => f.write_str("unterminated block comment"),
             LexError::MalformedNumber => f.write_str("malformed number literal"),
+            LexError::UnterminatedString => f.write_str("unterminated string literal"),
+            LexError::InvalidEscape => f.write_str("invalid escape in string literal"),
         }
     }
 }
@@ -206,13 +268,14 @@ mod tests {
     #[test]
     fn keywords_and_punctuation() {
         assert_eq!(
-            tokens("namespace use enum struct message"),
+            tokens("namespace use enum struct message const"),
             [
                 Token::Namespace,
                 Token::Use,
                 Token::Enum,
                 Token::Struct,
                 Token::Message,
+                Token::Const,
             ]
         );
         assert_eq!(
@@ -277,6 +340,42 @@ mod tests {
                 Token::Ident("true"),
             ]
         );
+    }
+
+    #[test]
+    fn string_literals_resolve_their_escapes() {
+        assert_eq!(
+            tokens(r#""" "hi" "a\"b\\c" "\n\r\t\0" "\u{41}\u{1F600}" "héllo""#),
+            [
+                Token::Str(String::new()),
+                Token::Str("hi".into()),
+                Token::Str("a\"b\\c".into()),
+                Token::Str("\n\r\t\0".into()),
+                Token::Str("A\u{1F600}".into()),
+                Token::Str("héllo".into()),
+            ]
+        );
+        // A comment marker inside a string is part of it.
+        assert_eq!(tokens(r#""// /*""#), [Token::Str("// /*".into())]);
+    }
+
+    #[test]
+    fn bad_string_literals_are_reported() {
+        for src in [
+            r#""\q""#,
+            r#""\u41""#,
+            r#""\u{}""#,
+            r#""\u{1234567}""#,
+            r#""\u{D800}""#,
+            r#""\u{zz}""#,
+        ] {
+            assert_eq!(
+                errors(src),
+                [(LexError::InvalidEscape, 0..src.len())],
+                "{src}"
+            );
+        }
+        assert_eq!(errors("\"open\nA"), [(LexError::UnterminatedString, 0..5)]);
     }
 
     #[test]

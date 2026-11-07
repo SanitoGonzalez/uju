@@ -5,7 +5,9 @@
 
 use std::fmt::Write as _;
 
-use crate::ir::{DefKind, Direction, Field, Number, Schema, Type, TypeId, TypeKind};
+use crate::ir::{
+    ConstId, ConstValue, DefKind, Direction, Field, Number, Schema, Type, TypeId, TypeKind,
+};
 
 /// The largest encoded message, in bytes. Every length, count, and offset
 /// therefore fits in a `u16`.
@@ -558,7 +560,7 @@ fn sequence_max(ty: &Type, sequence: Sequence, item: Size) -> Option<u32> {
 
 /// Every declaration as written in source, sorted by qualified name, so the
 /// order sources are compiled in does not matter. Field order does: it is
-/// the layout.
+/// the layout. Consts follow the types, sorted the same way.
 fn canonical(schema: &Schema) -> String {
     let mut defs: Vec<(String, TypeId)> = (0..schema.defs.len())
         .map(|index| (schema.qualified(TypeId(index)), TypeId(index)))
@@ -594,6 +596,32 @@ fn canonical(schema: &Schema) -> String {
             }
         }
         out.push_str(" }\n");
+    }
+
+    let mut consts: Vec<(String, ConstId)> = (0..schema.consts.len())
+        .map(|index| (schema.const_qualified(ConstId(index)), ConstId(index)))
+        .collect();
+    consts.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, id) in consts {
+        let item = schema.constant(id);
+        let _ = write!(out, "const {name}: {} = ", schema.kind_name(&item.ty));
+        match &item.value {
+            // Escaped by hand, so the hash never follows `{:?}`'s choices.
+            ConstValue::String(value) => {
+                out.push('"');
+                for ch in value.chars() {
+                    if matches!(ch, '"' | '\\') {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                }
+                out.push('"');
+            }
+            value => {
+                let _ = write!(out, "{value}");
+            }
+        }
+        out.push_str(";\n");
     }
     out
 }
@@ -950,9 +978,34 @@ mod tests {
             "message[in] M { x: u8[max=9], y: u16 }",
             "message[in] M { x: option<u8>, y: u16 }",
             "message[in] M { x: u8, y: u16 }\nenum E { A }",
+            "message[in] M { x: u8, y: u16 }\nconst C: u8 = 1;",
+            "message[in] M { const C: u8 = 1; x: u8, y: u16 }",
         ] {
             assert_ne!(base, fingerprint(changed), "{changed}");
         }
+    }
+
+    #[test]
+    fn fingerprints_cover_const_values() {
+        let fingerprint = |src: &str| {
+            compiled(&[&format!("namespace a;\n{src}\n")])
+                .1
+                .fingerprint()
+        };
+        let base = fingerprint("const C: u8 = 1;\nconst S: string = \"a\";");
+        for changed in [
+            "const C: u8 = 2;\nconst S: string = \"a\";",
+            "const C: u16 = 1;\nconst S: string = \"a\";",
+            "const D: u8 = 1;\nconst S: string = \"a\";",
+            "const C: u8 = 1;\nconst S: string = \"b\";",
+        ] {
+            assert_ne!(base, fingerprint(changed), "{changed}");
+        }
+        // Unescaped, the first would read exactly as the second.
+        assert_ne!(
+            fingerprint(r#"const A: string = "x\";\nconst a.B: string = \"y";"#),
+            fingerprint("const A: string = \"x\";\nconst B: string = \"y\";"),
+        );
     }
 
     #[test]

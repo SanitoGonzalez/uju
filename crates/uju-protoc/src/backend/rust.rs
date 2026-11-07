@@ -7,7 +7,8 @@
 //! Each struct and message `Foo` becomes the owned `Foo`, which
 //! encodes into a caller's buffer, and `FooView`, which validates an encoding
 //! once and then reads it in place. Every layout comes from [`Wire`], so the
-//! code agrees with every other backend byte for byte.
+//! code agrees with every other backend byte for byte. Consts become
+//! `SCREAMING_SNAKE_CASE` constants beside the types of their scope.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -16,7 +17,10 @@ use std::path::PathBuf;
 use crate::backend::{self, Backend, Error, GeneratedFile};
 use crate::case;
 use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, Width, Wire};
-use crate::ir::{Constraints, DefKind, Direction, Field, Number, Schema, Type, TypeId, TypeKind};
+use crate::ir::{
+    ConstId, ConstValue, Constraints, DefKind, Direction, Field, NamespaceId, Number, Schema, Type,
+    TypeId, TypeKind,
+};
 
 /// Where generated code finds the runtime, aliased as `__w` in each module.
 const RUNTIME: &str = "::uju::net::wire";
@@ -105,6 +109,10 @@ struct Generator<'a> {
     names: Vec<String>,
     /// The module each declaration lives in, as Rust identifiers.
     modules: Vec<Vec<String>>,
+    /// The Rust name of each const, indexed by [`ConstId`], and the module
+    /// it lives in.
+    const_names: Vec<String>,
+    const_modules: Vec<Vec<String>>,
     traits: Vec<Traits>,
     /// Whether each declaration is encoded, or decoded, by this peer.
     encode: Vec<bool>,
@@ -126,6 +134,12 @@ impl<'a> Generator<'a> {
         let modules = (0..len)
             .map(|index| module(schema, TypeId(index)))
             .collect();
+        let const_names = const_names(schema)?;
+        let const_modules = schema
+            .consts
+            .iter()
+            .map(|item| scope_module(schema, item.namespace, item.parent))
+            .collect();
         let (encode, decode) = roles(schema, direction);
         let generator = Generator {
             schema,
@@ -133,6 +147,8 @@ impl<'a> Generator<'a> {
             direction,
             names,
             modules,
+            const_names,
+            const_modules,
             traits: traits(schema),
             encode,
             decode,
@@ -148,6 +164,19 @@ impl<'a> Generator<'a> {
     fn check_names(&self) -> Result<(), Error> {
         let mut seen: BTreeMap<(Vec<String>, String), String> = BTreeMap::new();
         let mut errors = Vec::new();
+        // Consts are values, so they never meet a type, but `MaxHp` and
+        // `MAXHp` are both `MAX_HP`.
+        let mut values: BTreeMap<(&[String], &str), ConstId> = BTreeMap::new();
+        for (index, name) in self.const_names.iter().enumerate() {
+            let key = (&self.const_modules[index][..], name.as_str());
+            if let Some(previous) = values.insert(key, ConstId(index)) {
+                errors.push(format!(
+                    "`{}` and `{}` both generate `{name}`",
+                    self.schema.const_qualified(previous),
+                    self.schema.const_qualified(ConstId(index))
+                ));
+            }
+        }
         let mut claim = |module: &[String], name: String, owner: String| {
             let key = (module.to_vec(), name);
             match seen.get(&key) {
@@ -173,12 +202,20 @@ impl<'a> Generator<'a> {
             let module = &self.modules[index];
             if let Some(parent) = def.parent {
                 let (name, outer) = module.split_last().expect("nested in a module");
-                let owner = format!("types nested in {}", self.schema.qualified(parent));
+                let owner = format!("declarations nested in {}", self.schema.qualified(parent));
                 claim(outer, name.clone(), owner);
             }
             claim(module, self.names[index].clone(), owner.clone());
             if !matches!(def.kind, DefKind::Enum(_)) {
                 claim(module, format!("{}View", self.names[index]), owner);
+            }
+        }
+        for (index, item) in self.schema.consts.iter().enumerate() {
+            if let Some(parent) = item.parent {
+                let module = &self.const_modules[index];
+                let (name, outer) = module.split_last().expect("nested in a module");
+                let owner = format!("declarations nested in {}", self.schema.qualified(parent));
+                claim(outer, name.clone(), owner);
             }
         }
         for (name, generated) in [
@@ -244,6 +281,15 @@ impl<'a> Generator<'a> {
             }
             module.defs.push(id);
         }
+        let mut consts: Vec<ConstId> = (0..self.schema.consts.len()).map(ConstId).collect();
+        consts.sort_by_cached_key(|id| self.schema.const_qualified(*id));
+        for id in consts {
+            let mut module = &mut root;
+            for segment in &self.const_modules[id.0] {
+                module = module.children.entry(segment.clone()).or_default();
+            }
+            module.consts.push(id);
+        }
         let mut files = Vec::new();
         self.file(&root, &mut Vec::new(), &mut files);
         files
@@ -306,6 +352,12 @@ impl<'a> Generator<'a> {
             out.line("");
             out.line(format!("use {RUNTIME} as __w;"));
         }
+        if !module.consts.is_empty() {
+            out.line("");
+        }
+        for id in &module.consts {
+            self.constant(out, *id);
+        }
         for id in &module.defs {
             out.line("");
             match &self.schema.def(*id).kind {
@@ -333,6 +385,23 @@ impl<'a> Generator<'a> {
 
     // -----------------------------------------------------------------------
     // Declarations
+
+    fn constant(&self, out: &mut Out, id: ConstId) {
+        let item = self.schema.constant(id);
+        let (ty, value) = match (&item.ty, &item.value) {
+            (_, ConstValue::Int(value)) => (self.schema.kind_name(&item.ty), value.to_string()),
+            (TypeKind::F32, ConstValue::Float(value)) => {
+                ("f32".into(), format!("{:?}", *value as f32))
+            }
+            (_, ConstValue::Float(value)) => ("f64".into(), format!("{value:?}")),
+            (_, ConstValue::Bool(value)) => ("bool".into(), value.to_string()),
+            (_, ConstValue::String(value)) => ("&str".into(), string_literal(value)),
+        };
+        out.line(format!(
+            "pub const {}: {ty} = {value};",
+            self.const_names[id.0]
+        ));
+    }
 
     fn enumeration(&self, out: &mut Out, id: TypeId, item: &crate::ir::Enum) {
         let name = &self.names[id.0];
@@ -1803,6 +1872,7 @@ impl Object<'_> {
 #[derive(Default)]
 struct Module {
     defs: Vec<TypeId>,
+    consts: Vec<ConstId>,
     children: BTreeMap<String, Module>,
     /// A namespace, or one enclosing a namespace, emitted as its own file;
     /// the modules of nested types are inline.
@@ -1937,17 +2007,70 @@ fn unsupported(schema: &Schema) -> Result<(), Error> {
 /// declaration, so `a.Foo.Bar` lives in `a::foo`.
 fn module(schema: &Schema, id: TypeId) -> Vec<String> {
     let def = schema.def(id);
-    match def.parent {
+    scope_module(schema, def.namespace, def.parent)
+}
+
+/// The module of what is declared in `parent`, or at the top of
+/// `namespace`.
+fn scope_module(schema: &Schema, namespace: NamespaceId, parent: Option<TypeId>) -> Vec<String> {
+    match parent {
         Some(parent) => {
             let mut module = module(schema, parent);
             module.push(snake(&schema.def(parent).name));
             module
         }
         None => {
-            let namespace = schema.namespace(def.namespace);
+            let namespace = schema.namespace(namespace);
             namespace.name.iter().map(|name| ident(name)).collect()
         }
     }
+}
+
+/// Each const's name in `SCREAMING_SNAKE_CASE`: `MaxHp` is `MAX_HP`. A
+/// name made only of underscores has no words to convert and is rejected.
+fn const_names(schema: &Schema) -> Result<Vec<String>, Error> {
+    let mut names = Vec::with_capacity(schema.consts.len());
+    let mut errors = Vec::new();
+    for (index, item) in schema.consts.iter().enumerate() {
+        let name = case::shouty(&item.name);
+        if name.is_empty() {
+            errors.push(format!(
+                "`{}` has no words to name a Rust constant",
+                schema.const_qualified(ConstId(index))
+            ));
+        }
+        // `_1` is `1`, which must not start an identifier.
+        if name.starts_with(|ch: char| ch.is_ascii_digit()) {
+            names.push(format!("_{name}"));
+        } else {
+            names.push(name);
+        }
+    }
+    if !errors.is_empty() {
+        return Err(Error::new(errors.join("\n")));
+    }
+    Ok(names)
+}
+
+/// `value` as a Rust string literal. Escaped by hand rather than with
+/// `{:?}`, whose choices may change between Rust versions and churn
+/// committed code.
+fn string_literal(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Every declaration's role: whether this peer encodes it, and whether it
@@ -2513,8 +2636,89 @@ mod tests {
         let error = Rust { direction: None }.generate(&schema).unwrap_err();
         assert_eq!(
             error.message,
-            "`namespace a.foo` and `types nested in a.Foo` both generate `foo`"
+            "`namespace a.foo` and `declarations nested in a.Foo` both generate `foo`"
         );
+
+        // A const alone opens the module.
+        let schema = compile(&[
+            "namespace a;\nstruct Foo { const C: u8 = 1; }\n",
+            "namespace a.foo;\nstruct Bar {}\n",
+        ])
+        .unwrap()
+        .schema;
+        let error = Rust { direction: None }.generate(&schema).unwrap_err();
+        assert_eq!(
+            error.message,
+            "`namespace a.foo` and `declarations nested in a.Foo` both generate `foo`"
+        );
+    }
+
+    #[test]
+    fn consts_are_shouty_beside_their_scope() {
+        let files = files(
+            &[concat!(
+                "namespace a;\n",
+                "const MaxHp: u32 = 100;\n",
+                "const HTTPPort: u16 = 80;\n",
+                "const Low: i64 = -9223372036854775808;\n",
+                "const Big: u64 = 18446744073709551615;\n",
+                "const Rate: f32 = 0.1;\n",
+                "const Whole: f64 = 2;\n",
+                "const On: bool = false;\n",
+                "const Text: string = \"say \\\"hi\\\"\\n\\u{7}é\";\n",
+                "message[in] SetName {\n",
+                "    const MaxLength: u8 = 16;\n",
+                "    name: string,\n",
+                "}\n",
+                "struct Limits { const Slots: u8 = 4; }\n",
+            )],
+            None,
+        );
+        let contents = file(&files, "a/mod.rs");
+        for line in [
+            "pub const MAX_HP: u32 = 100;",
+            "pub const HTTP_PORT: u16 = 80;",
+            "pub const LOW: i64 = -9223372036854775808;",
+            "pub const BIG: u64 = 18446744073709551615;",
+            "pub const RATE: f32 = 0.1;",
+            "pub const WHOLE: f64 = 2.0;",
+            "pub const ON: bool = false;",
+            r#"pub const TEXT: &str = "say \"hi\"\n\u{7}é";"#,
+            "pub mod set_name {\n    pub const MAX_LENGTH: u8 = 16;\n}",
+            "pub mod limits {\n    pub const SLOTS: u8 = 4;\n}",
+        ] {
+            assert!(contents.contains(line), "no `{line}` in\n{contents}");
+        }
+        // Sorted by qualified name, before the types.
+        let at = |needle| contents.find(needle).unwrap();
+        assert!(at("BIG") < at("HTTP_PORT") && at("HTTP_PORT") < at("MAX_HP"));
+        assert!(at("TEXT") < at("pub struct Limits"));
+    }
+
+    #[test]
+    fn colliding_consts_are_reported() {
+        let schema = compile(&["namespace a;\nconst MaxHp: u8 = 1;\nconst MAXHp: u8 = 2;\n"])
+            .unwrap()
+            .schema;
+        let error = Rust { direction: None }.generate(&schema).unwrap_err();
+        assert_eq!(
+            error.message,
+            "`a.MaxHp` and `a.MAXHp` both generate `MAX_HP`"
+        );
+
+        // Values and types live apart in Rust.
+        files(&["namespace a;\nconst AB: u8 = 1;\nstruct Ab {}\n"], None);
+
+        let schema = compile(&["namespace a;\nconst _: u8 = 1;\nconst _1: u8 = 2;\n"])
+            .unwrap()
+            .schema;
+        let error = Rust { direction: None }.generate(&schema).unwrap_err();
+        assert_eq!(error.message, "`a._` has no words to name a Rust constant");
+        let schema = compile(&["namespace a;\nconst _1: u8 = 2;\n"])
+            .unwrap()
+            .schema;
+        let files = Rust { direction: None }.generate(&schema).unwrap();
+        assert!(file(&files, "a/mod.rs").contains("pub const _1: u8 = 2;"));
     }
 
     #[test]
