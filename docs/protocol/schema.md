@@ -303,8 +303,8 @@ message(client <-> entry) Ping {}
 ```
 
 - The roles are `client`, `entry`, `edge`, `sim` and `hub`, the processes
-  of a [cluster](../architectures/topology.md#roles). Atlas speaks only
-  uju's own messages, so `atlas` is not an endpoint.
+  of a [cluster](../architectures/topology.md#roles). Coordinator speaks
+  only uju's own messages, so `coordinator` is not an endpoint.
 - `->` goes one way and `<->` both ways. `|` lists the roles of one side,
   each once.
 - A message travels every pair of a role on its left and a role on its

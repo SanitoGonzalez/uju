@@ -10,7 +10,7 @@ client ──login──► entry ───────────────�
 client ─────────► edge ──┬──► sim node ── shard × N   owns cells
                          └──► hub node ── shard × N   owns slots
    sim shard ◄─► sim shard    sim shard ──► hub shard    hub shard ◄─► hub shard
-        atlas: placement maps, directory, every move
+  coordinator: placement maps, directory, every move
 ```
 
 ## Roles
@@ -35,8 +35,9 @@ client ─────────► edge ──┬──► sim node ── sh
   [Inside an edge](#inside-an-edge)).
 - **Entry**: the front door. Authenticates a client and tells it which edge
   to connect to.
-- **Atlas**: the control plane. Owns the placement maps and the directory of
-  addresses, and decides every move of a cell, a slot or an edge cut.
+- **Coordinator**: the control plane. Owns the placement maps and the
+  directory of addresses, and decides every move of a cell, a slot or an
+  edge cut.
 
 A **replica** is a read-only copy of a cell, kept by a node that needs the
 cell but does not own it: an edge for its clients, or a sim shard for the
@@ -60,8 +61,8 @@ of NPCs is heavy for the sim and light for the edge. Keeping the maps apart
 lets each follow its own load, and lets sims rebalance without clients
 noticing.
 
-Atlas decides every move. The owners carry it out between themselves, and
-data never waits on atlas.
+Coordinator decides every move. The owners carry it out between
+themselves, and data never waits on coordinator.
 
 ## Cells
 
@@ -150,7 +151,7 @@ Hilbert order (4×4)        cores as ranges
 - A world that is not a 2ⁿ×2ⁿ square is padded up to one. Padding cells
   hold nothing and cost nothing.
 
-Atlas picks where to cut:
+Coordinator picks where to cut:
 
 - **Balance first.** Candidates lie near the point that halves the range's
   load, say within ±10%.
@@ -188,9 +189,9 @@ core is only a few cells across, R takes over.
 
 - **Hysteresis.** The split threshold sits above the merge threshold, and a
   layout change holds for a minimum time before the next one.
-- **Ahead of the peak.** Load follows a daily pattern, so atlas splits on
-  forecast load before the peak and merges after it, rather than moving
-  clients at the busiest hour.
+- **Ahead of the peak.** Load follows a daily pattern, so coordinator
+  splits on forecast load before the peak and merges after it, rather than
+  moving clients at the busiest hour.
 - **Gradual handover.** After a cut moves, the gaining edge replicates the
   cells first. Entry then sends new logins there, and the edge that lost the
   cells moves its clients across in batches, each by
@@ -303,8 +304,8 @@ Edges are spatial, so a client cannot pick one on its own. Entry does it:
    threads' rings.
 3. On character select, entry reads [presence](#presence) as a hint only.
 4. Entry reads the character's last position, maps it to a cell, picks the
-   least loaded edge of that cell's set, by the load atlas reports, and
-   returns the edge's address and a token.
+   least loaded edge of that cell's set, by the load that coordinator
+   reports, and returns the edge's address and a token.
 5. The client connects to the edge. The edge verifies the token and claims
    presence. Once the claim is granted, it asks the cell's owner shard to
    load and spawn the character. If the cell is not in its core, because
@@ -336,7 +337,7 @@ chat channel. Its placement is
 
 ```
 slot = hash(kind, id) mod SLOTS   # SLOTS a power of two, fixed for the cluster's lifetime
-shard = slot_map[slot]            # owned by atlas
+shard = slot_map[slot]            # owned by coordinator
 ```
 
 Whoever asks for a new object mints its id, such as a random 64-bit number,
@@ -422,8 +423,8 @@ character in play, the edge serving it, and a generation number.
 | sim shard | neighbor sim shards | halo replicas, cell handoff, entity migration, forwarding |
 | sim shard | hub shards | writes, hub cache, hub → sim messages |
 | hub shard | hub shards | slot handoff, forwarding |
-| atlas | every node | maps, decisions |
-| every node | atlas | load, crossing traffic |
+| coordinator | every node | maps, decisions |
+| every node | coordinator | load, crossing traffic |
 
 Shards on the same node talk over in-process channels
 (`crates/uju/src/runtime/node.rs`), and over TCP across nodes.
@@ -438,22 +439,23 @@ connecting on demand. Whether an edge connects per thread or per node
 depends on [Inside an edge](#inside-an-edge).
 
 **Shards connect to each other on demand.** Each needs only its neighbors
-and the targets of its handoffs, which atlas knows in advance, since it
-decides every move. Atlas names the peer in its decision, the shards
-connect, and only then does the move start. Idle shard-to-shard sessions
-close after a while.
+and the targets of its handoffs, which coordinator knows in advance, since
+it decides every move. Coordinator names the peer in its decision, the
+shards connect, and only then does the move start. Idle shard-to-shard
+sessions close after a while.
 
 See [Network](../operations/network.md) for how each session's packets land
 on the right CPU.
 
 ## Membership
 
-- **Join**: a node registers with atlas, which adds it to the directory.
-  Edges, entry and the shards atlas names connect to it. Once they report
-  connected, atlas may place cells, slots or an edge cut on it.
-- **Leave**: atlas drains the node first: its cells and slots move away, or
-  its edge's clients move to other edges. Then atlas removes it from the
-  directory and peers close their sessions.
+- **Join**: a node registers with coordinator, which adds it to the
+  directory. Edges, entry and the shards that coordinator names connect to
+  it. Once they report connected, coordinator may place cells, slots or an
+  edge cut on it.
+- **Leave**: coordinator drains the node first: its cells and slots move
+  away, or its edge's clients move to other edges. Then coordinator removes
+  it from the directory and peers close their sessions.
 
 ## Replication
 
@@ -471,7 +473,7 @@ change.
 
 ### Cell handoff
 
-Atlas decides that cell `c` moves from shard S to shard S′. Then:
+Coordinator decides that cell `c` moves from shard S to shard S′. Then:
 
 1. S sends `c`'s last deltas, then `Handoff { cell: c, epoch: e, to: S′ }`,
    in order on the same stream.
@@ -485,9 +487,9 @@ Atlas decides that cell `c` moves from shard S to shard S′. Then:
 
 - **For a subscribed cell, the stream** is the truth: a subscriber learns
   every change from `Handoff`, in order with the data.
-- **For any other cell, atlas's map** is, and it may be stale. A shard that
-  receives a subscription, snapshot request or input for a cell it no longer
-  owns forwards it to the owner it handed the cell to.
+- **For any other cell, coordinator's map** is, and it may be stale. A
+  shard that receives a subscription, snapshot request or input for a cell
+  it no longer owns forwards it to the owner it handed the cell to.
 
 ### Resync and backpressure
 
@@ -523,9 +525,10 @@ its replicas. The replicas lag the sim by about a tick plus transit, so
 anything that needs authority, such as a purchase or a state change, goes
 to the owning shard.
 
-## Atlas
+## Coordinator
 
-- **cell → sim shard**: authoritative, changed only by atlas's decisions.
+- **cell → sim shard**: authoritative, changed only by coordinator's
+  decisions.
 - **slot → hub shard**: likewise.
 - **cell → edge set**: cut points along the Hilbert order, and R per core.
   Halos are derived.
@@ -552,5 +555,5 @@ to the owning shard.
   objects, and where a character's last position is read from at entry.
 - **Token keys**: every edge issues tokens, so every edge holds a signing
   key. How keys reach entries and edges, and how they rotate.
-- **Failures**: how atlas stays available, and what happens to a node's
-  cells, slots and clients when it dies rather than leaves.
+- **Failures**: how coordinator stays available, and what happens to a
+  node's cells, slots and clients when it dies rather than leaves.

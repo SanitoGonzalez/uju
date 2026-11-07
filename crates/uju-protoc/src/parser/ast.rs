@@ -780,7 +780,7 @@ mod tests {
         for role in Role::ALL {
             assert_eq!(Role::from_name(role.name()), Some(role));
         }
-        assert_eq!(Role::from_name("atlas"), None);
+        assert_eq!(Role::from_name("coordinator"), None);
         assert_eq!(Role::from_name("Sim"), None);
     }
 

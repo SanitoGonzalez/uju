@@ -381,10 +381,10 @@ where
             .try_map(|((name, name_span), kind), span: Span| {
                 let role = match Role::from_name(name) {
                     Some(role) => role,
-                    None if name == "atlas" => {
+                    None if name == "coordinator" => {
                         return Err(Rich::custom(
                             name_span,
-                            "`atlas` cannot be an endpoint; atlas speaks only uju's own messages",
+                            "`coordinator` cannot be an endpoint; coordinator speaks only uju's own messages",
                         ));
                     }
                     None => {
@@ -903,8 +903,8 @@ mod tests {
             "`server` is not a role; expected `client`, `entry`, `edge`, `sim`, or `hub`"
         );
         assert_eq!(
-            errors_of("namespace a\nmessage(atlas -> sim) M {}\n")[0].message,
-            "`atlas` cannot be an endpoint; atlas speaks only uju's own messages"
+            errors_of("namespace a\nmessage(coordinator -> sim) M {}\n")[0].message,
+            "`coordinator` cannot be an endpoint; coordinator speaks only uju's own messages"
         );
         let src = "namespace a\nmessage(client -> sim<P>) M {}\n";
         let error = &errors_of(src)[0];
