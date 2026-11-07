@@ -23,6 +23,8 @@ pub enum Item<'src> {
     Struct(Struct<'src>),
     Message(Message<'src>),
     Const(Const<'src>),
+    Union(Union<'src>),
+    Type(TypeDecl<'src>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +52,42 @@ pub struct Message<'src> {
     pub direction: Spanned<Direction>,
     pub name: Ident<'src>,
     pub body: Body<'src>,
+}
+
+/// `union Name { A { x: u8 }, B(u8), C }`: a sum type whose variants
+/// carry data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Union<'src> {
+    pub name: Ident<'src>,
+    pub variants: Vec<UnionVariant<'src>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionVariant<'src> {
+    pub name: Ident<'src>,
+    pub data: VariantData<'src>,
+}
+
+/// What a union variant carries, in one of Rust's three forms.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VariantData<'src> {
+    /// `C`: nothing.
+    Unit,
+    /// `B(u8)`: a single value.
+    Type(Type<'src>),
+    /// `A { x: u8 }`: fields, laid out as an object. `span` covers the
+    /// braces.
+    Fields {
+        fields: Vec<Field<'src>>,
+        span: Span,
+    },
+}
+
+/// `type Name = Target;`: a named type, laid out as its target.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDecl<'src> {
+    pub name: Ident<'src>,
+    pub target: Type<'src>,
 }
 
 /// `const Name: Type = value;`, at the top level or in a struct or message.
@@ -166,6 +204,8 @@ impl<'src> Item<'src> {
             Item::Struct(item) => &item.name,
             Item::Message(item) => &item.name,
             Item::Const(item) => &item.name,
+            Item::Union(item) => &item.name,
+            Item::Type(item) => &item.name,
         }
     }
 
@@ -175,6 +215,8 @@ impl<'src> Item<'src> {
             Item::Struct(_) => "struct",
             Item::Message(_) => "message",
             Item::Const(_) => "const",
+            Item::Union(_) => "union",
+            Item::Type(_) => "type",
         }
     }
 
@@ -182,7 +224,7 @@ impl<'src> Item<'src> {
         match self {
             Item::Struct(item) => Some(&item.body),
             Item::Message(item) => Some(&item.body),
-            Item::Enum(_) | Item::Const(_) => None,
+            Item::Enum(_) | Item::Const(_) | Item::Union(_) | Item::Type(_) => None,
         }
     }
 }
@@ -492,6 +534,13 @@ mod tests {
         });
         assert_eq!(item.keyword(), "enum");
         assert_eq!(item.body(), None);
+
+        let item = Item::Union(Union {
+            name: ("Op", 6..8),
+            variants: Vec::new(),
+        });
+        assert_eq!(item.keyword(), "union");
+        assert_eq!(item.body(), None, "a union holds no nested declarations");
     }
 
     #[test]

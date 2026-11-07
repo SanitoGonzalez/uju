@@ -1,7 +1,7 @@
 # Schema
 
-> **Status.** Only naming, consts, and the planned component declarations
-> are written up here. Until the rest of the language is,
+> **Status.** Only naming, consts, types, unions, and the planned component
+> declarations are written up here. Until the rest of the language is,
 > `crates/uju-protoc/tests/data/example1.uju` shows every declaration kind,
 > type and constraint.
 
@@ -15,8 +15,12 @@ name has a convention:
 | Namespace segment | `snake_case` | `namespace demo.character;` |
 | Enum, struct, message | `PascalCase` | `message[out] SpawnPlayer` |
 | Enum variant | `PascalCase` | `Blue` |
+| Union | `PascalCase` | `union InventoryOp` |
+| Union variant | `PascalCase` | `Remove(u8)` |
+| Type | `PascalCase` | `type PartyId = u64;` |
 | Const | `PascalCase` | `const MaxHp: u32 = 100;` |
 | Field | `snake_case` | `max_hp: u32` |
+| Union variant field | `snake_case` | `Add { slot_index: u8 }` |
 
 `ujuc` warns about a name that breaks its convention and suggests one that
 follows it. The schema still compiles.
@@ -101,6 +105,82 @@ namespace's module, and a nested const in its parent's module, as
 
 > **TODO.** Constraints and array lengths can't refer to consts yet, as in
 > `string[max_length=MaxNameLength]` or `array<u32, SlotCount>`.
+
+## Types
+
+A `type` gives a scalar a name of its own, so that an id or a key can't be
+mixed up with another value of the same width:
+
+```
+namespace demo.party;
+
+type PartyId = u64;
+type Level = u8[max=100];
+
+struct Member {
+    party: PartyId,
+    level: Level,
+}
+```
+
+- The target is a scalar: an integer, a float, `bool`, `timestamp`,
+  `interval`, `entity`, `uentity`, `uuid`, an enum, or another `type`.
+  Strings, `bytes`, arrays, collections, structs and unions are rejected.
+- The target can't be optional. Make the field holding the type optional
+  instead, as in `leader: option<PartyId>`.
+- The target can carry constraints, as `Level` does. They belong to the
+  type, so every `Level` is checked and [narrowed](wire-format.md#integers)
+  the same way.
+- Like any named type, a `type` takes no constraints where it is used:
+  `Level[max=50]` is an error. Declare another `type` instead.
+
+A `type` goes at the top of a namespace or in a struct or message, like an
+enum. It can't refer to itself, directly or through other types. On the
+wire it is [encoded as its target](wire-format.md#types).
+
+The Rust backend emits a newtype, `pub struct PartyId(pub u64);`, and views
+read a `PartyId` wherever one is stored.
+
+## Unions
+
+A union holds one of several variants, each of which may carry data. A
+variant takes one of Rust's three forms:
+
+```
+namespace demo.inventory;
+
+union InventoryOp {
+    Add { item: u32, slot: u8 },  // fields
+    Remove(u8),                   // a single type
+    Clear,                        // nothing
+}
+
+message[in] ApplyOps {
+    ops: vec<InventoryOp>[max_length=8],
+}
+```
+
+- Fields are written as in a struct and may be optional.
+- A single type is any type a field can have, except `option<T>`.
+- A variant without data has one spelling: `Clear {}` is an error that
+  suggests `Clear`.
+- A union needs at least one variant and holds at most 65535. Variant names
+  are unique within the union.
+
+A union goes at the top of a namespace or in a struct or message. It holds
+no nested declarations of its own. A union is always variable-size, so it
+can't be an array item, a set item, or a map key, and like any type it
+can't refer to itself. See [Unions](wire-format.md#unions) for its
+encoding.
+
+The Rust backend emits an enum of the same shape, `InventoryOp`, and a view
+enum, `InventoryOpView`, whose variants hold views of their data. The views
+of fields variants go in a module named after the union, as
+`inventory_op::AddView`.
+
+`type` and `union` are keywords only where a declaration starts, as `true`
+and `false` are only literals where a value is expected. They stay usable
+as names, so `type: u8` is still a valid field.
 
 ## Components
 

@@ -57,7 +57,7 @@ which keep their fraction (`1.0`). `fingerprint` and `u64` values can exceed
 - `path`: its qualified name, as in `foo.bar.MyResponse.Result`, which is how
   other declarations refer to it
 - `parent`: the `path` of the declaration it is nested in, or `null`
-- `kind`: `enum`, `struct`, or `message`
+- `kind`: `enum`, `struct`, `message`, `union`, or `type`
 
 ### Enums
 
@@ -114,11 +114,46 @@ bitmap's first byte.
 
 | `kind` | Other keys | Field |
 |---|---|---|
-| `bit` | `bit` | A `bool`, stored as this bit |
+| `bit` | `bit` | A `bool` or a `type` over one, stored as this bit |
 | `at` | `offset` | A fixed-size value, `offset` bytes into the head |
-| `optional_bit` | `presence`, `value` | An `option<bool>`: its presence bit, then its value bit |
+| `optional_bit` | `presence`, `value` | An `option<bool>`, or an optional `type` over `bool`: its presence bit, then its value bit |
 | `optional` | `presence` | An optional fixed-size value. Present values are packed back to back after the head, in declaration order |
 | `var` | `slot`, `presence` | A variable-size value in this var slot. `presence` is its bit when optional, otherwise `null`. An absent value's slot is empty |
+
+### Unions
+
+```json
+{
+  "kind": "union",
+  "size": { "kind": "var", "max": 6 },
+  "tag": 1,
+  "variants": [
+    { "name": "Add", "tag": 1, "kind": "fields", "layout": { ... }, "fields": [ ... ] },
+    { "name": "Remove", "tag": 2, "kind": "type", "type": { "kind": "u8", ... } },
+    { "name": "Clear", "tag": 3, "kind": "unit" }
+  ]
+}
+```
+
+A [union](wire-format.md#unions) has a `size`, which is always `var`, a
+`tag` giving the width of its tag in bytes (`1` or `2`), and its `variants`
+in declaration order. Each variant has its `name`, its own `tag` value on
+the wire, and a `kind`:
+
+| `kind` | Other keys | Data |
+|---|---|---|
+| `unit` | | None |
+| `type` | `type` | A single value of this [type](#types) |
+| `fields` | `layout`, `fields` | An object, described as for [structs](#structs-and-messages) |
+
+### Type declarations
+
+```json
+{ "kind": "type", "target": { "kind": "u8", "constraints": { "max": 100 }, "wire": { ... } } }
+```
+
+A `type` is encoded as its `target`, which is a scalar, or a `named` enum or
+`type`.
 
 ### Types
 
@@ -163,7 +198,9 @@ constraints say otherwise.
   bitmap instead.
 - `int`, on integers: `{ "kind": "native", "width": 4 }`, stored as
   declared, or `{ "kind": "biased", "min": -100, "width": 1 }`, stored as
-  `value - min` unsigned. See [Integers](wire-format.md#integers).
+  `value - min` unsigned. See [Integers](wire-format.md#integers). A
+  `named` type has none, even when it names a `type` over an integer: read
+  it from the declaration's `target`.
 - `sequence`, on `vec`, `set`, and `map`: how the
   [items](wire-format.md#collections) are laid out. A map's items are its
   entries, key then value. Widths are in bytes.

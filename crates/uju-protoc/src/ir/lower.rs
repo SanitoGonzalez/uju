@@ -99,6 +99,8 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             ast::Item::Enum(item) => DefKind::Enum(self.lower_enum(site.source, item)),
             ast::Item::Struct(item) => DefKind::Struct(self.lower_struct(site.source, id, item)),
             ast::Item::Message(item) => DefKind::Message(self.lower_message(site.source, id, item)),
+            ast::Item::Union(item) => DefKind::Union(self.lower_union(site.source, id, item)),
+            ast::Item::Type(item) => DefKind::Type(self.lower_type_def(site.source, id, item)),
             ast::Item::Const(_) => unreachable!("consts are not type sites"),
         };
         Def {
@@ -296,10 +298,10 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         &mut self,
         source: SourceId,
         scope: TypeId,
-        body: &ast::Body<'src>,
+        fields: &[ast::Field<'src>],
     ) -> Vec<Field> {
         let mut seen = HashSet::new();
-        body.fields
+        fields
             .iter()
             .map(|field| {
                 if !seen.insert(field.name.0) {
@@ -350,8 +352,110 @@ impl<'a, 'src> Lowerer<'a, 'src> {
 
     fn lower_struct(&mut self, source: SourceId, id: TypeId, item: &ast::Struct<'src>) -> Struct {
         Struct {
-            fields: self.lower_fields(source, id, &item.body),
+            fields: self.lower_fields(source, id, &item.body.fields),
         }
+    }
+
+    fn lower_union(&mut self, source: SourceId, id: TypeId, item: &ast::Union<'src>) -> Union {
+        let name = item.name.0;
+        if item.variants.is_empty() {
+            self.error(
+                source,
+                &item.name.1,
+                format!("union `{name}` needs at least one variant"),
+            );
+        }
+        if item.variants.len() > wire::MAX_VARIANTS {
+            self.error(
+                source,
+                &item.name.1,
+                format!(
+                    "union `{name}` has {} variants; a union holds at most {}",
+                    item.variants.len(),
+                    wire::MAX_VARIANTS
+                ),
+            );
+        }
+        let mut seen = HashSet::new();
+        let variants = item
+            .variants
+            .iter()
+            .map(|variant| {
+                let (variant_name, span) = &variant.name;
+                if !seen.insert(*variant_name) {
+                    self.error(source, span, format!("duplicate variant `{variant_name}`"));
+                }
+                let data = match &variant.data {
+                    ast::VariantData::Unit => VariantData::Unit,
+                    ast::VariantData::Type(ty) => {
+                        VariantData::Type(self.lower_type(source, Some(id), ty))
+                    }
+                    ast::VariantData::Fields { fields, span } => {
+                        // One spelling for a variant without data.
+                        if fields.is_empty() {
+                            self.error(
+                                source,
+                                span,
+                                format!(
+                                    "variant `{variant_name}` has no fields; write it as `{variant_name}`"
+                                ),
+                            );
+                        }
+                        VariantData::Fields(self.lower_fields(source, id, fields))
+                    }
+                };
+                UnionVariant {
+                    name: variant_name.to_string(),
+                    data,
+                }
+            })
+            .collect();
+        Union { variants }
+    }
+
+    /// A `type` stands for a scalar: what is read by value, so its name can
+    /// wrap the value wherever it is read.
+    fn lower_type_def(
+        &mut self,
+        source: SourceId,
+        id: TypeId,
+        item: &ast::TypeDecl<'src>,
+    ) -> TypeDef {
+        let written = match &item.target.kind {
+            ast::TypeKind::Option(inner) => {
+                self.error(
+                    source,
+                    &item.target.span,
+                    "a `type` cannot be optional; make the field holding it optional instead",
+                );
+                &**inner
+            }
+            _ => &item.target,
+        };
+        let target = self.lower_type(source, Some(id), written);
+        let scalar = match &target.kind {
+            TypeKind::Array(..)
+            | TypeKind::Vec(_)
+            | TypeKind::Set(_)
+            | TypeKind::Map(..)
+            | TypeKind::String
+            | TypeKind::Bytes => false,
+            TypeKind::Named(target) => matches!(
+                self.resolver.types[target.0].item,
+                ast::Item::Enum(_) | ast::Item::Type(_)
+            ),
+            _ => true,
+        };
+        if !scalar {
+            self.error(
+                source,
+                &written.span,
+                format!(
+                    "`{written}` is not a scalar; a `type` stands for an integer, a float, `bool`, `timestamp`, `interval`, `entity`, `uentity`, `uuid`, an enum, or another `type`"
+                ),
+            );
+        }
+        TypeDef { target }
     }
 
     fn lower_message(
@@ -367,7 +471,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         };
         Message {
             direction,
-            fields: self.lower_fields(source, id, &item.body),
+            fields: self.lower_fields(source, id, &item.body.fields),
         }
     }
 
@@ -472,9 +576,23 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         };
         for error in errors {
             let site = &self.resolver.types[error.def.0];
-            let span = match (error.field, site.item.body()) {
-                (Some(field), Some(body)) => body.fields[field].ty.span.clone(),
-                _ => site.item.name().1.clone(),
+            let span = match (site.item, error.variant, error.field) {
+                (ast::Item::Union(item), Some(variant), field) => {
+                    let variant = &item.variants[variant];
+                    match (&variant.data, field) {
+                        (ast::VariantData::Type(ty), _) => ty.span.clone(),
+                        (ast::VariantData::Fields { fields, .. }, Some(field)) => {
+                            fields[field].ty.span.clone()
+                        }
+                        _ => variant.name.1.clone(),
+                    }
+                }
+                (ast::Item::Type(item), _, _) => item.target.span.clone(),
+                (item, _, Some(field)) => match item.body() {
+                    Some(body) => body.fields[field].ty.span.clone(),
+                    None => item.name().1.clone(),
+                },
+                (item, _, None) => item.name().1.clone(),
             };
             self.diagnostics
                 .push(Diagnostic::new(site.source, span, error.message));
@@ -509,8 +627,9 @@ impl<'a, 'src> Lowerer<'a, 'src> {
     }
 
     /// The field path to a float that a value of `ty` stores inline,
-    /// directly (an empty path) or through a struct or array. `visiting`
-    /// guards against recursive structs, which are reported separately.
+    /// directly (an empty path) or through a struct, an array, or a `type`.
+    /// `visiting` guards against recursive types, which are reported
+    /// separately.
     fn holds_float(
         &self,
         source: SourceId,
@@ -526,12 +645,19 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             ast::TypeKind::Named(path) => {
                 let id = self.resolver.resolve(source, scope, path).ok()?;
                 let site = &self.resolver.types[id.0];
-                let ast::Item::Struct(item) = site.item else {
-                    return None;
-                };
                 if visiting.contains(&id) {
                     return None;
                 }
+                let item = match site.item {
+                    ast::Item::Struct(item) => item,
+                    ast::Item::Type(item) => {
+                        visiting.push(id);
+                        let path = self.holds_float(site.source, Some(id), &item.target, visiting);
+                        visiting.pop();
+                        return path;
+                    }
+                    _ => return None,
+                };
                 visiting.push(id);
                 item.body.fields.iter().find_map(|field| {
                     let mut path = self.holds_float(site.source, Some(id), &field.ty, visiting)?;
@@ -747,14 +873,28 @@ impl<'a, 'src> Lowerer<'a, 'src> {
 
     fn visit(&mut self, defs: &[Def], marks: &mut [Mark], index: usize) {
         marks[index] = Mark::Grey;
-        let fields = match &defs[index].kind {
-            DefKind::Enum(_) => &[][..],
-            DefKind::Struct(item) => &item.fields,
-            DefKind::Message(item) => &item.fields,
-        };
         let mut targets = Vec::new();
-        for field in fields {
-            refs(&field.ty, &mut targets);
+        match &defs[index].kind {
+            DefKind::Enum(_) => {}
+            DefKind::Struct(Struct { fields }) | DefKind::Message(Message { fields, .. }) => {
+                for field in fields {
+                    refs(&field.ty, &mut targets);
+                }
+            }
+            DefKind::Union(item) => {
+                for variant in &item.variants {
+                    match &variant.data {
+                        VariantData::Unit => {}
+                        VariantData::Type(ty) => refs(ty, &mut targets),
+                        VariantData::Fields(fields) => {
+                            for field in fields {
+                                refs(&field.ty, &mut targets);
+                            }
+                        }
+                    }
+                }
+            }
+            DefKind::Type(item) => refs(&item.target, &mut targets),
         }
         for target in targets {
             match marks[target.0] {
@@ -1539,6 +1679,293 @@ mod tests {
     }
 
     #[test]
+    fn unions_lower_their_variants_in_order() {
+        let schema = compiled(&[concat!(
+            "namespace a;\n",
+            "struct Item { id: u32 }\n",
+            "union Op {\n",
+            "    Add { item: Item, slot: u8, note: option<string> },\n",
+            "    Remove(u8[max=9]),\n",
+            "    Clear,\n",
+            "}\n",
+        )]);
+        let (item_id, _) = def(&schema, "Item");
+        let (_, op) = def(&schema, "Op");
+        let DefKind::Union(op) = &op.kind else {
+            panic!("expected a union");
+        };
+        assert_eq!(
+            op.variants
+                .iter()
+                .map(|variant| variant.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Add", "Remove", "Clear"]
+        );
+        let VariantData::Fields(fields) = &op.variants[0].data else {
+            panic!("expected fields");
+        };
+        assert_eq!(fields[0].ty.kind, TypeKind::Named(item_id));
+        assert_eq!(fields[1].ty.kind, TypeKind::U8);
+        assert_eq!(fields[2].ty.kind, TypeKind::String);
+        assert!(fields[2].optional);
+        let VariantData::Type(ty) = &op.variants[1].data else {
+            panic!("expected a type");
+        };
+        assert_eq!(ty.kind, TypeKind::U8);
+        assert_eq!(ty.constraints.max, Some(Number::Int(9)));
+        assert_eq!(op.variants[2].data, VariantData::Unit);
+    }
+
+    #[test]
+    fn types_lower_onto_their_target() {
+        let schema = compiled(&[concat!(
+            "namespace a;\n",
+            "enum Color: u8 { Red }\n",
+            "type PartyId = u64;\n",
+            "type Level = u8[max=100];\n",
+            "type Hue = Color;\n",
+            "type Leader = PartyId;\n",
+            "message[in] M { type Local = bool; p: PartyId, l: Local }\n",
+        )]);
+        let target = |name: &str| {
+            let (_, def) = def(&schema, name);
+            let DefKind::Type(item) = &def.kind else {
+                panic!("expected a type");
+            };
+            item.target.clone()
+        };
+        assert_eq!(target("PartyId").kind, TypeKind::U64);
+        assert_eq!(target("Level").kind, TypeKind::U8);
+        assert_eq!(target("Level").constraints.max, Some(Number::Int(100)));
+        let (color, _) = def(&schema, "Color");
+        assert_eq!(target("Hue").kind, TypeKind::Named(color));
+        let (party, _) = def(&schema, "PartyId");
+        assert_eq!(target("Leader").kind, TypeKind::Named(party));
+
+        let (message, _) = def(&schema, "M");
+        let (local, local_def) = def(&schema, "Local");
+        assert_eq!(local_def.parent, Some(message));
+        assert_eq!(schema.path(local), ["M", "Local"]);
+
+        // `resolved` follows every `type` to its scalar.
+        let leader = Type::from(TypeKind::Named(def(&schema, "Leader").0));
+        assert_eq!(schema.resolved(&leader).kind, TypeKind::U64);
+        let level = Type::from(TypeKind::Named(def(&schema, "Level").0));
+        assert_eq!(
+            schema.resolved(&level).constraints.max,
+            Some(Number::Int(100))
+        );
+    }
+
+    #[test]
+    fn unions_are_validated() {
+        let cases = [
+            ("union U {}", "union `U` needs at least one variant"),
+            ("union U { A, B(u8), A }", "duplicate variant `A`"),
+            (
+                "union U { Add {} }",
+                "variant `Add` has no fields; write it as `Add`",
+            ),
+            ("union U { A { x: u8, x: u16 } }", "duplicate field `x`"),
+            (
+                "union U { A(option<u8>) }",
+                "`option<u8>` is nested; `option` is only allowed as a field's own type",
+            ),
+            (
+                "union U { A { v: option<vec<u8>> } }",
+                "`vec<u8>` is a collection; collections cannot be optional",
+            ),
+            (
+                "union U { A(Missing) }",
+                "cannot find `Missing` in this scope",
+            ),
+            (
+                "message[in] M {}\nunion U { A(M) }",
+                "`M` is a message; messages are standalone and cannot be used as a type",
+            ),
+        ];
+        for (src, expected) in cases {
+            assert_eq!(
+                messages(&[&format!("namespace a;\n{src}\n")]),
+                [expected],
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn unions_hold_at_most_65535_variants() {
+        let union = |count: usize| {
+            let variants: Vec<String> = (0..count).map(|index| format!("V{index}")).collect();
+            format!("namespace a;\nunion U {{ {} }}\n", variants.join(", "))
+        };
+        assert_eq!(
+            messages(&[&union(65536)]),
+            ["union `U` has 65536 variants; a union holds at most 65535"]
+        );
+        compiled(&[&union(65535)]);
+    }
+
+    #[test]
+    fn types_stand_for_scalars() {
+        let scalar = "is not a scalar; a `type` stands for an integer, a float, `bool`, \
+                      `timestamp`, `interval`, `entity`, `uentity`, `uuid`, an enum, or another `type`";
+        let prelude = "namespace a;\nstruct S { x: u8 }\nunion U { A }\n";
+        for target in [
+            "string",
+            "string[min_length=2, max_length=2]",
+            "bytes",
+            "vec<u8>",
+            "set<u8>",
+            "map<u8, u8>",
+            "array<u8, 2>",
+            "S",
+            "U",
+        ] {
+            assert_eq!(
+                messages(&[&format!("{prelude}type T = {target};\n")]),
+                [format!("`{target}` {scalar}")],
+                "{target}"
+            );
+        }
+        assert_eq!(
+            messages(&[&format!("{prelude}type T = option<u8>;\n")]),
+            ["a `type` cannot be optional; make the field holding it optional instead"]
+        );
+        // Through another `type`, it is the target that is checked.
+        assert_eq!(
+            messages(&[&format!("{prelude}type T = string;\ntype V = T;\n")]),
+            [format!("`string` {scalar}")]
+        );
+
+        compiled(&[concat!(
+            "namespace a;\n",
+            "enum E { A }\n",
+            "type A = u8;\n",
+            "type B = i64[min=-5, max=5];\n",
+            "type C = f32[nan];\n",
+            "type D = f64;\n",
+            "type F = bool;\n",
+            "type G = timestamp;\n",
+            "type H = interval;\n",
+            "type I = entity;\n",
+            "type J = uentity;\n",
+            "type K = uuid;\n",
+            "type L = E;\n",
+            "type M = A;\n",
+        )]);
+    }
+
+    #[test]
+    fn named_types_take_no_constraints() {
+        let prelude = "namespace a;\ntype PartyId = u64;\nunion U { A }\n";
+        let cases = [
+            ("p: PartyId[max=3]", "`PartyId` takes no constraints"),
+            ("v: vec<PartyId[min=1]>", "`PartyId` takes no constraints"),
+            ("u: U[max_length=3]", "`U` takes no constraints"),
+        ];
+        for (field, expected) in cases {
+            let src = format!("{prelude}message[in] M {{ {field} }}\n");
+            assert_eq!(messages(&[&src]), [expected], "{field}");
+        }
+        assert_eq!(
+            messages(&[&format!("{prelude}union V {{ A(PartyId[max=3]) }}\n")]),
+            ["`PartyId` takes no constraints"]
+        );
+        assert_eq!(
+            messages(&[&format!("{prelude}type T = PartyId[max=3];\n")]),
+            ["`PartyId` takes no constraints"]
+        );
+    }
+
+    #[test]
+    fn unions_are_variable_size_and_types_are_their_target() {
+        let prelude = concat!(
+            "namespace a;\n",
+            "union U { A }\n",
+            "type PartyId = u64;\n",
+            "type Weight = f32;\n",
+            "struct Holder { u: U }\n",
+        );
+        let cases = [
+            (
+                "a: array<U, 2>",
+                "`U` is variable-size; an array item must be fixed-size",
+            ),
+            (
+                "s: set<U>",
+                "`U` is variable-size; a set item must be fixed-size",
+            ),
+            (
+                "m: map<U, u8>",
+                "`U` is variable-size; a map key must be fixed-size",
+            ),
+            (
+                "a: array<Holder, 2>",
+                "`Holder` is variable-size; an array item must be fixed-size",
+            ),
+            (
+                "s: set<Weight>",
+                "`Weight` holds a float; a set item cannot hold a float",
+            ),
+            (
+                "m: map<Weight, u8>",
+                "`Weight` holds a float; a map key cannot hold a float",
+            ),
+        ];
+        for (field, expected) in cases {
+            let src = format!("{prelude}message[in] M {{ {field} }}\n");
+            assert_eq!(messages(&[&src]), [expected], "{field}");
+        }
+
+        // A union is fine wherever a variable-size value is, and a `type`
+        // wherever its target is.
+        compiled(&[&format!(
+            "{prelude}message[in] M {{ v: vec<U>, m: map<u8, U>, o: option<U>, \
+             a: array<PartyId, 2>, s: set<PartyId>, k: map<PartyId, Weight>, \
+             w: vec<Weight>, p: option<PartyId> }}\n"
+        )]);
+    }
+
+    #[test]
+    fn wire_errors_in_unions_point_at_the_variant() {
+        let src = concat!(
+            "namespace a;\n",
+            "union U {\n",
+            "    Big(array<u64, 9000>),\n",
+            "    Wide { a: u8, b: array<u64, 9000> },\n",
+            "    Long { a: array<u64, 5000>, b: array<u64, 5000> },\n",
+            "}\n",
+        );
+        let errors: Vec<_> = compile(&[src])
+            .expect_err("expected errors")
+            .into_iter()
+            .filter(|diagnostic| diagnostic.is_error())
+            .map(|diagnostic| (src[diagnostic.span.clone()].to_string(), diagnostic.message))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                (
+                    "array<u64, 9000>".to_string(),
+                    "`array<u64, 9000>` takes 72000 bytes; a message holds at most 65535"
+                        .to_string()
+                ),
+                (
+                    "array<u64, 9000>".to_string(),
+                    "`array<u64, 9000>` takes 72000 bytes; a message holds at most 65535"
+                        .to_string()
+                ),
+                (
+                    "Long".to_string(),
+                    "`a.U.Long` takes at least 80000 bytes; a message holds at most 65535"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn recursion_is_reported() {
         let recursive = "`S` refers to itself; recursive types are not allowed";
         assert_eq!(
@@ -1564,5 +1991,33 @@ mod tests {
         );
 
         compiled(&["namespace a;\nstruct S { x: i32 }\nmessage[in] M { v: vec<S> }\n"]);
+    }
+
+    #[test]
+    fn recursion_through_unions_and_types_is_reported() {
+        let cases = [
+            ("union U { A(U) }", "U"),
+            ("union U { A, B { v: vec<U> } }", "U"),
+            ("union U { A(map<u8, U>) }", "U"),
+            ("union U { A(S) }\nstruct S { u: option<U> }", "U"),
+            ("type A = A;", "A"),
+            ("type A = B;\ntype B = A;", "A"),
+        ];
+        for (src, name) in cases {
+            assert_eq!(
+                messages(&[&format!("namespace a;\n{src}\n")]),
+                [format!(
+                    "`{name}` refers to itself; recursive types are not allowed"
+                )],
+                "{src}"
+            );
+        }
+        // Unions and types may refer to others, as long as nothing loops.
+        compiled(&[concat!(
+            "namespace a;\n",
+            "type Id = u32;\n",
+            "union Inner { A(Id), B }\n",
+            "union Outer { I(Inner), L { all: vec<Inner>, id: Id } }\n",
+        )]);
     }
 }

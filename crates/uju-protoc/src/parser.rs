@@ -172,9 +172,49 @@ where
 
     let field = ident
         .then_ignore(just(Token::Colon))
-        .then(ty)
+        .then(ty.clone())
         .map(|(name, ty)| Field { name, ty })
         .boxed();
+
+    // `type` and `union` are keywords only where a declaration starts, so
+    // they stay usable as names, as in a field `type: u8`.
+    let type_item = just(Token::Ident("type"))
+        .ignore_then(ident)
+        .then_ignore(just(Token::Equal))
+        .then(ty.clone())
+        .then_ignore(just(Token::Semicolon))
+        .map(|(name, target)| Item::Type(TypeDecl { name, target }));
+
+    let variant_fields = field
+        .clone()
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::BraceOpen), just(Token::BraceClose))
+        .map_with(|fields, e| VariantData::Fields {
+            fields,
+            span: e.span(),
+        });
+    let variant_type = ty
+        .delimited_by(just(Token::ParenOpen), just(Token::ParenClose))
+        .map(VariantData::Type);
+    let union_variant = ident
+        .then(choice((variant_fields, variant_type)).or_not())
+        .map(|(name, data)| UnionVariant {
+            name,
+            data: data.unwrap_or(VariantData::Unit),
+        });
+
+    let union_item = just(Token::Ident("union"))
+        .ignore_then(ident)
+        .then(
+            union_variant
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::BraceOpen), just(Token::BraceClose)),
+        )
+        .map(|(name, variants)| Item::Union(Union { name, variants }));
 
     let repr = just(Token::Colon)
         .ignore_then(
@@ -259,9 +299,16 @@ where
                 })
             });
 
-        choice((enum_item, struct_item, message_item, const_item))
-            .labelled("declaration")
-            .boxed()
+        choice((
+            enum_item,
+            struct_item,
+            message_item,
+            const_item,
+            union_item.clone(),
+            type_item.clone(),
+        ))
+        .labelled("declaration")
+        .boxed()
     });
 
     let namespace = just(Token::Namespace)
@@ -385,6 +432,25 @@ mod tests {
 
         assert_eq!(item(&schema, "EmptyStruct").body(), Some(&Body::default()));
         assert_eq!(fields(item(&schema, "Position")), ["x: f32", "y: f32"]);
+
+        let Item::Type(level) = item(&schema, "Level") else {
+            panic!("expected a type");
+        };
+        assert_eq!(level.target.to_string(), "u8[max=100]");
+        let Item::Union(op) = item(&schema, "PartyOp") else {
+            panic!("expected a union");
+        };
+        assert!(matches!(
+            op.variants
+                .iter()
+                .map(|variant| &variant.data)
+                .collect::<Vec<_>>()[..],
+            [
+                VariantData::Fields { .. },
+                VariantData::Type(_),
+                VariantData::Unit
+            ]
+        ));
     }
 
     #[test]
@@ -611,6 +677,138 @@ mod tests {
         assert_eq!(
             errors_of("namespace a;\nconst A = 1;\n")[0].message,
             "found '=' expected ':'"
+        );
+    }
+
+    #[test]
+    fn types_and_unions_parse() {
+        let src = concat!(
+            "namespace a;\n",
+            "type PartyId = u64;\n",
+            "type Level = u8[max=100];\n",
+            "union Op {\n",
+            "    Add { item: u32, slot: u8 },\n",
+            "    Remove(u8[max=9]),\n",
+            "    Clear,\n",
+            "}\n",
+            "union One { Only }\n",
+            "message[in] M {\n",
+            "    type Inner = PartyId;\n",
+            "    union Nested { A(Inner), }\n",
+            "    x: Inner,\n",
+            "}\n",
+        );
+        let schema = schema_of(src);
+
+        let Item::Type(party) = item(&schema, "PartyId") else {
+            panic!("expected a type");
+        };
+        assert_eq!(party.target.to_string(), "u64");
+        let Item::Type(level) = item(&schema, "Level") else {
+            panic!("expected a type");
+        };
+        assert_eq!(level.target.to_string(), "u8[max=100]");
+        assert_eq!(item(&schema, "Level").keyword(), "type");
+
+        let Item::Union(op) = item(&schema, "Op") else {
+            panic!("expected a union");
+        };
+        assert_eq!(item(&schema, "Op").keyword(), "union");
+        assert_eq!(
+            op.variants
+                .iter()
+                .map(|variant| variant.name.0)
+                .collect::<Vec<_>>(),
+            ["Add", "Remove", "Clear"]
+        );
+        let VariantData::Fields { fields: add, span } = &op.variants[0].data else {
+            panic!("expected fields");
+        };
+        assert_eq!(
+            add.iter()
+                .map(|field| format!("{}: {}", field.name.0, field.ty))
+                .collect::<Vec<_>>(),
+            ["item: u32", "slot: u8"]
+        );
+        assert_eq!(&src[span.clone()], "{ item: u32, slot: u8 }");
+        let VariantData::Type(ty) = &op.variants[1].data else {
+            panic!("expected a type");
+        };
+        assert_eq!(ty.to_string(), "u8[max=9]");
+        assert_eq!(op.variants[2].data, VariantData::Unit);
+
+        let Item::Union(one) = item(&schema, "One") else {
+            panic!("expected a union");
+        };
+        assert_eq!(one.variants.len(), 1);
+        assert_eq!(one.variants[0].data, VariantData::Unit);
+
+        let message = item(&schema, "M");
+        assert_eq!(fields(message), ["x: Inner"]);
+        let body = &message.body().unwrap().items;
+        assert_eq!(
+            body.iter().map(Item::keyword).collect::<Vec<_>>(),
+            ["type", "union"]
+        );
+    }
+
+    #[test]
+    fn type_and_union_are_keywords_only_where_a_declaration_starts() {
+        let src = concat!(
+            "namespace a;\n",
+            "struct S { type: u8, union: u8 }\n",
+            "message[in] M { type: u8, union: u8, }\n",
+            "union U { A { type: u8, union: u8 } }\n",
+            "type type = u8;\n",
+            "union union { union }\n",
+        );
+        let schema = schema_of(src);
+        assert_eq!(fields(item(&schema, "S")), ["type: u8", "union: u8"]);
+        assert_eq!(fields(item(&schema, "M")), ["type: u8", "union: u8"]);
+        assert!(item(&schema, "M").body().unwrap().items.is_empty());
+        assert_eq!(item(&schema, "type").keyword(), "type");
+        let Item::Union(union) = item(&schema, "union") else {
+            panic!("expected a union");
+        };
+        assert_eq!(union.variants[0].name.0, "union");
+    }
+
+    #[test]
+    fn empty_braces_parse_as_a_variant_without_fields() {
+        // Lowering rejects it, suggesting the bare name.
+        let src = "namespace a;\nunion U { Add {} }\n";
+        let schema = schema_of(src);
+        let Item::Union(union) = item(&schema, "U") else {
+            panic!("expected a union");
+        };
+        let VariantData::Fields { fields, span } = &union.variants[0].data else {
+            panic!("expected fields");
+        };
+        assert!(fields.is_empty());
+        assert_eq!(&src[span.clone()], "{}");
+    }
+
+    #[test]
+    fn malformed_types_and_unions_are_reported() {
+        assert_eq!(
+            errors_of("namespace a;\ntype T u8;\n")[0].message,
+            "found 'u8' expected '='"
+        );
+        assert_eq!(
+            errors_of("namespace a;\ntype T = u8\n")[0].message,
+            "found end of input expected '[', or ';'"
+        );
+        assert_eq!(
+            errors_of("namespace a;\nunion U { A(u8, u8) }\n")[0].message,
+            "found ',' expected '[', or ')'"
+        );
+        assert_eq!(
+            errors_of("namespace a;\nunion U { A() }\n")[0].message,
+            "found ')' expected type"
+        );
+        assert_eq!(
+            errors_of("namespace a;\nunion U { A B }\n")[0].message,
+            "found 'B' expected '{', '(', ',', or '}'"
         );
     }
 

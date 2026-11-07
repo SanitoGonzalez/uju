@@ -35,6 +35,18 @@ fn item_naming(source: SourceId, item: &ast::Item<'_>, out: &mut Vec<Diagnostic>
             body_naming(source, &item.body, out);
         }
         ast::Item::Const(item) => expect(source, "const", &item.name, Style::Pascal, out),
+        ast::Item::Union(item) => {
+            expect(source, "union", &item.name, Style::Pascal, out);
+            for variant in &item.variants {
+                expect(source, "variant", &variant.name, Style::Pascal, out);
+                if let ast::VariantData::Fields { fields, .. } = &variant.data {
+                    for field in fields {
+                        expect(source, "field", &field.name, Style::Snake, out);
+                    }
+                }
+            }
+        }
+        ast::Item::Type(item) => expect(source, "type", &item.name, Style::Pascal, out),
     }
 }
 
@@ -113,7 +125,9 @@ mod tests {
              enum color { light_red }\n\
              struct Foo_Bar { HitPoints: u8 }\n\
              message[in] spawn { struct inner { _: u8 } const max_len: u8 = 1; }\n\
-             const HTTP_PORT: u16 = 80;\n"]);
+             const HTTP_PORT: u16 = 80;\n\
+             type party_id = u64;\n\
+             union op { add_item { SlotIndex: u8 }, remove(u8) }\n"]);
         assert_eq!(
             warnings,
             [
@@ -127,6 +141,11 @@ mod tests {
                 "field `_` should be snake_case",
                 "const `max_len` should be PascalCase, like `MaxLen`",
                 "const `HTTP_PORT` should be PascalCase, like `HttpPort`",
+                "type `party_id` should be PascalCase, like `PartyId`",
+                "union `op` should be PascalCase, like `Op`",
+                "variant `add_item` should be PascalCase, like `AddItem`",
+                "field `SlotIndex` should be snake_case, like `slot_index`",
+                "variant `remove` should be PascalCase, like `Remove`",
             ]
         );
     }

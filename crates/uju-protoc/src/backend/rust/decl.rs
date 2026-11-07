@@ -59,6 +59,50 @@ impl Generator<'_> {
         out.line("}");
     }
 
+    /// A `type`: a tuple struct over its target, which views read by
+    /// value through [`Self::cell`]'s `__w::Typed`.
+    pub(super) fn newtype(
+        &self,
+        out: &mut Out,
+        id: TypeId,
+        item: &crate::ir::TypeDef,
+        module: &[String],
+    ) {
+        let name = &self.names[id.0];
+        let traits = self.traits[id.0];
+        // Every target is a scalar, so `Copy` and `PartialOrd` always hold,
+        // and `Ord` goes with `Eq`.
+        let mut derives = vec!["Debug", "Clone", "Copy", "PartialEq"];
+        if traits.eq {
+            derives.push("Eq");
+        }
+        derives.push("PartialOrd");
+        if traits.eq {
+            derives.push("Ord");
+        }
+        if traits.hash {
+            derives.push("Hash");
+        }
+        if traits.default {
+            derives.push("Default");
+        }
+        out.line(format!("#[derive({})]", derives.join(", ")));
+        out.line(format!(
+            "pub struct {name}(pub {});",
+            self.owned(&item.target, module)
+        ));
+        if self.decode[id.0] {
+            out.line("");
+            out.line(format!("impl __w::Newtype for {name} {{"));
+            out.line(format!("type Cell = {};", self.cell(&item.target, module)));
+            out.line("");
+            out.line("fn from_cell(cell: &Self::Cell) -> Self {");
+            out.line(format!("{name}(__w::Cell::get(cell))"));
+            out.line("}");
+            out.line("}");
+        }
+    }
+
     pub(super) fn object(&self, out: &mut Out, id: TypeId, fields: &[Field], module: &[String]) {
         let layout = self.wire.layout(id);
         let name = &self.names[id.0];
@@ -97,6 +141,7 @@ impl Generator<'_> {
             layout,
             fields,
             module,
+            bound: false,
         };
         out.line("");
         out.line(format!("impl {name} {{"));
@@ -110,7 +155,7 @@ impl Generator<'_> {
             ));
             out.line("");
             out.line("pub fn encoded_size(&self) -> usize {");
-            self.encoded_size(out, &object);
+            self.encoded_size(out, &object, 0);
             out.line("}");
             out.line("");
             out.line("/// Writes the encoding to the start of `buf`, which must hold at least");
@@ -142,8 +187,153 @@ impl Generator<'_> {
         }
         if self.decode[id.0] {
             out.line("");
-            self.view(out, &object, name);
+            self.view(out, &object, name, None);
         }
+    }
+
+    /// A union: an enum of its variants, tagged on the wire, and its view,
+    /// an enum of what each variant's data reads as. The views of variants
+    /// with fields live in the module `snake(Union)`.
+    pub(super) fn union(&self, out: &mut Out, id: TypeId, item: &Union, module: &[String]) {
+        let layout = self.wire.union(id);
+        let name = &self.names[id.0];
+        let label = self.schema.path(id).join(".");
+        let traits = self.traits[id.0];
+        // A union has no variant to default to.
+        let mut derives = vec!["Debug", "Clone"];
+        if traits.copy {
+            derives.push("Copy");
+        }
+        derives.push("PartialEq");
+        if traits.eq {
+            derives.push("Eq");
+        }
+        if traits.hash {
+            derives.push("Hash");
+        }
+        out.line(format!("#[derive({})]", derives.join(", ")));
+        out.line(format!("pub enum {name} {{"));
+        for variant in &item.variants {
+            let variant_name = ident(&variant.name);
+            match &variant.data {
+                VariantData::Unit => out.line(format!("{variant_name},")),
+                VariantData::Type(ty) => {
+                    out.line(format!("{variant_name}({}),", self.owned(ty, module)));
+                }
+                VariantData::Fields(fields) => {
+                    out.line(format!("{variant_name} {{"));
+                    for field in fields {
+                        out.line(format!(
+                            "{}: {},",
+                            ident(&field.name),
+                            self.field_owned(field, module)
+                        ));
+                    }
+                    out.line("},");
+                }
+            }
+        }
+        out.line("}");
+
+        out.line("");
+        out.line(format!("impl {name} {{"));
+        if self.encode[id.0] {
+            let max = match layout.size.max() {
+                Some(max) => format!("Some({max})"),
+                None => "None".to_string(),
+            };
+            out.line(format!(
+                "pub const MAX_ENCODED_SIZE: {OPTION}<usize> = {max};"
+            ));
+            out.line("");
+            out.line("pub fn encoded_size(&self) -> usize {");
+            self.union_size(out, id, item, module);
+            out.line("}");
+            out.line("");
+            out.line("/// Writes the encoding to the start of `buf`, which must hold at least");
+            out.line("/// [`Self::encoded_size`] bytes, and returns its length.");
+            out.line(format!(
+                "pub fn encode(&self, buf: &mut [u8]) -> {RESULT}<usize, __w::EncodeError> {{"
+            ));
+            out.line(format!("__w::en::encode(self, buf, {label:?})"));
+            out.line("}");
+        }
+        if self.decode[id.0] {
+            if self.encode[id.0] {
+                out.line("");
+            }
+            out.line("/// Validates `buf` as one encoding and copies it out.");
+            out.line(format!(
+                "pub fn decode(buf: &[u8]) -> {RESULT}<{name}, __w::DecodeError> {{"
+            ));
+            out.line(format!(
+                "{name}View::decode(buf).map(|view| view.to_owned())"
+            ));
+            out.line("}");
+        }
+        out.line("}");
+
+        if self.encode[id.0] {
+            out.line("");
+            self.union_encoder(out, id, item, module);
+        }
+        if self.decode[id.0] {
+            out.line("");
+            self.union_view(out, id, item, module);
+            if has_fields(item) {
+                self.variant_views(out, id, item, module);
+            }
+        }
+    }
+
+    /// The fields of variant `index` of union `id`, as an object seen from
+    /// `module`.
+    pub(super) fn variant_object<'f>(
+        &'f self,
+        id: TypeId,
+        index: usize,
+        fields: &'f [Field],
+        module: &'f [String],
+    ) -> Object<'f> {
+        let variant = match &self.schema.def(id).kind {
+            DefKind::Union(item) => &item.variants[index],
+            _ => unreachable!("a union"),
+        };
+        Object {
+            name: format!("{}.{}", self.schema.path(id).join("."), variant.name),
+            layout: self.wire.union(id).variants[index]
+                .as_ref()
+                .expect("a variant with fields"),
+            fields,
+            module,
+            bound: true,
+        }
+    }
+
+    /// The module `snake(Union)`, holding the views of the variants with
+    /// fields.
+    fn variant_views(&self, out: &mut Out, id: TypeId, item: &Union, module: &[String]) {
+        let def = self.schema.def(id);
+        let mut inner = module.to_vec();
+        inner.push(snake(&def.name));
+        out.line("");
+        out.line(ALLOW);
+        out.line(format!("pub mod {} {{", snake(&def.name)));
+        out.line(format!("use {RUNTIME} as __w;"));
+        for (index, variant) in item.variants.iter().enumerate() {
+            let VariantData::Fields(fields) = &variant.data else {
+                continue;
+            };
+            let object = self.variant_object(id, index, fields, &inner);
+            let doc = self.path(
+                id,
+                &inner,
+                &format!("{}::{}", self.names[id.0], ident(&variant.name)),
+            );
+            out.line("");
+            self.view(out, &object, &variant.name, Some(&doc));
+        }
+        out.line("}");
     }
 
     pub(super) fn message(&self, out: &mut Out, id: TypeId) {

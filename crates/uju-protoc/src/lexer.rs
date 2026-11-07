@@ -41,6 +41,12 @@ pub enum Token<'src> {
     #[token("]")]
     BracketClose,
 
+    #[token("(")]
+    ParenOpen,
+
+    #[token(")")]
+    ParenClose,
+
     #[token("<")]
     Lt,
 
@@ -218,6 +224,8 @@ impl fmt::Display for Token<'_> {
             Token::BraceClose => f.write_str("}"),
             Token::BracketOpen => f.write_str("["),
             Token::BracketClose => f.write_str("]"),
+            Token::ParenOpen => f.write_str("("),
+            Token::ParenClose => f.write_str(")"),
             Token::Lt => f.write_str("<"),
             Token::Gt => f.write_str(">"),
             Token::Colon => f.write_str(":"),
@@ -279,12 +287,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            tokens("{ } [ ] < > : ; , . ="),
+            tokens("{ } [ ] ( ) < > : ; , . ="),
             [
                 Token::BraceOpen,
                 Token::BraceClose,
                 Token::BracketOpen,
                 Token::BracketClose,
+                Token::ParenOpen,
+                Token::ParenClose,
                 Token::Lt,
                 Token::Gt,
                 Token::Colon,
@@ -306,6 +316,16 @@ mod tests {
                 Token::Ident("_struct"),
                 Token::Ident("message1"),
             ]
+        );
+    }
+
+    #[test]
+    fn contextual_keywords_are_idents() {
+        // The parser treats them as keywords only where a declaration
+        // starts, so `type: u8` stays a field.
+        assert_eq!(
+            tokens("type union"),
+            [Token::Ident("type"), Token::Ident("union")]
         );
     }
 

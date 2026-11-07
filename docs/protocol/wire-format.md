@@ -71,11 +71,18 @@ is stored as declared.
 Floats and enums are never narrowed. Float `min`/`max` and the finite/non-NaN
 rules are only checked.
 
+### Types
+
+A `type` is encoded exactly as its target, constraints included, wherever
+it appears. `type Level = u8[max=100]` is a byte. `type Flag = bool` takes
+a bit in an object's [bitmap](#objects), two bits as an `option<Flag>`
+field, and a byte inside an `array` or collection, as a `bool` does.
+
 ## Fixed-size and variable-size types
 
 A type is **fixed-size** when every value takes the same number of bytes:
 
-- scalars and enums;
+- scalars, enums, and `type`s;
 - `string` and `bytes` whose `min_length` equals their `max_length`
   (`bytes[min_length=32, max_length=32]` is always 32 bytes);
 - `array<T, N>`, which is `N` values of `T` back to back. `T` must be
@@ -84,9 +91,10 @@ A type is **fixed-size** when every value takes the same number of bytes:
   `option<bool>`, which takes two bits either way.
 
 Everything else is **variable-size**: other strings and bytes, `vec`, `set`,
-`map`, and structs holding a variable-size or optional field. A variable-size
-value is always handed its exact byte range by whatever contains it (the
-message, a boundary, or a length prefix), so it never records its own length.
+`map`, structs holding a variable-size or optional field, and unions. A
+variable-size value is always handed its exact byte range by whatever contains
+it (the message, a boundary, or a length prefix), so it never records its own
+length.
 
 ## Objects
 
@@ -238,6 +246,50 @@ Widths:
 
 Option elements are not allowed in collections. `bool` items take a byte each.
 
+## Unions
+
+A union is the tag of the variant it holds, then that variant's data:
+
+```
+union := tag | data
+```
+
+**Tag.** Variants are tagged from `1` in declaration order, so variant `i`,
+counting from `0`, is tagged `i + 1`, and `0` is never a tag. The tag is a
+`u8` when the union has at most 255 variants, and a little-endian `u16`
+otherwise.
+
+**Data.** The data runs from the tag to the end of the union's byte range:
+
+| Variant | Data |
+|---|---|
+| `C` | Nothing |
+| `B(T)` | A value of `T`. A fixed-size `T` takes exactly its size, and a `bool` takes a byte |
+| `A { x: T, ... }` | An [object](#objects) laid out like a struct with these fields. Its offsets count from its own start, right after the tag |
+
+A union is variable-size even when every variant is fixed-size, so like any
+variable-size value it sits in a slot or behind a length prefix and is
+handed its exact byte range. Its largest encoding is the tag plus the
+largest variant's data, and it is unbounded when any variant is.
+
+### Example: an inventory operation
+
+```
+union InventoryOp {
+    Add { item: u32, slot: u8 },
+    Remove(u8),
+    Clear,
+}
+```
+
+Three variants take a 1-byte tag, and the largest encoding is 6 bytes:
+
+```
+01 07 00 00 00 02    Add { item: 7, slot: 2 }
+02 03                Remove(3)
+03                   Clear
+```
+
 ## Validation
 
 Decoding validates the whole message once. After that, reading a field cannot
@@ -251,6 +303,9 @@ fail. A decoder must reject a message unless:
   of absent optional values are empty or zero;
 - `bool` bytes are `0` or `1`, enums hold a declared variant, and `entity`
   generations are non-zero;
+- union tags name a declared variant, never `0` or past the last one, a
+  unit variant's data is empty, and a fixed-size variant type's data is
+  exactly its size;
 - strings are valid UTF-8;
 - every constraint holds: integer and float ranges (a biased integer must not
   exceed `max - min`), finite and non-NaN floats unless `infinite`/`nan` is
@@ -275,14 +330,17 @@ differ.
 The compiler emits a `u64` fingerprint of the schema. It is the 64-bit
 FNV-1a hash of a canonical text listing every declaration, sorted by fully
 qualified name, with every name included: enums with their repr and variant
-values, structs and messages with their fields in declaration order, each
-field's type spelled as in source, qualified, and with its constraints, and
-messages with their direction. Consts follow, sorted the same way, with
+values, structs and messages with their fields in declaration order, unions
+with their variants and each variant's data in declaration order, `type`s
+with their target, each type spelled as in source, qualified, and with its
+constraints, and messages with their direction. A union is listed as
+`union a.U { A { x: u8, }, B(u8), C, }`, and a `type` as
+`type a.Level = u8[max=100];`. Consts follow, sorted the same way, with
 their type and value. They never go on the wire, but peers must agree on
 them too.
 
-Renaming anything, reordering fields, or changing a constraint or a const
-changes the fingerprint. The order in which sources are compiled does not. FNV-1a is not
+Renaming anything, reordering fields or variants, or changing a constraint
+or a const changes the fingerprint. The order in which sources are compiled does not. FNV-1a is not
 collision-resistant against an attacker, and it doesn't need to be: it only
 catches peers built from different schemas.
 

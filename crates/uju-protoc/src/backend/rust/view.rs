@@ -3,8 +3,12 @@
 use super::*;
 
 impl Generator<'_> {
-    pub(super) fn view(&self, out: &mut Out, object: &Object, name: &str) {
+    /// The view of struct or message `name`, or with `variant`, the path of
+    /// a union's variant, of that variant's fields. A variant's view is only
+    /// reached through the union's, so it leaves out what decodes it alone.
+    pub(super) fn view(&self, out: &mut Out, object: &Object, name: &str, variant: Option<&str>) {
         let layout = object.layout;
+        let doc = variant.unwrap_or(name);
         let fixed = layout.size.fixed();
         let view = format!("{name}View");
         let (lt, bytes) = if fixed.is_some() {
@@ -20,14 +24,14 @@ impl Generator<'_> {
         match fixed {
             Some(size) => {
                 out.line(format!(
-                    "/// [`{name}`], read in place; borrowed as `&{view}`."
+                    "/// [`{doc}`], read in place; borrowed as `&{view}`."
                 ));
                 out.line("#[repr(transparent)]");
                 out.line("#[derive(Clone, Copy)]");
                 out.line(format!("pub struct {view}([u8; {size}]);"));
             }
             None => {
-                out.line(format!("/// [`{name}`], read in place."));
+                out.line(format!("/// [`{doc}`], read in place."));
                 out.line("#[derive(Clone, Copy)]");
                 out.line(format!("pub struct {view}<'a> {{"));
                 out.line("buf: &'a [u8],");
@@ -37,67 +41,32 @@ impl Generator<'_> {
 
         out.line("");
         out.line(format!("impl{generics} {ty} {{"));
-        let (input, output) = match fixed {
-            Some(_) => ("&[u8]", format!("&{view}")),
-            None => ("&'a [u8]", "Self".to_string()),
-        };
-        out.line("/// Validates `buf` as exactly one encoding.");
-        out.line(format!(
-            "pub fn decode(buf: {input}) -> {RESULT}<{output}, __w::DecodeError> {{"
-        ));
-        out.line("Self::validate(buf)?;");
-        out.line("// SAFETY: just validated.");
-        out.line("Ok(unsafe { Self::decode_unchecked(buf) })");
-        out.line("}");
-        out.line("");
-        out.line("/// # Safety");
-        out.line("///");
-        out.line("/// `buf` must hold exactly one encoding [`Self::validate`] accepts.");
-        out.line(format!(
-            "pub unsafe fn decode_unchecked(buf: {input}) -> {output} {{"
-        ));
-        match fixed {
-            Some(_) => out.line(format!("unsafe {{ __w::cast::<{view}>(buf) }}")),
-            None => out.line(format!("{view} {{ buf }}")),
+        if variant.is_none() {
+            let (input, output) = match fixed {
+                Some(_) => ("&[u8]", format!("&{view}")),
+                None => ("&'a [u8]", "Self".to_string()),
+            };
+            let unchecked = match fixed {
+                Some(_) => format!("unsafe {{ __w::cast::<{view}>(buf) }}"),
+                None => format!("{view} {{ buf }}"),
+            };
+            let validated = match fixed {
+                Some(_) => view.clone(),
+                None => format!("{view}<'_>"),
+            };
+            self.decoders(out, &object.name, input, &output, &unchecked, &validated);
+            out.line("");
         }
-        out.line("}");
-        out.line("");
-        out.line(format!(
-            "pub fn validate(buf: &[u8]) -> {RESULT}<(), __w::DecodeError> {{"
-        ));
-        out.line(format!("__w::de::size(buf, {:?})?;", object.name));
-        out.line(format!(
-            "<{} as __w::Validate>::validate_at(buf, 0)",
-            if fixed.is_some() {
-                view.clone()
-            } else {
-                format!("{view}<'_>")
-            }
-        ));
-        out.line("}");
-        out.line("");
         let as_bytes = if fixed.is_some() { "&[u8]" } else { "&'a [u8]" };
         out.line(format!("pub fn as_bytes(&self) -> {as_bytes} {{"));
         out.line(bytes);
         out.line("}");
-        out.line("");
-        out.line(format!("pub fn to_owned(&self) -> {name} {{"));
-        if object.fields.is_empty() {
-            out.line(format!("{name} {{}}"));
-        } else {
-            out.line(format!("{name} {{"));
-            for field in object.fields {
-                let read = format!("self.{}()", accessor(&field.name));
-                let owned = if field.optional {
-                    optional(&read, &self.owned_from(&field.ty, "v"))
-                } else {
-                    self.owned_from(&field.ty, &read)
-                };
-                out.line(format!("{}: {owned},", ident(&field.name)));
-            }
+        if variant.is_none() {
+            out.line("");
+            out.line(format!("pub fn to_owned(&self) -> {name} {{"));
+            out.line(self.owned_object(object, name, "self"));
             out.line("}");
         }
-        out.line("}");
 
         let optionals = self.optionals(object);
         let start = match optionals.as_str() {
@@ -126,10 +95,13 @@ impl Generator<'_> {
                 lt.trim_start_matches("'_")
             ));
             match *slot {
-                Slot::Bit(bit) => out.line(format!("__w::bit(b, {bit})")),
+                Slot::Bit(bit) => out.line(self.bit(&field.ty, bit, object.module)),
                 Slot::OptionalBit { presence, value } => {
                     out.line(format!("if __w::bit(b, {presence}) {{"));
-                    out.line(format!("Some(__w::bit(b, {value}))"));
+                    out.line(format!(
+                        "Some({})",
+                        self.bit(&field.ty, value, object.module)
+                    ));
                     out.line("} else {");
                     out.line("None");
                     out.line("}");
@@ -209,14 +181,6 @@ impl Generator<'_> {
                 out.line("self");
                 out.line("}");
                 out.line("}");
-                out.line("");
-                out.line(format!("impl<'a> __w::Decode<'a> for &'a {view} {{"));
-                out.line(format!(
-                    "fn decode(buf: &'a [u8]) -> {RESULT}<Self, __w::DecodeError> {{"
-                ));
-                out.line(format!("{view}::decode(buf)"));
-                out.line("}");
-                out.line("}");
             }
             None => {
                 out.line(format!("impl<'a> __w::Var<'a> for {view}<'a> {{"));
@@ -224,15 +188,15 @@ impl Generator<'_> {
                 out.line(format!("{view} {{ buf: bytes }}"));
                 out.line("}");
                 out.line("}");
-                out.line("");
-                out.line(format!("impl<'a> __w::Decode<'a> for {view}<'a> {{"));
-                out.line(format!(
-                    "fn decode(buf: &'a [u8]) -> {RESULT}<Self, __w::DecodeError> {{"
-                ));
-                out.line(format!("{view}::decode(buf)"));
-                out.line("}");
-                out.line("}");
             }
+        }
+        if variant.is_none() {
+            let target = match fixed {
+                Some(_) => format!("&'a {view}"),
+                None => format!("{view}<'a>"),
+            };
+            out.line("");
+            decode_impl(out, &target, &view);
         }
 
         out.line("");
@@ -455,11 +419,13 @@ impl Generator<'_> {
                 lines.push("}".to_string());
                 lines
             }
-            TypeKind::Named(id) => match self.schema.def(*id).kind {
+            TypeKind::Named(id) => match &self.schema.def(*id).kind {
                 DefKind::Enum(_) => vec![format!(
                     "__w::de::enumeration::<{}>(b, at, {label})?;",
                     self.path(*id, module, &self.names[id.0])
                 )],
+                // The target's constraints hold wherever the `type` is used.
+                DefKind::Type(item) => self.check_fixed(&item.target, raw, module),
                 _ if self.is_checked(*id) => vec![format!(
                     "<{} as __w::Validate>::validate_at(b, at)?;",
                     self.view_path(*id, module)
@@ -590,11 +556,14 @@ impl Generator<'_> {
                 }
                 lines.extend(body);
             }
-            TypeKind::Named(id) => lines.push(format!(
-                "<{}<'_> as __w::Validate>::validate_at(b, at)?;",
-                self.view_path(*id, module)
-            )),
-            _ => unreachable!("only strings, bytes, collections, and structs vary in size"),
+            TypeKind::Named(id) => {
+                let view = match self.schema.def(*id).kind {
+                    DefKind::Union(_) => self.union_view_ty(*id, module, "'_"),
+                    _ => format!("{}<'_>", self.view_path(*id, module)),
+                };
+                lines.push(format!("<{view} as __w::Validate>::validate_at(b, at)?;"));
+            }
+            _ => unreachable!("only strings, bytes, collections, structs, and unions vary in size"),
         }
         lines
     }
@@ -608,7 +577,10 @@ impl Generator<'_> {
         let fields = match &self.schema.def(id).kind {
             DefKind::Struct(item) => &item.fields,
             DefKind::Message(item) => &item.fields,
-            DefKind::Enum(_) => unreachable!("enums are checked as enums"),
+            DefKind::Enum(_) | DefKind::Type(_) => {
+                unreachable!("enums and types are checked as what they hold")
+            }
+            DefKind::Union(_) => unreachable!("a union is never fixed-size"),
         };
         let bits: u32 = layout
             .fields
@@ -632,6 +604,15 @@ impl Generator<'_> {
         checked
     }
 
+    /// Reads bit `bit` of `b` as `ty`, a `bool` or a `type` over one.
+    pub(super) fn bit(&self, ty: &Type, bit: u32, module: &[String]) -> String {
+        let mut read = format!("__w::bit(b, {bit})");
+        for path in self.newtypes(ty, module).iter().rev() {
+            read = format!("{path}({read})");
+        }
+        read
+    }
+
     /// The `(presence, size)` list of an object's optional fixed-size
     /// fields, as `__w::offset` takes it.
     pub(super) fn optionals(&self, object: &Object) -> String {
@@ -648,4 +629,306 @@ impl Generator<'_> {
             .collect();
         optionals.join(", ")
     }
+}
+
+impl Generator<'_> {
+    /// A view's `decode`, `decode_unchecked`, and `validate`: `unchecked`
+    /// makes `output` from `buf`, and `validated` names the view's `impl
+    /// __w::Validate`.
+    pub(super) fn decoders(
+        &self,
+        out: &mut Out,
+        name: &str,
+        input: &str,
+        output: &str,
+        unchecked: &str,
+        validated: &str,
+    ) {
+        out.line("/// Validates `buf` as exactly one encoding.");
+        out.line(format!(
+            "pub fn decode(buf: {input}) -> {RESULT}<{output}, __w::DecodeError> {{"
+        ));
+        out.line("Self::validate(buf)?;");
+        out.line("// SAFETY: just validated.");
+        out.line("Ok(unsafe { Self::decode_unchecked(buf) })");
+        out.line("}");
+        out.line("");
+        out.line("/// # Safety");
+        out.line("///");
+        out.line("/// `buf` must hold exactly one encoding [`Self::validate`] accepts.");
+        out.line(format!(
+            "pub unsafe fn decode_unchecked(buf: {input}) -> {output} {{"
+        ));
+        out.line(unchecked);
+        out.line("}");
+        out.line("");
+        out.line(format!(
+            "pub fn validate(buf: &[u8]) -> {RESULT}<(), __w::DecodeError> {{"
+        ));
+        out.line(format!("__w::de::size(buf, {name:?})?;"));
+        out.line(format!(
+            "<{validated} as __w::Validate>::validate_at(buf, 0)"
+        ));
+        out.line("}");
+    }
+
+    /// `name { .. }` built from the accessors of `receiver`, a view of
+    /// `object`.
+    pub(super) fn owned_object(&self, object: &Object, name: &str, receiver: &str) -> String {
+        if object.fields.is_empty() {
+            return format!("{name} {{}}");
+        }
+        let mut lines = vec![format!("{name} {{")];
+        for field in object.fields {
+            let read = format!("{receiver}.{}()", accessor(&field.name));
+            let owned = if field.optional {
+                optional(&read, &self.owned_from(&field.ty, "v"))
+            } else {
+                self.owned_from(&field.ty, &read)
+            };
+            lines.push(format!("{}: {owned},", ident(&field.name)));
+        }
+        lines.push("}".to_string());
+        lines.join("\n")
+    }
+
+    /// Whether union `id`'s view borrows the buffer: a variant's data does.
+    /// One that does not takes no lifetime, which rustc would reject as
+    /// unused.
+    pub(super) fn union_borrows(&self, id: TypeId) -> bool {
+        if let Some(borrows) = self.borrows.borrow()[id.0] {
+            return borrows;
+        }
+        let DefKind::Union(item) = &self.schema.def(id).kind else {
+            unreachable!("a union");
+        };
+        let module = &self.modules[id.0];
+        let borrows = item.variants.iter().any(|variant| match &variant.data {
+            VariantData::Unit => false,
+            VariantData::Type(ty) => self.view_ty(ty, module, "'a").contains("'a"),
+            VariantData::Fields(_) => true,
+        });
+        self.borrows.borrow_mut()[id.0] = Some(borrows);
+        borrows
+    }
+
+    /// The view of union `id` as seen from `module`, borrowing for `lt`.
+    pub(super) fn union_view_ty(&self, id: TypeId, module: &[String], lt: &str) -> String {
+        let view = self.view_path(id, module);
+        if self.union_borrows(id) {
+            format!("{view}<{lt}>")
+        } else {
+            view
+        }
+    }
+
+    /// The view of union `id`: an enum of what each variant's data reads
+    /// as, a variant's fields through its view in `snake(Union)`.
+    pub(super) fn union_view(&self, out: &mut Out, id: TypeId, item: &Union, module: &[String]) {
+        let layout = self.wire.union(id);
+        let name = &self.names[id.0];
+        let label = self.schema.path(id).join(".");
+        let view = format!("{name}View");
+        let borrows = self.union_borrows(id);
+        let (ty, generics, input) = if borrows {
+            (format!("{view}<'a>"), "<'a>", "&'a [u8]")
+        } else {
+            (view.clone(), "", "&[u8]")
+        };
+        let anonymous = if borrows {
+            format!("{view}<'_>")
+        } else {
+            view.clone()
+        };
+        let tag = layout.tag.bytes();
+        let tag_cell = match layout.tag {
+            Width::U8 => "u8",
+            _ => "__w::U16",
+        };
+        let inner = snake(&self.schema.def(id).name);
+        // What each variant's data reads as, and whether it is fixed-size.
+        let payloads: Vec<Option<(String, bool)>> = item
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(index, variant)| match &variant.data {
+                VariantData::Unit => None,
+                VariantData::Type(ty) => Some((
+                    self.view_ty(ty, module, "'a"),
+                    self.wire.size(ty).fixed().is_some(),
+                )),
+                VariantData::Fields(_) => {
+                    let path = format!("self::{inner}::{}View", variant.name);
+                    let fixed = layout.variants[index]
+                        .as_ref()
+                        .expect("a variant with fields")
+                        .size
+                        .fixed()
+                        .is_some();
+                    let ty = if fixed {
+                        format!("&'a {path}")
+                    } else {
+                        format!("{path}<'a>")
+                    };
+                    Some((ty, fixed))
+                }
+            })
+            .collect();
+
+        out.line(format!("/// [`{name}`], read in place."));
+        out.line("#[derive(Debug, Clone, Copy)]");
+        out.line(format!("pub enum {ty} {{"));
+        for (variant, payload) in item.variants.iter().zip(&payloads) {
+            let variant = ident(&variant.name);
+            match payload {
+                None => out.line(format!("{variant},")),
+                Some((ty, _)) => out.line(format!("{variant}({ty}),")),
+            }
+        }
+        out.line("}");
+
+        out.line("");
+        out.line(format!("impl{generics} {ty} {{"));
+        self.decoders(
+            out,
+            &label,
+            input,
+            "Self",
+            "unsafe { <Self as __w::Var<'_>>::read(buf) }",
+            &anonymous,
+        );
+        out.line("");
+        out.line(format!("pub fn to_owned(&self) -> {name} {{"));
+        out.line("match *self {");
+        for (index, variant) in item.variants.iter().enumerate() {
+            let variant_name = ident(&variant.name);
+            let owned = format!("{name}::{variant_name}");
+            match &variant.data {
+                VariantData::Unit => out.line(format!("Self::{variant_name} => {owned},")),
+                VariantData::Type(ty) => out.line(format!(
+                    "Self::{variant_name}(v) => {owned}({}),",
+                    self.owned_from(ty, "v")
+                )),
+                VariantData::Fields(fields) => {
+                    let object = self.variant_object(id, index, fields, module);
+                    out.line(format!(
+                        "Self::{variant_name}(v) => {},",
+                        self.owned_object(&object, &owned, "v")
+                    ));
+                }
+            }
+        }
+        out.line("}");
+        out.line("}");
+        out.line("}");
+
+        out.line("");
+        out.line(format!("impl __w::Validate for {anonymous} {{"));
+        out.line(format!(
+            "fn validate_at(buf: &[u8], at: usize) -> {RESULT}<(), __w::DecodeError> {{"
+        ));
+        out.line(format!("__w::de::at_least(buf, {tag}, at, {label:?})?;"));
+        let mut arms = Vec::new();
+        for (index, (variant, payload)) in item.variants.iter().zip(&payloads).enumerate() {
+            let quoted = format!("{label}.{}", variant.name);
+            let check = match (&variant.data, payload) {
+                (VariantData::Unit, _) => {
+                    vec![format!("__w::de::exact(b, 0, at, {quoted:?})?;")]
+                }
+                (VariantData::Type(ty), Some((_, true))) => {
+                    let mut check = vec![format!(
+                        "__w::de::exact(b, {}, at, {quoted:?})?;",
+                        self.fixed_size(ty)
+                    )];
+                    check.extend(self.check_fixed(ty, &quoted, module));
+                    check
+                }
+                (VariantData::Type(ty), _) => self.check_var(ty, &quoted, module),
+                (VariantData::Fields(_), Some((ty, _))) => {
+                    let view = ty.trim_start_matches("&'a ").replace("<'a>", "<'_>");
+                    vec![format!("<{view} as __w::Validate>::validate_at(b, at)?;")]
+                }
+                (VariantData::Fields(_), None) => unreachable!("fields read as a view"),
+            };
+            arms.push((UnionLayout::tag_of(index), check));
+        }
+        // Each arm checks `b`, the variant's data, starting `at`.
+        let reads = arms.iter().any(|(_, check)| !check.is_empty());
+        if reads {
+            out.line(format!("let (b, at) = (&buf[{tag}..], at + {tag});"));
+        }
+        out.line(format!("match __w::de::plain::<{tag_cell}>(buf, 0) {{"));
+        for (tag, check) in arms {
+            if check.is_empty() {
+                out.line(format!("{tag} => {{}}"));
+            } else {
+                out.line(format!("{tag} => {{"));
+                out.extend(check);
+                out.line("}");
+            }
+        }
+        let at = if reads {
+            format!("at - {tag}")
+        } else {
+            "at".into()
+        };
+        out.line(format!("_ => return __w::de::tag({at}, {label:?}),"));
+        out.line("}");
+        out.line("Ok(())");
+        out.line("}");
+        out.line("}");
+
+        out.line("");
+        out.line(format!("impl<'a> __w::Var<'a> for {view}{generics} {{"));
+        out.line("unsafe fn read(bytes: &'a [u8]) -> Self {");
+        if payloads.iter().any(Option::is_some) {
+            out.line(format!("let b = &bytes[{tag}..];"));
+        }
+        out.line(format!("match __w::de::plain::<{tag_cell}>(bytes, 0) {{"));
+        for (index, (variant, payload)) in item.variants.iter().zip(&payloads).enumerate() {
+            let tag = UnionLayout::tag_of(index);
+            let variant_name = ident(&variant.name);
+            let Some((ty, fixed)) = payload else {
+                out.line(format!("{tag} => Self::{variant_name},"));
+                continue;
+            };
+            let read = match (&variant.data, fixed) {
+                (VariantData::Fields(_), true) => {
+                    format!("__w::cast::<{}>(b)", ty.trim_start_matches("&'a "))
+                }
+                (VariantData::Type(ty), true) => {
+                    format!("__w::read::<{}>(b, 0)", self.cell(ty, module))
+                }
+                _ => format!("<{ty} as __w::Var<'a>>::read(b)"),
+            };
+            out.line(format!(
+                "{tag} => Self::{variant_name}(unsafe {{ {read} }}),"
+            ));
+        }
+        out.line("// SAFETY: validated as a declared tag.");
+        out.line("_ => unsafe { ::core::hint::unreachable_unchecked() },");
+        out.line("}");
+        out.line("}");
+        out.line("}");
+
+        out.line("");
+        let target = if borrows {
+            format!("{view}<'a>")
+        } else {
+            view.clone()
+        };
+        decode_impl(out, &target, &view);
+    }
+}
+
+/// `impl __w::Decode` for `target`, a view or a reference to one, through
+/// `view`'s `decode`.
+fn decode_impl(out: &mut Out, target: &str, view: &str) {
+    out.line(format!("impl<'a> __w::Decode<'a> for {target} {{"));
+    out.line(format!(
+        "fn decode(buf: &'a [u8]) -> {RESULT}<Self, __w::DecodeError> {{"
+    ));
+    out.line(format!("{view}::decode(buf)"));
+    out.line("}");
+    out.line("}");
 }

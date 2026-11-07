@@ -7,6 +7,8 @@
 // collections: vec<T>, set<T>, map<T>, array<T, N>
 // option<T>: collections cannot be optional
 // consts: integers, floats, bool, and string
+// type: a scalar under a name of its own
+// union: one of several variants, each with fields, a value, or nothing
 //
 // `timestamp`, `interval`, `uentity`, and `uuid` are left out until the Rust
 // backend supports them.
@@ -38,6 +40,12 @@ const MinHeight: i32 = -100;
 const Gravity: f32 = -9.81;
 const PvpEnabled: bool = true;
 const Motd: string = "Welcome!\n\u{1F44B}";
+
+// A `type` is laid out as the scalar it names, constraints included.
+type PartyId = u64;
+type Level = u8[max=100];
+// Over `bool`, a field of it takes a bitmap bit, as a `bool` does.
+type Ready = bool;
 
 struct EmptyStruct {}
 
@@ -77,7 +85,30 @@ struct StatsPatch {
     strength: option<u8>,
 }
 
+struct Member {
+    id: PartyId,
+    level: Level,
+    ready: Ready,
+}
+
+// A tag, then the variant's data: fields laid out like a struct, a single
+// value, or nothing.
+union PartyOp {
+    Invite { who: PartyId, level: Level, note: option<string[max_length=32]> },
+    Kick(PartyId),
+    Disband,
+}
+
 message[bi] Ping {}
+
+message[bi] Party {
+    leader: PartyId,
+    members: vec<PartyId>[max_length=8],
+    levels: map<PartyId, Level>,
+    roster: vec<Member>,
+    history: vec<PartyOp>,
+    pending: option<PartyOp>,
+}
 
 message[in] MyRequest {
     // A const nested in a message, like a nested type.

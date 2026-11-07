@@ -5,10 +5,10 @@
 //! `docs/protocol/ir.md` describes the format.
 
 use crate::backend::{self, Backend, Error, GeneratedFile};
-use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, Width, Wire};
+use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, UnionLayout, Width, Wire};
 use crate::ir::{
     self, ConstId, ConstValue, Constraints, DefKind, Field, NamespaceId, Number, Type, TypeId,
-    TypeKind,
+    TypeKind, VariantData,
 };
 
 /// The file holding what spans namespaces. Namespace files sit in their own
@@ -130,6 +130,43 @@ fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
             json.end('}');
             object_json(json, schema, wire, id, &item.fields);
         }
+        DefKind::Union(item) => {
+            json.entry("kind", "union");
+            let layout = wire.union(id);
+            json.key("size");
+            size_json(json, layout.size);
+            json.entry_width("tag", layout.tag);
+            json.key("variants");
+            json.begin('[');
+            for (index, variant) in item.variants.iter().enumerate() {
+                json.item();
+                json.begin('{');
+                json.entry("name", &variant.name);
+                json.entry_num("tag", UnionLayout::tag_of(index));
+                match &variant.data {
+                    VariantData::Unit => json.entry("kind", "unit"),
+                    VariantData::Type(ty) => {
+                        json.entry("kind", "type");
+                        json.key("type");
+                        type_json(json, schema, wire, ty);
+                    }
+                    VariantData::Fields(fields) => {
+                        json.entry("kind", "fields");
+                        let layout = layout.variants[index]
+                            .as_ref()
+                            .expect("a variant with fields has a layout");
+                        fields_json(json, schema, wire, layout, fields);
+                    }
+                }
+                json.end('}');
+            }
+            json.end(']');
+        }
+        DefKind::Type(item) => {
+            json.entry("kind", "type");
+            json.key("target");
+            type_json(json, schema, wire, &item.target);
+        }
     }
 
     json.end('}');
@@ -157,7 +194,18 @@ fn const_json(json: &mut Json, schema: &ir::Schema, id: ConstId) {
 
 /// The layout and fields of a struct or message.
 fn object_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId, fields: &[Field]) {
-    let layout = wire.layout(id);
+    fields_json(json, schema, wire, wire.layout(id), fields);
+}
+
+/// The layout and fields of an object: a struct, a message, or a union's
+/// variant.
+fn fields_json(
+    json: &mut Json,
+    schema: &ir::Schema,
+    wire: &Wire,
+    layout: &Layout,
+    fields: &[Field],
+) {
     json.key("layout");
     layout_json(json, layout);
 
@@ -785,6 +833,123 @@ mod tests {
         assert_eq!(
             field(&def, "prefixed")["type"]["wire"]["size"],
             json!({"kind": "var", "max": 238})
+        );
+    }
+
+    #[test]
+    fn unions_carry_their_tag_and_variants() {
+        let def = def(
+            &[concat!(
+                "namespace a;\n",
+                "type Flag = bool;\n",
+                "union Op { Add { slot: u8, hot: Flag }, Remove(u8[max=9]), Clear }\n",
+            )],
+            "a.Op",
+        );
+        assert_eq!(def["kind"], "union");
+        assert_eq!(def["size"], json!({"kind": "var", "max": 3}));
+        assert_eq!(def["tag"], 1);
+        let variants = def["variants"].as_array().unwrap();
+        assert_eq!(variants.len(), 3);
+
+        let add = &variants[0];
+        assert_eq!(add["name"], "Add");
+        assert_eq!(add["tag"], 1);
+        assert_eq!(add["kind"], "fields");
+        assert_eq!(
+            add["layout"],
+            json!({
+                "size": {"kind": "fixed", "bytes": 2},
+                "bitmap": 1,
+                "boundaries": 2,
+                "boundary": 1,
+                "head": 2,
+                "vars": 0,
+            })
+        );
+        assert_eq!(
+            field(add, "slot")["slot"],
+            json!({"kind": "at", "offset": 1})
+        );
+        assert_eq!(field(add, "hot")["slot"], json!({"kind": "bit", "bit": 0}));
+        assert_eq!(field(add, "hot")["type"]["path"], "a.Flag");
+
+        assert_eq!(
+            variants[1],
+            json!({
+                "name": "Remove",
+                "tag": 2,
+                "kind": "type",
+                "type": {
+                    "kind": "u8",
+                    "constraints": {"max": 9},
+                    "wire": {
+                        "size": {"kind": "fixed", "bytes": 1},
+                        "int": {"kind": "native", "width": 1},
+                    },
+                },
+            })
+        );
+        assert_eq!(
+            variants[2],
+            json!({"name": "Clear", "tag": 3, "kind": "unit"})
+        );
+    }
+
+    #[test]
+    fn wide_unions_take_a_two_byte_tag() {
+        let variants: Vec<String> = (0..256).map(|index| format!("V{index}")).collect();
+        let def = def(
+            &[&format!(
+                "namespace a;\nunion U {{ {} }}\n",
+                variants.join(", ")
+            )],
+            "a.U",
+        );
+        assert_eq!(def["tag"], 2);
+        assert_eq!(def["size"], json!({"kind": "var", "max": 2}));
+        assert_eq!(def["variants"][255]["tag"], 256);
+    }
+
+    #[test]
+    fn types_carry_their_target() {
+        let sources = [concat!(
+            "namespace a;\n",
+            "enum E: u16 { A }\n",
+            "type Level = i32[min=-100, max=100];\n",
+            "type Hue = E;\n",
+            "type Rank = Level;\n",
+            "struct S { level: Level }\n",
+        )];
+        let level = def(&sources, "a.Level");
+        assert_eq!(level["kind"], "type");
+        assert_eq!(
+            level["target"],
+            json!({
+                "kind": "i32",
+                "constraints": {"min": -100, "max": 100},
+                "wire": {
+                    "size": {"kind": "fixed", "bytes": 1},
+                    "int": {"kind": "biased", "min": -100, "width": 1},
+                },
+            })
+        );
+        let hue = def(&sources, "a.Hue");
+        assert_eq!(hue["target"]["kind"], "named");
+        assert_eq!(hue["target"]["path"], "a.E");
+        assert_eq!(
+            hue["target"]["wire"]["size"],
+            json!({"kind": "fixed", "bytes": 2})
+        );
+        assert_eq!(def(&sources, "a.Rank")["target"]["path"], "a.Level");
+
+        // A field names the type, and takes its size, not its `int`.
+        let level = &field(&def(&sources, "a.S"), "level")["type"];
+        assert_eq!(level["kind"], "named");
+        assert_eq!(level["path"], "a.Level");
+        assert_eq!(
+            level["wire"],
+            json!({"size": {"kind": "fixed", "bytes": 1}})
         );
     }
 

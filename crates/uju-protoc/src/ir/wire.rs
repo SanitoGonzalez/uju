@@ -7,11 +7,15 @@ use std::fmt::Write as _;
 
 use crate::ir::{
     ConstId, ConstValue, DefKind, Direction, Field, Number, Schema, Type, TypeId, TypeKind,
+    VariantData,
 };
 
 /// The largest encoded message, in bytes. Every length, count, and offset
 /// therefore fits in a `u16`.
 pub const MAX_SIZE: u32 = u16::MAX as u32;
+
+/// The most variants a union holds, so its tag fits in a `u16`.
+pub const MAX_VARIANTS: usize = u16::MAX as usize;
 
 /// Byte width of an integer on the wire, little-endian.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -156,6 +160,26 @@ pub struct Layout {
     pub fields: Vec<Slot>,
 }
 
+/// Layout of a union: its tag, then the variant's data, which runs to the
+/// end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionLayout {
+    /// Always [`Size::Var`].
+    pub size: Size,
+    /// Width of the tag opening the union: variant `i` is tagged `i + 1`.
+    pub tag: Width,
+    /// The layout of each variant with fields, indexed by variant; `None`
+    /// for the others.
+    pub variants: Vec<Option<Layout>>,
+}
+
+impl UnionLayout {
+    /// The tag of the variant at `index`; `0` is never a tag.
+    pub fn tag_of(index: usize) -> u16 {
+        u16::try_from(index + 1).expect("lowering bounds the variants")
+    }
+}
+
 /// Where a field sits. Bits count from the least significant bit of the
 /// bitmap's first byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +211,8 @@ pub struct Ids {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     pub def: TypeId,
+    /// The union variant at fault, by declaration index.
+    pub variant: Option<usize>,
     /// The field at fault, by declaration index; `None` for the whole
     /// declaration.
     pub field: Option<usize>,
@@ -198,8 +224,10 @@ pub struct Error {
 pub struct Wire {
     /// Indexed by [`TypeId`].
     sizes: Vec<Size>,
-    /// Indexed by [`TypeId`]; `None` for enums.
+    /// Indexed by [`TypeId`]; `Some` for structs and messages.
     layouts: Vec<Option<Layout>>,
+    /// Indexed by [`TypeId`]; `Some` for unions.
+    unions: Vec<Option<UnionLayout>>,
     /// Indexed by [`TypeId`]; empty for everything but messages.
     ids: Vec<Ids>,
     inbound: Vec<TypeId>,
@@ -214,6 +242,7 @@ impl Wire {
             schema,
             states: vec![State::Todo; len],
             layouts: vec![None; len],
+            unions: vec![None; len],
             errors: Vec::new(),
         };
         let sizes: Vec<Size> = (0..len).map(|index| builder.def(TypeId(index))).collect();
@@ -243,6 +272,7 @@ impl Wire {
                 if index.is_none() {
                     builder.errors.push(Error {
                         def: id,
+                        variant: None,
                         field: None,
                         message: format!("more than {} {name} messages", u16::MAX),
                     });
@@ -264,6 +294,7 @@ impl Wire {
         Ok(Wire {
             sizes,
             layouts: builder.layouts,
+            unions: builder.unions,
             ids,
             inbound,
             outbound,
@@ -284,11 +315,20 @@ impl Wire {
     ///
     /// # Panics
     ///
-    /// When `id` is an enum, which is laid out as its repr.
+    /// When `id` is not a struct or message.
     pub fn layout(&self, id: TypeId) -> &Layout {
         self.layouts[id.0]
             .as_ref()
             .expect("only structs and messages have a layout")
+    }
+
+    /// The layout of a union.
+    ///
+    /// # Panics
+    ///
+    /// When `id` is not a union.
+    pub fn union(&self, id: TypeId) -> &UnionLayout {
+        self.unions[id.0].as_ref().expect("not a union")
     }
 
     pub fn ids(&self, id: TypeId) -> Ids {
@@ -325,6 +365,7 @@ struct Builder<'a> {
     schema: &'a Schema,
     states: Vec<State>,
     layouts: Vec<Option<Layout>>,
+    unions: Vec<Option<UnionLayout>>,
     errors: Vec<Error>,
 }
 
@@ -339,8 +380,11 @@ impl Builder<'_> {
         let schema = self.schema;
         let size = match &schema.def(id).kind {
             DefKind::Enum(item) => Size::Fixed(item.repr.size() as u32),
-            DefKind::Struct(item) => self.layout(id, &item.fields),
-            DefKind::Message(item) => self.layout(id, &item.fields),
+            DefKind::Struct(item) => self.object(id, &item.fields),
+            DefKind::Message(item) => self.object(id, &item.fields),
+            DefKind::Union(item) => self.union(id, &item.variants),
+            // A scalar, so never too large.
+            DefKind::Type(item) => self.size(&item.target),
         };
         self.states[id.0] = State::Done(size);
         size
@@ -350,7 +394,56 @@ impl Builder<'_> {
         type_size(ty, &mut |id| self.def(id))
     }
 
-    fn layout(&mut self, id: TypeId, fields: &[Field]) -> Size {
+    fn object(&mut self, id: TypeId, fields: &[Field]) -> Size {
+        let layout = self.layout(id, None, fields);
+        let size = layout.size;
+        self.layouts[id.0] = Some(layout);
+        size
+    }
+
+    fn union(&mut self, id: TypeId, variants: &[crate::ir::UnionVariant]) -> Size {
+        let tag = Width::of(variants.len() as u128);
+        let mut layouts = Vec::with_capacity(variants.len());
+        // The largest variant's data, `None` once one is unbounded.
+        let mut largest = Some(0u32);
+        for (index, variant) in variants.iter().enumerate() {
+            let (size, layout) = match &variant.data {
+                VariantData::Unit => (Size::Fixed(0), None),
+                VariantData::Type(ty) => {
+                    if let Some(size) = self.oversized(ty) {
+                        self.errors.push(Error {
+                            def: id,
+                            variant: Some(index),
+                            field: None,
+                            message: format!(
+                                "`{}` takes {size} bytes; a message holds at most {MAX_SIZE}",
+                                self.schema.type_name(ty)
+                            ),
+                        });
+                    }
+                    (self.size(ty), None)
+                }
+                VariantData::Fields(fields) => {
+                    let layout = self.layout(id, Some(index), fields);
+                    (layout.size, Some(layout))
+                }
+            };
+            largest = largest.zip(size.max()).map(|(a, b)| a.max(b));
+            layouts.push(layout);
+        }
+        let size = Size::Var {
+            max: largest.and_then(|largest| bound(tag.bytes() as u64 + largest as u64)),
+        };
+        self.unions[id.0] = Some(UnionLayout {
+            size,
+            tag,
+            variants: layouts,
+        });
+        size
+    }
+
+    /// Lays out the fields of a struct or message, or of a union's variant.
+    fn layout(&mut self, id: TypeId, variant: Option<usize>, fields: &[Field]) -> Layout {
         let mut bits = 0;
         let mut bit = || {
             bits += 1;
@@ -366,6 +459,7 @@ impl Builder<'_> {
                 oversized = true;
                 self.errors.push(Error {
                     def: id,
+                    variant,
                     field: Some(index),
                     message: format!(
                         "`{}` takes {size} bytes; a message holds at most {MAX_SIZE}",
@@ -373,7 +467,9 @@ impl Builder<'_> {
                     ),
                 });
             }
-            let slot = match (field.optional, &field.ty.kind, size) {
+            // A `type` over `bool` is a bit too.
+            let kind = &self.schema.resolved(&field.ty).kind;
+            let slot = match (field.optional, kind, size) {
                 (false, TypeKind::Bool, _) => Slot::Bit(bit()),
                 (true, TypeKind::Bool, _) => Slot::OptionalBit {
                     presence: bit(),
@@ -419,12 +515,17 @@ impl Builder<'_> {
         let head = boundaries + count * boundary.bytes() as u64;
 
         if head > MAX_SIZE as u64 && !oversized {
+            let mut name = self.schema.qualified(id);
+            if let (Some(index), DefKind::Union(item)) = (variant, &self.schema.def(id).kind) {
+                name.push('.');
+                name.push_str(&item.variants[index].name);
+            }
             self.errors.push(Error {
                 def: id,
+                variant,
                 field: None,
                 message: format!(
-                    "`{}` takes at least {head} bytes; a message holds at most {MAX_SIZE}",
-                    self.schema.qualified(id)
+                    "`{name}` takes at least {head} bytes; a message holds at most {MAX_SIZE}"
                 ),
             });
         }
@@ -437,7 +538,7 @@ impl Builder<'_> {
                 max: var.and_then(|var| bound(head + optional + var)),
             }
         };
-        self.layouts[id.0] = Some(Layout {
+        Layout {
             size,
             bitmap,
             boundaries: boundaries.min(u32::MAX as u64) as u32,
@@ -445,8 +546,7 @@ impl Builder<'_> {
             head: head.min(u32::MAX as u64) as u32,
             vars,
             fields: slots,
-        });
-        size
+        }
     }
 
     /// The size of a fixed-size part of `ty` too large for any message.
@@ -567,26 +667,8 @@ fn canonical(schema: &Schema) -> String {
         .collect();
     defs.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let mut out = String::new();
-    for (name, id) in defs {
-        let fields = match &schema.def(id).kind {
-            DefKind::Enum(item) => {
-                let _ = write!(out, "enum {name}: {} {{", item.repr);
-                for variant in &item.variants {
-                    let _ = write!(out, " {} = {},", variant.name, variant.value);
-                }
-                out.push_str(" }\n");
-                continue;
-            }
-            DefKind::Struct(item) => {
-                let _ = write!(out, "struct {name} {{");
-                &item.fields
-            }
-            DefKind::Message(item) => {
-                let _ = write!(out, "message[{}] {name} {{", item.direction.name());
-                &item.fields
-            }
-        };
+    let fields = |out: &mut String, fields: &[Field]| {
+        out.push_str(" {");
         for field in fields {
             let ty = schema.type_name(&field.ty);
             if field.optional {
@@ -595,7 +677,46 @@ fn canonical(schema: &Schema) -> String {
                 let _ = write!(out, " {}: {ty},", field.name);
             }
         }
-        out.push_str(" }\n");
+        out.push_str(" }");
+    };
+    let mut out = String::new();
+    for (name, id) in defs {
+        match &schema.def(id).kind {
+            DefKind::Enum(item) => {
+                let _ = write!(out, "enum {name}: {} {{", item.repr);
+                for variant in &item.variants {
+                    let _ = write!(out, " {} = {},", variant.name, variant.value);
+                }
+                out.push_str(" }");
+            }
+            DefKind::Struct(item) => {
+                let _ = write!(out, "struct {name}");
+                fields(&mut out, &item.fields);
+            }
+            DefKind::Message(item) => {
+                let _ = write!(out, "message[{}] {name}", item.direction.name());
+                fields(&mut out, &item.fields);
+            }
+            DefKind::Union(item) => {
+                let _ = write!(out, "union {name} {{");
+                for variant in &item.variants {
+                    let _ = write!(out, " {}", variant.name);
+                    match &variant.data {
+                        VariantData::Unit => {}
+                        VariantData::Type(ty) => {
+                            let _ = write!(out, "({})", schema.type_name(ty));
+                        }
+                        VariantData::Fields(variant) => fields(&mut out, variant),
+                    }
+                    out.push(',');
+                }
+                out.push_str(" }");
+            }
+            DefKind::Type(item) => {
+                let _ = write!(out, "type {name} = {};", schema.type_name(&item.target));
+            }
+        }
+        out.push('\n');
     }
 
     let mut consts: Vec<(String, ConstId)> = (0..schema.consts.len())
@@ -667,7 +788,9 @@ mod tests {
         match &schema.def(id).kind {
             DefKind::Struct(item) => &item.fields,
             DefKind::Message(item) => &item.fields,
-            DefKind::Enum(_) => panic!("an enum has no fields"),
+            DefKind::Enum(_) | DefKind::Union(_) | DefKind::Type(_) => {
+                panic!("only structs and messages have fields")
+            }
         }
     }
 
@@ -923,6 +1046,241 @@ mod tests {
             wire.size(field(&schema, m, "empties")),
             Size::Var { max: Some(1) }
         );
+    }
+
+    #[test]
+    fn unions_take_a_tag_then_their_largest_variant() {
+        let (schema, wire) = compiled(&[concat!(
+            "namespace a;\n",
+            "union U {\n",
+            "    Clear,\n",
+            "    Remove(u32),\n",
+            "    Add { slot: u16, flag: bool, name: string[max_length=10] },\n",
+            "    Hit(bool),\n",
+            "}\n",
+            "union Units { A, B }\n",
+            "union Open { A(u8), B(string) }\n",
+            "message[in] M { u: U, o: option<U>, v: vec<U>[max_length=2] }\n",
+        )]);
+        let u = wire.union(id(&schema, "U"));
+        assert_eq!(u.tag, Width::U8);
+        let add = Layout {
+            // 1 (tag) + 1 (bitmap) + 2 (slot) + 10 (name)
+            size: Size::Var { max: Some(13) },
+            bitmap: 1,
+            boundaries: 3,
+            boundary: Width::U8,
+            vars: 1,
+            head: 3,
+            fields: vec![
+                Slot::At(1),
+                Slot::Bit(0),
+                Slot::Var {
+                    slot: 0,
+                    presence: None,
+                },
+            ],
+        };
+        assert_eq!(u.variants, [None, None, Some(add), None]);
+        assert_eq!(u.size, Size::Var { max: Some(14) }, "the tag and `Add`");
+
+        let m = id(&schema, "M");
+        assert_eq!(wire.size(field(&schema, m, "u")), u.size);
+        assert_eq!(
+            wire.layout(m).fields[..2],
+            [
+                Slot::Var {
+                    slot: 0,
+                    presence: None
+                },
+                Slot::Var {
+                    slot: 1,
+                    presence: Some(0)
+                },
+            ]
+        );
+        assert_eq!(
+            wire.sequence(field(&schema, m, "v")),
+            Some(Sequence::Prefixed {
+                count: Width::U8,
+                prefix: Width::U8,
+            })
+        );
+
+        let units = wire.union(id(&schema, "Units"));
+        assert_eq!(units.size, Size::Var { max: Some(1) }, "a tag alone");
+        assert_eq!(units.variants, [None, None]);
+        assert_eq!(
+            wire.union(id(&schema, "Open")).size,
+            Size::Var { max: None },
+            "one unbounded variant leaves the union unbounded"
+        );
+    }
+
+    #[test]
+    fn a_tag_widens_past_255_variants() {
+        let tag = |count: usize| {
+            let variants: Vec<String> = (0..count).map(|index| format!("V{index}")).collect();
+            let (schema, wire) = compiled(&[&format!(
+                "namespace a;\nunion U {{ {} }}\n",
+                variants.join(", ")
+            )]);
+            let layout = wire.union(id(&schema, "U"));
+            (layout.tag, layout.size)
+        };
+        assert_eq!(tag(255), (Width::U8, Size::Var { max: Some(1) }));
+        assert_eq!(tag(256), (Width::U16, Size::Var { max: Some(2) }));
+        assert_eq!(UnionLayout::tag_of(0), 1, "0 is never a tag");
+        assert_eq!(UnionLayout::tag_of(254), 255);
+        assert_eq!(UnionLayout::tag_of(MAX_VARIANTS - 1), u16::MAX);
+    }
+
+    #[test]
+    fn types_lay_out_as_their_target() {
+        let (schema, wire, m) = message(concat!(
+            "enum E: u16 { A }\n",
+            "struct P { x: f32, y: f32 }\n",
+            "type Level = u8[max=100];\n",
+            "type Big = i64[min=0, max=70000];\n",
+            "type Id = uuid;\n",
+            "type Hue = E;\n",
+            "type Alias = Level;\n",
+            "type Flag = bool;\n",
+            "message[in] M { level: Level, big: Big, id: Id, hue: Hue, alias: Alias, ",
+            "ids: vec<Id>, keyed: map<Big, P>, grid: array<Level, 3> }",
+        ));
+        let target = |name: &str| {
+            let DefKind::Type(item) = &schema.def(id(&schema, name)).kind else {
+                panic!("expected a type");
+            };
+            item.target.clone()
+        };
+        for (name, bytes) in [
+            ("Level", 1),
+            ("Big", 4),
+            ("Id", 16),
+            ("Hue", 2),
+            ("Alias", 1),
+            ("Flag", 1),
+        ] {
+            let named = Type::from(TypeKind::Named(id(&schema, name)));
+            assert_eq!(wire.size(&named), wire.size(&target(name)), "{name}");
+            assert_eq!(wire.size(&named), Size::Fixed(bytes), "{name}");
+        }
+        // The target carries the narrowing.
+        assert_eq!(
+            Int::of(schema.resolved(field(&schema, m, "big"))),
+            Some(Int::Biased {
+                min: 0,
+                width: Width::U32
+            })
+        );
+
+        let layout = wire.layout(m);
+        assert_eq!(
+            layout.fields[..5],
+            [
+                Slot::At(0),
+                Slot::At(1),
+                Slot::At(5),
+                Slot::At(21),
+                Slot::At(23),
+            ]
+        );
+        let sequence = |name| wire.sequence(field(&schema, m, name));
+        assert_eq!(sequence("ids"), Some(Sequence::Packed { item: 16 }));
+        assert_eq!(sequence("keyed"), Some(Sequence::Packed { item: 12 }));
+        assert_eq!(wire.size(field(&schema, m, "grid")), Size::Fixed(3));
+    }
+
+    #[test]
+    fn types_over_bool_take_bitmap_bits() {
+        let (schema, wire) = compiled(&[concat!(
+            "namespace a;\n",
+            "type Flag = bool;\n",
+            "type Ready = Flag;\n",
+            "struct S { a: Flag, x: u8, b: option<Ready>, c: bool, all: array<Flag, 2> }\n",
+            "union U { A { f: Flag }, B(Flag) }\n",
+        )]);
+        let layout = wire.layout(id(&schema, "S"));
+        assert_eq!(layout.bitmap, 1);
+        assert_eq!(
+            layout.fields,
+            [
+                Slot::Bit(0),
+                Slot::At(1),
+                Slot::OptionalBit {
+                    presence: 1,
+                    value: 2
+                },
+                Slot::Bit(3),
+                // Outside a bitmap, it takes a byte, as a `bool` does.
+                Slot::At(2),
+            ]
+        );
+        assert_eq!(layout.size, Size::Fixed(4), "`option<bool>` stays fixed");
+
+        let union = wire.union(id(&schema, "U"));
+        let a = union.variants[0].as_ref().expect("a layout");
+        assert_eq!(a.fields, [Slot::Bit(0)]);
+        assert_eq!(a.size, Size::Fixed(1));
+        assert_eq!(union.size, Size::Var { max: Some(2) });
+    }
+
+    #[test]
+    fn canonical_text_spells_out_unions_and_types() {
+        let (schema, _) = compiled(&[concat!(
+            "namespace a;\n",
+            "type PartyId = u64;\n",
+            "union Op { Add { id: PartyId, note: option<string> }, Remove(u8[max=9]), Clear }\n",
+        )]);
+        assert_eq!(
+            canonical(&schema),
+            concat!(
+                "union a.Op { Add { id: a.PartyId, note: option<string>, }, Remove(u8[max=9]), Clear, }\n",
+                "type a.PartyId = u64;\n",
+            )
+        );
+    }
+
+    #[test]
+    fn fingerprints_cover_unions_and_types() {
+        let fingerprint = |src: &str| {
+            compiled(&[&format!("namespace a;\n{src}\n")])
+                .1
+                .fingerprint()
+        };
+        let base = fingerprint(concat!(
+            "type Id = u32;\n",
+            "union U { A { x: Id }, B(u8), C }\n",
+        ));
+        assert_eq!(
+            base,
+            fingerprint(concat!(
+                "union U { A { x: Id, }, B(u8), C, }\n",
+                "type Id = u32;\n",
+            )),
+            "declaration order and trailing commas do not matter"
+        );
+        for changed in [
+            // Variants: order, names, and forms.
+            "type Id = u32;\nunion U { B(u8), A { x: Id }, C }",
+            "type Id = u32;\nunion U { A { x: Id }, B(u8), D }",
+            "type Id = u32;\nunion U { A { y: Id }, B(u8), C }",
+            "type Id = u32;\nunion U { A(Id), B(u8), C }",
+            "type Id = u32;\nunion U { A { x: Id }, B(u16), C }",
+            "type Id = u32;\nunion U { A { x: Id }, B(u8[max=9]), C }",
+            "type Id = u32;\nunion U { A { x: Id }, B(u8), C, D }",
+            "type Id = u32;\nunion V { A { x: Id }, B(u8), C }",
+            // A type's target and name.
+            "type Id = u64;\nunion U { A { x: Id }, B(u8), C }",
+            "type Id = u32[max=9];\nunion U { A { x: Id }, B(u8), C }",
+            "type Key = u32;\nunion U { A { x: Key }, B(u8), C }",
+            // A type, or the scalar it stands for.
+            "type Id = u32;\nunion U { A { x: u32 }, B(u8), C }",
+        ] {
+            assert_ne!(base, fingerprint(changed), "{changed}");
+        }
     }
 
     #[test]

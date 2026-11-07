@@ -32,10 +32,26 @@ impl Generator<'_> {
     }
 
     pub(super) fn is_fixed_def(&self, id: TypeId) -> bool {
-        match self.schema.def(id).kind {
+        match &self.schema.def(id).kind {
             DefKind::Enum(_) => true,
-            _ => self.wire.layout(id).size.fixed().is_some(),
+            DefKind::Type(item) => self.wire.size(&item.target).fixed().is_some(),
+            DefKind::Union(_) => false,
+            DefKind::Struct(_) | DefKind::Message(_) => self.wire.layout(id).size.fixed().is_some(),
         }
+    }
+
+    /// The `type`s `ty` names in turn before its scalar, outermost first, as
+    /// seen from `module`; empty when `ty` names none.
+    pub(super) fn newtypes(&self, ty: &Type, module: &[String]) -> Vec<String> {
+        let mut paths = Vec::new();
+        let mut ty = ty;
+        while let TypeKind::Named(id) = ty.kind
+            && let DefKind::Type(item) = &self.schema.def(id).kind
+        {
+            paths.push(self.path(id, module, &self.names[id.0]));
+            ty = &item.target;
+        }
+        paths
     }
 
     pub(super) fn fixed_size(&self, ty: &Type) -> u32 {
@@ -99,7 +115,11 @@ impl Generator<'_> {
                     "__w::EnumCell<{}>",
                     self.path(*id, module, &self.names[id.0])
                 ),
-                _ => self.view_path(*id, module),
+                DefKind::Type(_) => {
+                    format!("__w::Typed<{}>", self.path(*id, module, &self.names[id.0]))
+                }
+                DefKind::Union(_) => unreachable!("a union is never fixed-size"),
+                DefKind::Struct(_) | DefKind::Message(_) => self.view_path(*id, module),
             },
             _ => unreachable!("only fixed-size types have cells"),
         }
@@ -118,7 +138,7 @@ impl Generator<'_> {
             TypeKind::Bytes => format!("&{lt} [u8; {}]", self.fixed_size(ty)),
             TypeKind::Array(..) => format!("&{lt} {}", self.cell(ty, module)),
             TypeKind::Named(id) => match self.schema.def(*id).kind {
-                DefKind::Enum(_) => self.path(*id, module, &self.names[id.0]),
+                DefKind::Enum(_) | DefKind::Type(_) => self.path(*id, module, &self.names[id.0]),
                 _ => format!("&{lt} {}", self.view_path(*id, module)),
             },
             _ => self.owned(ty, module),
@@ -170,8 +190,11 @@ impl Generator<'_> {
                     ),
                 }
             }
-            TypeKind::Named(id) => format!("{}<{lt}>", self.view_path(*id, module)),
-            _ => unreachable!("only strings, bytes, collections, and structs vary in size"),
+            TypeKind::Named(id) => match self.schema.def(*id).kind {
+                DefKind::Union(_) => self.union_view_ty(*id, module, lt),
+                _ => format!("{}<{lt}>", self.view_path(*id, module)),
+            },
+            _ => unreachable!("only strings, bytes, collections, structs, and unions vary in size"),
         }
     }
 
@@ -213,7 +236,7 @@ impl Generator<'_> {
                 }
             }
             TypeKind::Named(id) => match self.schema.def(*id).kind {
-                DefKind::Enum(_) => e.to_string(),
+                DefKind::Enum(_) | DefKind::Type(_) => e.to_string(),
                 _ => format!("{e}.to_owned()"),
             },
             _ => e.to_string(),

@@ -7,7 +7,10 @@
 //! Each struct and message `Foo` becomes the owned `Foo`, which
 //! encodes into a caller's buffer, and `FooView`, which validates an encoding
 //! once and then reads it in place. Every layout comes from [`Wire`], so the
-//! code agrees with every other backend byte for byte. Consts become
+//! code agrees with every other backend byte for byte. A `type` becomes a
+//! newtype over its scalar, which views read by value. A union `U` becomes
+//! the enum `U` and the view enum `UView`, whose variants with fields are
+//! read through views in the module `u`. Consts become
 //! `SCREAMING_SNAKE_CASE` constants beside the types of their scope.
 
 use std::cell::RefCell;
@@ -24,10 +27,10 @@ use self::out::Out;
 use self::types::*;
 use crate::backend::{self, Backend, Error, GeneratedFile};
 use crate::case;
-use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, Width, Wire};
+use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, UnionLayout, Width, Wire};
 use crate::ir::{
     ConstId, ConstValue, Constraints, DefKind, Direction, Field, NamespaceId, Number, Schema, Type,
-    TypeId, TypeKind,
+    TypeId, TypeKind, Union, VariantData,
 };
 
 /// Where generated code finds the runtime, aliased as `__w` in each module.
@@ -100,6 +103,18 @@ struct Traits {
     copy: bool,
 }
 
+impl Traits {
+    /// What both `self` and `other` support.
+    fn and(self, other: Traits) -> Traits {
+        Traits {
+            eq: self.eq && other.eq,
+            hash: self.hash && other.hash,
+            default: self.default && other.default,
+            copy: self.copy && other.copy,
+        }
+    }
+}
+
 const ALL: Traits = Traits {
     eq: true,
     hash: true,
@@ -128,6 +143,9 @@ struct Generator<'a> {
     /// Whether a fixed-size struct's bytes need checks beyond their size,
     /// filled in on demand.
     checked: RefCell<Vec<Option<bool>>>,
+    /// Whether a union's view borrows the buffer, and so takes a lifetime,
+    /// filled in on demand.
+    borrows: RefCell<Vec<Option<bool>>>,
 }
 
 impl<'a> Generator<'a> {
@@ -161,6 +179,7 @@ impl<'a> Generator<'a> {
             encode,
             decode,
             checked: RefCell::new(vec![None; len]),
+            borrows: RefCell::new(vec![None; len]),
         };
         generator.check_names()?;
         Ok(generator)
@@ -214,8 +233,15 @@ impl<'a> Generator<'a> {
                 claim(outer, name.clone(), owner);
             }
             claim(module, self.names[index].clone(), owner.clone());
-            if !matches!(def.kind, DefKind::Enum(_)) {
-                claim(module, format!("{}View", self.names[index]), owner);
+            // A `type` is its own view.
+            if !matches!(def.kind, DefKind::Enum(_) | DefKind::Type(_)) {
+                claim(module, format!("{}View", self.names[index]), owner.clone());
+            }
+            if let DefKind::Union(item) = &def.kind
+                && has_fields(item)
+            {
+                let owner = format!("the variant views of {owner}");
+                claim(module, snake(&def.name), owner);
             }
         }
         for (index, item) in self.schema.consts.iter().enumerate() {
@@ -375,6 +401,8 @@ impl<'a> Generator<'a> {
                     self.object(out, *id, &item.fields, path);
                     self.message(out, *id);
                 }
+                DefKind::Type(item) => self.newtype(out, *id, item, path),
+                DefKind::Union(item) => self.union(out, *id, item, path),
             }
         }
         for (name, child) in &module.children {
@@ -392,18 +420,50 @@ impl<'a> Generator<'a> {
     }
 }
 
-/// A struct or message being emitted.
+/// A struct or message being emitted, or the fields of a union variant.
 struct Object<'a> {
-    /// The name errors report, as `Outer.Inner`.
+    /// The name errors report, as `Outer.Inner`, or `Union.Variant`.
     name: String,
     layout: &'a Layout,
     fields: &'a [Field],
     module: &'a [String],
+    /// Whether the encoder finds field `i` bound as `__fi`, a reference, as
+    /// a union's `match` binds a variant's fields; otherwise it reads
+    /// `self.x`.
+    bound: bool,
 }
 
 impl Object<'_> {
     fn field(&self, field: &Field) -> String {
         format!("{}.{}", self.name, field.name)
+    }
+
+    /// Field `i` as a `&T`.
+    fn reference(&self, i: usize) -> String {
+        if self.bound {
+            format!("__f{i}")
+        } else {
+            format!("&self.{}", ident(&self.fields[i].name))
+        }
+    }
+
+    /// Field `i` as the receiver of a method taking `&self`.
+    fn receiver(&self, i: usize) -> String {
+        if self.bound {
+            format!("__f{i}")
+        } else {
+            format!("self.{}", ident(&self.fields[i].name))
+        }
+    }
+
+    /// Field `i` followed by `suffix`, as a place: `self.x.0`, or the
+    /// `Copy` value itself when `suffix` is empty.
+    fn value(&self, i: usize, suffix: &str) -> String {
+        match (self.bound, suffix) {
+            (true, "") => format!("*__f{i}"),
+            (true, _) => format!("__f{i}{suffix}"),
+            (false, _) => format!("self.{}{suffix}", ident(&self.fields[i].name)),
+        }
     }
 
     fn optional_count(&self) -> usize {
@@ -444,6 +504,37 @@ fn unsupported(schema: &Schema) -> Result<(), Error> {
             DefKind::Enum(_) => continue,
             DefKind::Struct(item) => &item.fields,
             DefKind::Message(item) => &item.fields,
+            // Reported once here rather than at every field it types.
+            DefKind::Type(item) => {
+                if let Some(name) = find(&item.target) {
+                    errors.push(format!(
+                        "`{}`: the Rust backend does not support `{name}` yet",
+                        schema.qualified(TypeId(index))
+                    ));
+                }
+                continue;
+            }
+            DefKind::Union(item) => {
+                for variant in &item.variants {
+                    let tys: Vec<(String, &Type)> = match &variant.data {
+                        VariantData::Unit => Vec::new(),
+                        VariantData::Type(ty) => vec![(variant.name.clone(), ty)],
+                        VariantData::Fields(fields) => fields
+                            .iter()
+                            .map(|field| (format!("{}.{}", variant.name, field.name), &field.ty))
+                            .collect(),
+                    };
+                    for (label, ty) in tys {
+                        if let Some(name) = find(ty) {
+                            errors.push(format!(
+                                "`{}.{label}`: the Rust backend does not support `{name}` yet",
+                                schema.qualified(TypeId(index))
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
         };
         for field in fields {
             if let Some(name) = find(&field.ty) {
@@ -459,6 +550,25 @@ fn unsupported(schema: &Schema) -> Result<(), Error> {
         return Err(Error::new(errors.join("\n")));
     }
     Ok(())
+}
+
+/// Whether any variant of `item` has fields, and so a view in the union's
+/// module.
+fn has_fields(item: &crate::ir::Union) -> bool {
+    item.variants
+        .iter()
+        .any(|variant| matches!(variant.data, VariantData::Fields(_)))
+}
+
+/// The pattern binding the fields of variant `name` as `__f0`, `__f1`, …,
+/// in declaration order.
+fn variant_pattern(name: &str, fields: &[Field]) -> String {
+    let bindings: Vec<String> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| format!("{}: __f{i}", ident(&field.name)))
+        .collect();
+    format!("Self::{name} {{ {} }}", bindings.join(", "))
 }
 
 /// The module `id` is declared in: its namespace's, then one per enclosing
@@ -554,17 +664,30 @@ fn roles(schema: &Schema, direction: Option<Direction>) -> (Vec<bool>, Vec<bool>
         }
         encode[id.0] |= enc;
         decode[id.0] |= dec;
-        let fields = match &schema.def(id).kind {
-            DefKind::Struct(item) => &item.fields,
-            DefKind::Message(item) => &item.fields,
-            DefKind::Enum(_) => return,
-        };
-        for field in fields {
-            let mut named = Vec::new();
-            named_in(&field.ty, &mut named);
-            for inner in named {
-                mark(schema, inner, roles, encode, decode);
+        let mut named = Vec::new();
+        match &schema.def(id).kind {
+            DefKind::Struct(item) => fields_named(&item.fields, &mut named),
+            DefKind::Message(item) => fields_named(&item.fields, &mut named),
+            DefKind::Type(item) => named_in(&item.target, &mut named),
+            DefKind::Union(item) => {
+                for variant in &item.variants {
+                    match &variant.data {
+                        VariantData::Unit => {}
+                        VariantData::Type(ty) => named_in(ty, &mut named),
+                        VariantData::Fields(fields) => fields_named(fields, &mut named),
+                    }
+                }
             }
+            DefKind::Enum(_) => return,
+        }
+        for inner in named {
+            mark(schema, inner, roles, encode, decode);
+        }
+    }
+
+    fn fields_named(fields: &[Field], out: &mut Vec<TypeId>) {
+        for field in fields {
+            named_in(&field.ty, out);
         }
     }
 
@@ -593,6 +716,8 @@ fn roles(schema: &Schema, direction: Option<Direction>) -> (Vec<bool>, Vec<bool>
     (encode, decode)
 }
 
+/// The declarations `ty` names directly; a `type`'s target is reached
+/// through its own declaration.
 fn named_in(ty: &Type, out: &mut Vec<TypeId>) {
     match &ty.kind {
         TypeKind::Array(item, _) | TypeKind::Vec(item) | TypeKind::Set(item) => named_in(item, out),
@@ -612,19 +737,28 @@ fn traits(schema: &Schema) -> Vec<Traits> {
     loop {
         let mut changed = false;
         for (index, def) in schema.defs.iter().enumerate() {
-            let fields = match &def.kind {
+            let all = match &def.kind {
                 DefKind::Enum(_) => continue,
-                DefKind::Struct(item) => &item.fields,
-                DefKind::Message(item) => &item.fields,
+                DefKind::Struct(item) => fields_traits(&item.fields, &traits),
+                DefKind::Message(item) => fields_traits(&item.fields, &traits),
+                DefKind::Type(item) => type_traits(&item.target, &traits),
+                // A union has no variant to default to.
+                DefKind::Union(item) => {
+                    let mut all = Traits {
+                        default: false,
+                        ..ALL
+                    };
+                    for variant in &item.variants {
+                        let variant_traits = match &variant.data {
+                            VariantData::Unit => ALL,
+                            VariantData::Type(ty) => type_traits(ty, &traits),
+                            VariantData::Fields(fields) => fields_traits(fields, &traits),
+                        };
+                        all = all.and(variant_traits);
+                    }
+                    all
+                }
             };
-            let mut all = ALL;
-            for field in fields {
-                let field_traits = type_traits(&field.ty, &traits);
-                all.eq &= field_traits.eq;
-                all.hash &= field_traits.hash;
-                all.default &= field.optional || field_traits.default;
-                all.copy &= field_traits.copy;
-            }
             if all != traits[index] {
                 traits[index] = all;
                 changed = true;
@@ -634,6 +768,20 @@ fn traits(schema: &Schema) -> Vec<Traits> {
             return traits;
         }
     }
+}
+
+/// What an object of `fields` supports. An optional field defaults to
+/// `None`, whatever its type.
+fn fields_traits(fields: &[Field], traits: &[Traits]) -> Traits {
+    let mut all = ALL;
+    for field in fields {
+        let field_traits = type_traits(&field.ty, traits);
+        all = all.and(Traits {
+            default: field.optional || field_traits.default,
+            ..field_traits
+        });
+    }
+    all
 }
 
 fn type_traits(ty: &Type, traits: &[Traits]) -> Traits {

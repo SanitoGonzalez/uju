@@ -46,6 +46,8 @@ pub enum DefKind {
     Enum(Enum),
     Struct(Struct),
     Message(Message),
+    Union(Union),
+    Type(TypeDef),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +74,35 @@ pub enum EnumRepr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Struct {
     pub fields: Vec<Field>,
+}
+
+/// A sum type. Its variants are tagged from 1 in declaration order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Union {
+    pub variants: Vec<UnionVariant>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionVariant {
+    pub name: String,
+    pub data: VariantData,
+}
+
+/// What a union variant carries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VariantData {
+    Unit,
+    /// A single value, which is never optional.
+    Type(Type),
+    /// Fields, laid out as an object.
+    Fields(Vec<Field>),
+}
+
+/// `type Name = Target;`: a scalar under a name of its own, laid out as
+/// the scalar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDef {
+    pub target: Type,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -269,9 +300,26 @@ impl Schema {
         }
     }
 
+    /// `ty`, or the scalar it stands for when it names a `type`, through
+    /// any number of them.
+    pub fn resolved<'a>(&'a self, mut ty: &'a Type) -> &'a Type {
+        // Bounded, so a cycle, which lowering reports, cannot hang.
+        for _ in 0..=self.defs.len() {
+            match &ty.kind {
+                TypeKind::Named(id) => match &self.def(*id).kind {
+                    DefKind::Type(item) => ty = &item.target,
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        ty
+    }
+
     /// Whether every value of `ty` encodes to the same number of bytes. A
     /// struct is fixed-size when all of its fields are, and none is optional
-    /// but an `option<bool>`, which takes two bits either way.
+    /// but an `option<bool>`, which takes two bits either way. A union never
+    /// is.
     pub fn is_fixed(&self, ty: &Type) -> bool {
         self.is_fixed_in(ty, &mut Vec::new())
     }
@@ -285,14 +333,23 @@ impl Schema {
             TypeKind::Array(item, _) => self.is_fixed_in(item, visiting),
             TypeKind::Named(id) => match &self.def(*id).kind {
                 DefKind::Enum(_) => true,
-                DefKind::Message(_) => false,
+                DefKind::Message(_) | DefKind::Union(_) => false,
+                DefKind::Type(item) => {
+                    if visiting.contains(id) {
+                        return true;
+                    }
+                    visiting.push(*id);
+                    let fixed = self.is_fixed_in(&item.target, visiting);
+                    visiting.pop();
+                    fixed
+                }
                 DefKind::Struct(item) => {
                     if visiting.contains(id) {
                         return true;
                     }
                     visiting.push(*id);
                     let fixed = item.fields.iter().all(|field| {
-                        (!field.optional || field.ty.kind == TypeKind::Bool)
+                        (!field.optional || self.resolved(&field.ty).kind == TypeKind::Bool)
                             && self.is_fixed_in(&field.ty, visiting)
                     });
                     visiting.pop();
