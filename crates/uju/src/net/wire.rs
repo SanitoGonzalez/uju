@@ -208,6 +208,8 @@ pub enum DecodeErrorKind {
     Float,
     /// A string that isn't UTF-8.
     Utf8,
+    /// An undeclared union tag.
+    Tag,
     /// No message has this id.
     UnknownId(u16),
 }
@@ -226,6 +228,7 @@ impl fmt::Display for DecodeErrorKind {
             DecodeErrorKind::Range => f.write_str("value out of range"),
             DecodeErrorKind::Float => f.write_str("float is NaN or infinite"),
             DecodeErrorKind::Utf8 => f.write_str("string is not UTF-8"),
+            DecodeErrorKind::Tag => f.write_str("undeclared union tag"),
             DecodeErrorKind::UnknownId(id) => write!(f, "unknown message id {id}"),
         }
     }
@@ -534,6 +537,55 @@ unsafe impl<E: Enum> Cell for EnumCell<E> {
 }
 
 impl<E: Enum + fmt::Debug> fmt::Debug for EnumCell<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.get(), f)
+    }
+}
+
+/// A generated `type`: a newtype over a scalar, read from its target's cell.
+pub trait Newtype: Copy + 'static {
+    /// The target's cell.
+    type Cell: Cell;
+
+    fn from_cell(cell: &Self::Cell) -> Self;
+}
+
+/// A [`Newtype`] stored as its target.
+#[repr(transparent)]
+pub struct Typed<T: Newtype>(T::Cell, PhantomData<T>);
+
+impl<T: Newtype> Clone for Typed<T>
+where
+    T::Cell: Copy,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: Newtype> Copy for Typed<T> where T::Cell: Copy {}
+
+impl<T: Newtype> Typed<T> {
+    #[inline]
+    pub fn get(&self) -> T {
+        T::from_cell(&self.0)
+    }
+}
+
+// SAFETY: a transparent wrapper of a cell, so laid out as one.
+unsafe impl<T: Newtype> Cell for Typed<T> {
+    type Value<'a> = T;
+
+    #[inline]
+    fn get(&self) -> T {
+        Typed::get(self)
+    }
+}
+
+// SAFETY: valid for any bytes its target cell is valid for.
+unsafe impl<T: Newtype> Plain for Typed<T> where T::Cell: Plain {}
+
+impl<T: Newtype + fmt::Debug> fmt::Debug for Typed<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.get(), f)
     }
@@ -1153,6 +1205,12 @@ pub mod de {
         Ok(())
     }
 
+    /// The tag read at `at` names no variant of the union `field`.
+    #[cold]
+    pub fn tag<T>(at: usize, field: &'static str) -> Result<T, DecodeError> {
+        fail(at, field, DecodeErrorKind::Tag)
+    }
+
     /// The slot of an absent value is empty.
     #[inline]
     pub fn empty(bytes: &[u8], at: usize, field: &'static str) -> Result<(), DecodeError> {
@@ -1580,6 +1638,39 @@ mod tests {
         assert_eq!(bytes, [7, 0, 0, 0, 3, 0, 0, 0]);
         assert_eq!(unsafe { read::<EntityCell>(&bytes, 0) }, entity);
         assert!(de::entity(&[7, 0, 0, 0, 0, 0, 0, 0], 0, "t").is_err());
+    }
+
+    #[test]
+    fn undeclared_tags_fail_at_their_offset() {
+        let error = de::tag::<()>(3, "U").unwrap_err();
+        assert_eq!(error, DecodeError::new(3, "U", DecodeErrorKind::Tag));
+        assert_eq!(
+            error.to_string(),
+            "invalid `U` at byte 3: undeclared union tag"
+        );
+    }
+
+    #[test]
+    fn typed_cells_read_their_target() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        struct PartyId(u64);
+
+        impl Newtype for PartyId {
+            type Cell = U64;
+
+            fn from_cell(cell: &U64) -> Self {
+                PartyId(Cell::get(cell))
+            }
+        }
+
+        assert_eq!(size_of::<Typed<PartyId>>(), size_of::<U64>());
+        assert_eq!(align_of::<Typed<PartyId>>(), align_of::<U64>());
+        let bytes = [0, 0x01, 0x02, 0, 0, 0, 0, 0, 0x03];
+        let id = unsafe { read::<Typed<PartyId>>(&bytes, 1) };
+        assert_eq!(id, PartyId(0x0300_0000_0000_0201));
+        assert_eq!(de::plain::<Typed<PartyId>>(&bytes, 0), PartyId(0x0002_0100));
+        let cell = unsafe { cast::<Typed<PartyId>>(&bytes[1..]) };
+        assert_eq!(format!("{cell:?}"), "PartyId(216172782113784321)");
     }
 
     #[test]
