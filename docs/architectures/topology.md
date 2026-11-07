@@ -15,14 +15,18 @@ client ─────────► edge ──┬──► sim node ── sh
 
 ## Roles
 
-- **Shard**: one thread pinned to one CPU, owning one ECS `World`
-  (`crates/uju/src/runtime/shard.rs`) and a dynamic set of placement units.
-  It is the authority for everything in them.
+- **Shard**: one thread pinned to one CPU, owning the state of a dynamic set
+  of placement units (`crates/uju/src/runtime/shard.rs`). It is the
+  authority for everything in them.
 - **Sim node**: runs one shard per allowed CPU (`crates/uju/src/runtime/node.rs`).
-  Its shards own **cells**, the squares of the world grid.
-- **Hub node**: the same runtime. Its shards own **slots**, hash buckets of
-  the state that has no position: parties, guilds, friends, chat channels,
-  presence, mail.
+  Its shards own **cells**, the squares of the world grid, and keep their
+  entities in an ECS `World`.
+- **Hub node**: a binary of its own, sharing only the shard runtime with
+  sims. Its shards own **slots**, hash buckets of the state that has no
+  position: parties, guilds, friends, chat channels, presence, mail. A hub
+  shard holds no `World`: each slot keeps a map from key to object per
+  kind, since hub objects are read and written one at a time by key, and no
+  system iterates over them.
 - **Edge**: one edge node, running one thread per allowed CPU. Terminates
   client connections, keeps replicas of the cells around its clients, does
   interest management and fan-out, routes requests to the owning shard, and
@@ -247,8 +251,8 @@ The questions, whatever the model:
 - **Where a client's session lives**, and whether clients land on any
   thread, as a `SO_REUSEPORT` listener would do, or by position.
 - **How client-addressed messages reach the session's thread.** Hubs and
-  sims send messages for one player, such as party updates, private data and
-  mirrors. Either presence and the player entity record the thread, or the
+  sims send messages for one player, such as party updates and private
+  data. Either presence and the player entity record the thread, or the
   receiving thread forwards inside the edge.
 - **How a broadcast spreads**, such as world chat, received once per edge.
 - **How a read** that spans several cells' replicas is answered.
@@ -278,8 +282,7 @@ entity crosses into a cell owned by another shard S′, S hands it over:
 
 1. Once the entity is past the cell boundary by a small margin, so that
    jitter on the line does not bounce it, S removes it and sends
-   `Migrate { uid, state, last_input_seq }` to S′. Its mirror components
-   travel with its state.
+   `Migrate { uid, state, last_input_seq }` to S′.
 2. S emits `Leave { uid, to }` on the old cell's stream. S′ adopts the
    `UniversalId` and emits `Enter` on the new cell's stream.
 3. The two streams come from different shards, so a replica may see `Leave`
@@ -364,24 +367,26 @@ moving slots onto it.
 - **Idempotency**: a sender that times out or loses its session retries, so
   every write from an edge or a sim carries an idempotency key, and the slot
   remembers the keys it applied.
-- **Hub → players**: a hub never talks to clients. It looks up its members'
-  edges in [presence](#presence), sends one message per edge, and the edges
-  fan out. A party of five on three edges costs three messages. A world chat
+- **Hub → players**: a hub never connects to clients. It looks up its
+  members' edges in [presence](#presence), sends one message per edge, and
+  the edges fan out. A party of five on three edges costs three messages. A world chat
   message goes once to every edge.
-- **Hub → sim**: when gameplay needs hub state, such as a character's party
-  for shared experience, the hub sends a message addressed to the character.
-  The character's edge routes it to the owning shard like an input. The
-  shard keeps it as a read-only **mirror** component, which migrates with
-  the entity. Sims never query a hub synchronously during a tick.
-- **Mirror refresh**: a mirror carries its object's version, and the shard
-  ignores older ones. Messages routed through an edge can be lost while the
-  client moves, so on spawn and after every edge move, the shard asks the
-  hub for the current version.
+- **Hub → sim**: a message from a hub to a character goes over the
+  sim → hub session to the character's shard, not through its edge.
+  Messages that reach the old shard after a migration are forwarded, as
+  inputs are.
+- **Hub cache**: when gameplay needs hub state, such as a character's party
+  for shared experience, the sim shard reads it from a cache of hub objects
+  by kind and key. A miss starts a fetch, and sims never query a hub
+  synchronously during a tick. The shard holds a lease on each entry, and
+  the hub pushes every change of the object to it until the lease ends.
+  Every copy carries its object's version, and the shard ignores older
+  ones. Entries do not migrate with entities.
 
 ### Ownership rules
 
-- **One writer per object.** The party owns its member list. A character's
-  `party` field is a mirror, updated by messages from the party.
+- **One writer per object.** The party owns its member list. Sims read it
+  from their hub cache, which the party's pushes keep current.
 - **No cross-slot transactions.** An operation that touches two objects gets
   an object of its own to own it: a trade holds both sides' items in escrow
   and settles in steps.
@@ -415,7 +420,7 @@ character in play, the edge serving it, and a generation number.
 | edge | every hub shard | client requests, presence |
 | entry | hub shards | presence |
 | sim shard | neighbor sim shards | halo replicas, cell handoff, entity migration, forwarding |
-| sim shard | hub shards | writes, mirror refresh |
+| sim shard | hub shards | writes, hub cache, hub → sim messages |
 | hub shard | hub shards | slot handoff, forwarding |
 | atlas | every node | maps, decisions |
 | every node | atlas | load, crossing traffic |
