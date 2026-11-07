@@ -753,13 +753,16 @@ mod tests {
     const EXAMPLE2: &str = include_str!("../../tests/data/example2.uju");
 
     fn compiled(sources: &[&str]) -> Schema {
-        compile(sources).unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"))
+        compile(sources)
+            .unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"))
+            .schema
     }
 
     fn messages(sources: &[&str]) -> Vec<String> {
         compile(sources)
             .expect_err("expected errors")
             .into_iter()
+            .filter(|diagnostic| diagnostic.is_error())
             .map(|diagnostic| diagnostic.message)
             .collect()
     }

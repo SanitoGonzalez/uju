@@ -10,6 +10,7 @@ use clap::builder::PossibleValuesParser;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use uju_protoc::backend::{self, Backend, DISPATCHERS, GeneratedFile, MARKER, Options, PROTOCOLS};
 use uju_protoc::compile;
+use uju_protoc::diagnostic::Diagnostic;
 use uju_protoc::ir::Direction;
 
 /// The extension directories are searched for.
@@ -152,16 +153,23 @@ fn generate(name: &str, generator: &dyn Backend, args: &Common) -> Result<()> {
         .collect::<Result<Vec<String>>>()?;
 
     let borrowed: Vec<&str> = sources.iter().map(String::as_str).collect();
+    let report = |mut diagnostics: Vec<Diagnostic>| {
+        diagnostics.sort_by_key(|diagnostic| (diagnostic.source.0, diagnostic.span.start));
+        for diagnostic in &diagnostics {
+            let index = diagnostic.source.0;
+            let name = inputs[index].display().to_string();
+            eprintln!("{}", diagnostic.render(&name, &sources[index]));
+        }
+    };
     let schema = match compile(&borrowed) {
-        Ok(schema) => schema,
-        Err(mut diagnostics) => {
-            diagnostics.sort_by_key(|diagnostic| (diagnostic.source.0, diagnostic.span.start));
-            for diagnostic in &diagnostics {
-                let index = diagnostic.source.0;
-                let name = inputs[index].display().to_string();
-                eprintln!("{}", diagnostic.render(&name, &sources[index]));
-            }
-            bail!("{} error(s); nothing was generated", diagnostics.len());
+        Ok(compiled) => {
+            report(compiled.warnings);
+            compiled.schema
+        }
+        Err(diagnostics) => {
+            let errors = diagnostics.iter().filter(|d| d.is_error()).count();
+            report(diagnostics);
+            bail!("{errors} error(s); nothing was generated");
         }
     };
 

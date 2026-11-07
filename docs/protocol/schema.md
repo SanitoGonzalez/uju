@@ -1,8 +1,55 @@
 # Schema
 
-> **Status.** Only the planned component declarations are written up here.
-> Until the rest of the language is, `crates/uju-protoc/tests/data/example1.uju`
-> shows every declaration kind, type and constraint.
+> **Status.** Only naming and the planned component declarations are written
+> up here. Until the rest of the language is,
+> `crates/uju-protoc/tests/data/example1.uju` shows every declaration kind,
+> type and constraint.
+
+## Naming
+
+Names are ASCII: a letter or `_`, then letters, digits and `_`. Each kind of
+name has a convention:
+
+| Name | Convention | Example |
+|---|---|---|
+| Namespace segment | `snake_case` | `namespace demo.character;` |
+| Enum, struct, message | `PascalCase` | `message[out] SpawnPlayer` |
+| Enum variant | `PascalCase` | `Blue` |
+| Field | `snake_case` | `max_hp: u32` |
+
+`ujuc` warns about a name that breaks its convention and suggests one that
+follows it. The schema still compiles.
+
+```
+demo.uju:3:8: warning: struct `player_state` should be PascalCase, like `PlayerState`
+```
+
+### Why it matters
+
+Backends rename schema names into their language's conventions, and the
+conversion is only predictable from a known starting point. The Rust
+backend, for instance, puts the types nested in `HTTPDetail` in a module
+`http_detail`. A future C# backend would turn the field `max_hp` into a
+property `MaxHp`.
+
+Conversion splits a name into words:
+
+- at each `_`
+- before a capital that follows a lowercase letter or a digit
+- before the last capital of an acronym followed by lowercase
+
+Digits stay with the word before them. So `HTTPDetail` is `HTTP Detail`,
+`Vec2D` is `Vec2 D`, and `player2_id` is `player2 id`. PascalCase keeps an
+acronym as written, so `HTTPDetail` and `IOError` already follow the
+convention.
+
+### Collisions
+
+Different names can convert to the same generated name. `HTTPDetail` and
+`HttpDetail` both become the module `http_detail`, and two messages `M` in
+namespaces `aB.c` and `a.bC` both become the dispatch variant `ABCM`. A
+backend reports every collision as an error and generates nothing.
+Following the convention makes collisions rare but doesn't rule them out.
 
 ## Components
 

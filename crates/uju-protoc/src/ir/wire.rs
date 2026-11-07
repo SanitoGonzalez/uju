@@ -618,8 +618,9 @@ mod tests {
     const EXAMPLE2: &str = include_str!("../../tests/data/example2.uju");
 
     fn compiled(sources: &[&str]) -> (Schema, Wire) {
-        let schema =
-            compile(sources).unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"));
+        let schema = compile(sources)
+            .unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"))
+            .schema;
         let wire = Wire::new(&schema).expect("lowering checks the layout");
         (schema, wire)
     }
@@ -960,6 +961,7 @@ mod tests {
         let messages: Vec<_> = schema
             .expect_err("expected errors")
             .into_iter()
+            .filter(|diagnostic| diagnostic.is_error())
             .map(|diagnostic| diagnostic.message)
             .collect();
         assert_eq!(
@@ -972,6 +974,7 @@ mod tests {
         let messages: Vec<_> = schema
             .expect_err("expected errors")
             .into_iter()
+            .filter(|diagnostic| diagnostic.is_error())
             .map(|diagnostic| diagnostic.message)
             .collect();
         assert_eq!(

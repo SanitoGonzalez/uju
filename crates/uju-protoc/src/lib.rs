@@ -3,13 +3,22 @@ pub mod case;
 pub mod diagnostic;
 pub mod ir;
 pub mod lexer;
+mod lint;
 pub mod parser;
 pub mod resolve;
 
 use crate::diagnostic::{Diagnostic, SourceId};
 
-/// Compile schema sources into the IR.
-pub fn compile(sources: &[&str]) -> Result<ir::Schema, Vec<Diagnostic>> {
+/// A compiled schema, with the warnings compiling it raised.
+#[derive(Debug)]
+pub struct Compiled {
+    pub schema: ir::Schema,
+    pub warnings: Vec<Diagnostic>,
+}
+
+/// Compile schema sources into the IR. On failure, the diagnostics hold
+/// the errors along with any warnings raised before them.
+pub fn compile(sources: &[&str]) -> Result<Compiled, Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
     let mut schemas = Vec::with_capacity(sources.len());
 
@@ -35,5 +44,15 @@ pub fn compile(sources: &[&str]) -> Result<ir::Schema, Vec<Diagnostic>> {
         return Err(diagnostics);
     }
 
-    ir::lower(&schemas)
+    let mut warnings = Vec::new();
+    for (index, schema) in schemas.iter().enumerate() {
+        lint::naming(SourceId(index), schema, &mut warnings);
+    }
+    match ir::lower(&schemas) {
+        Ok(schema) => Ok(Compiled { schema, warnings }),
+        Err(mut errors) => {
+            errors.extend(warnings);
+            Err(errors)
+        }
+    }
 }

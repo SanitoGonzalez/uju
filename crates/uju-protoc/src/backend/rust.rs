@@ -2307,8 +2307,9 @@ mod tests {
     const EXAMPLE2: &str = include_str!("../../tests/data/example2.uju");
 
     fn files(sources: &[&str], direction: Option<Direction>) -> Vec<GeneratedFile> {
-        let schema =
-            compile(sources).unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"));
+        let schema = compile(sources)
+            .unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"))
+            .schema;
         Rust { direction }
             .generate(&schema)
             .unwrap_or_else(|error| panic!("{error}"))
@@ -2428,7 +2429,9 @@ mod tests {
 
     #[test]
     fn colliding_names_are_reported() {
-        let schema = compile(&["namespace a;\nstruct B {}\nstruct BView {}\n"]).unwrap();
+        let schema = compile(&["namespace a;\nstruct B {}\nstruct BView {}\n"])
+            .unwrap()
+            .schema;
         let error = Rust { direction: None }.generate(&schema).unwrap_err();
         assert_eq!(error.message, "`a.B` and `a.BView` both generate `BView`");
     }
@@ -2468,7 +2471,8 @@ mod tests {
             "namespace aB.c;\nmessage[in] M {}\n",
             "namespace a.bC;\nmessage[in] M {}\n",
         ])
-        .unwrap();
+        .unwrap()
+        .schema;
         let error = Rust { direction: None }.generate(&schema).unwrap_err();
         assert_eq!(
             error.message,
@@ -2487,7 +2491,8 @@ mod tests {
         let schema = compile(&[
             "namespace a;\nmessage[in] M { t: timestamp, ids: vec<uuid>, u: option<uentity> }\n",
         ])
-        .unwrap();
+        .unwrap()
+        .schema;
         let error = Rust { direction: None }.generate(&schema).unwrap_err();
         assert_eq!(
             error.message,
@@ -2503,7 +2508,8 @@ mod tests {
             "namespace a;\nstruct Foo { enum E { X } e: E }\n",
             "namespace a.foo;\nstruct Bar {}\n",
         ])
-        .unwrap();
+        .unwrap()
+        .schema;
         let error = Rust { direction: None }.generate(&schema).unwrap_err();
         assert_eq!(
             error.message,

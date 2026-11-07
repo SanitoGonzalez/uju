@@ -448,8 +448,9 @@ mod tests {
     const EXAMPLE2: &str = include_str!("../../tests/data/example2.uju");
 
     fn generated(sources: &[&str]) -> Vec<GeneratedFile> {
-        let schema =
-            compile(sources).unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"));
+        let schema = compile(sources)
+            .unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"))
+            .schema;
         Ir.generate(&schema)
             .expect("a lowered schema always lays out")
     }
@@ -514,7 +515,7 @@ mod tests {
 
     #[test]
     fn the_root_holds_the_fingerprint_and_id_order() {
-        let schema = compile(&[EXAMPLE1, EXAMPLE2]).unwrap();
+        let schema = compile(&[EXAMPLE1, EXAMPLE2]).unwrap().schema;
         let wire = Wire::new(&schema).unwrap();
         let files = Ir.generate(&schema).unwrap();
         let root = file(&files, "schema.json");
