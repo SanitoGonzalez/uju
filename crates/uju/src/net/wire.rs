@@ -22,11 +22,19 @@ use std::fmt;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use crate::ecs::entity::Entity;
 
 /// The largest encoded message, in bytes.
 pub const MAX_SIZE: usize = u16::MAX as usize;
+
+/// The latest `timestamp`, 9999-12-31T23:59:59.999999Z, in microseconds
+/// since the Unix epoch.
+pub const MAX_TIMESTAMP_MICROS: u64 = 253_402_300_799_999_999;
+
+/// The longest `duration`, 10000 Julian years, in microseconds.
+pub const MAX_DURATION_MICROS: u64 = 315_576_000_000_000_000;
 
 /// An owned value that can be encoded.
 pub trait Encode {
@@ -140,7 +148,8 @@ pub enum EncodeErrorKind {
     Buffer,
     /// A length is outside `min_length..=max_length`.
     Length,
-    /// An integer or float is outside `min..=max`.
+    /// An integer or float is outside `min..=max`, or a timestamp or
+    /// duration outside the range its type can hold.
     Range,
     /// A float is NaN or infinite where the schema forbids it.
     Float,
@@ -202,7 +211,8 @@ pub enum DecodeErrorKind {
     Enum,
     /// An `entity` whose generation is zero.
     Entity,
-    /// An integer or float outside `min..=max`.
+    /// An integer or float outside `min..=max`, or a timestamp or duration
+    /// past the largest its type allows.
     Range,
     /// A NaN or infinite float where the schema forbids it.
     Float,
@@ -350,6 +360,69 @@ unsafe impl Cell for EntityCell {
     fn get(&self) -> Entity {
         // Little-endian index then generation is exactly `to_bits`.
         Entity::from_bits(u64::from_le_bytes(self.0))
+    }
+}
+
+/// A `timestamp`: microseconds since the Unix epoch, read as a
+/// [`SystemTime`].
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TimestampCell([u8; 8]);
+
+impl TimestampCell {
+    /// Every valid value fits any target's `SystemTime`. A value past
+    /// [`MAX_TIMESTAMP_MICROS`], only read when a `decode_unchecked` was
+    /// handed invalid bytes, reads as a later time, or panics where
+    /// `SystemTime` can't hold it.
+    #[inline]
+    pub fn get(&self) -> SystemTime {
+        let micros = Duration::from_micros(u64::from_le_bytes(self.0));
+        match UNIX_EPOCH.checked_add(micros) {
+            Some(time) => time,
+            None => unreachable!("timestamp cells hold validated values"),
+        }
+    }
+}
+
+unsafe impl Cell for TimestampCell {
+    type Value<'a> = SystemTime;
+
+    #[inline]
+    fn get(&self) -> SystemTime {
+        TimestampCell::get(self)
+    }
+}
+
+impl fmt::Debug for TimestampCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.get(), f)
+    }
+}
+
+/// A `duration`: microseconds, read as a [`Duration`].
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DurationCell([u8; 8]);
+
+impl DurationCell {
+    #[inline]
+    pub fn get(&self) -> Duration {
+        Duration::from_micros(u64::from_le_bytes(self.0))
+    }
+}
+
+unsafe impl Cell for DurationCell {
+    type Value<'a> = Duration;
+
+    #[inline]
+    fn get(&self) -> Duration {
+        DurationCell::get(self)
+    }
+}
+
+impl fmt::Debug for DurationCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.get(), f)
     }
 }
 
@@ -1276,6 +1349,18 @@ pub mod de {
         Ok(())
     }
 
+    /// A `timestamp` is at most [`MAX_TIMESTAMP_MICROS`].
+    #[inline]
+    pub fn timestamp(bytes: &[u8], at: usize, field: &'static str) -> Result<(), DecodeError> {
+        range(plain::<U64>(bytes, 0), 0, MAX_TIMESTAMP_MICROS, at, field)
+    }
+
+    /// A `duration` is at most [`MAX_DURATION_MICROS`].
+    #[inline]
+    pub fn duration(bytes: &[u8], at: usize, field: &'static str) -> Result<(), DecodeError> {
+        range(plain::<U64>(bytes, 0), 0, MAX_DURATION_MICROS, at, field)
+    }
+
     #[inline]
     pub fn utf8(bytes: &[u8], at: usize, field: &'static str) -> Result<(), DecodeError> {
         match str::from_utf8(bytes) {
@@ -1567,6 +1652,33 @@ pub mod en {
         range(value, min, max, field)
     }
 
+    /// A `timestamp`'s encoding: microseconds since the Unix epoch, any
+    /// finer precision truncated. Fails before the epoch or past
+    /// [`MAX_TIMESTAMP_MICROS`].
+    #[inline]
+    pub fn timestamp(value: SystemTime, field: &'static str) -> Result<[u8; 8], EncodeError> {
+        match value.duration_since(UNIX_EPOCH) {
+            Ok(since) => micros(since, MAX_TIMESTAMP_MICROS, field),
+            Err(_) => fail(field, EncodeErrorKind::Range),
+        }
+    }
+
+    /// A `duration`'s encoding: microseconds, any finer precision
+    /// truncated. Fails past [`MAX_DURATION_MICROS`].
+    #[inline]
+    pub fn duration(value: Duration, field: &'static str) -> Result<[u8; 8], EncodeError> {
+        micros(value, MAX_DURATION_MICROS, field)
+    }
+
+    #[inline]
+    fn micros(value: Duration, max: u64, field: &'static str) -> Result<[u8; 8], EncodeError> {
+        let micros = value.as_micros();
+        if micros > max as u128 {
+            return fail(field, EncodeErrorKind::Range);
+        }
+        Ok((micros as u64).to_le_bytes())
+    }
+
     #[inline]
     pub fn length(
         len: usize,
@@ -1638,6 +1750,70 @@ mod tests {
         assert_eq!(bytes, [7, 0, 0, 0, 3, 0, 0, 0]);
         assert_eq!(unsafe { read::<EntityCell>(&bytes, 0) }, entity);
         assert!(de::entity(&[7, 0, 0, 0, 0, 0, 0, 0], 0, "t").is_err());
+    }
+
+    #[test]
+    fn timestamps_are_micros_since_the_epoch() {
+        let at = |micros: u64| UNIX_EPOCH + Duration::from_micros(micros);
+        let max = at(MAX_TIMESTAMP_MICROS);
+        for (time, micros) in [(UNIX_EPOCH, 0), (max, MAX_TIMESTAMP_MICROS)] {
+            let bytes = en::timestamp(time, "t").unwrap();
+            assert_eq!(bytes, micros.to_le_bytes());
+            assert_eq!(unsafe { read::<TimestampCell>(&bytes, 0) }, time);
+            assert_eq!(de::timestamp(&bytes, 0, "t"), Ok(()));
+        }
+        // Finer precision is truncated toward the epoch.
+        let fine = at(1_500_000) + Duration::from_nanos(999);
+        assert_eq!(en::timestamp(fine, "t"), Ok(1_500_000u64.to_le_bytes()));
+
+        let range = EncodeError::new("t", EncodeErrorKind::Range);
+        assert_eq!(
+            en::timestamp(max + Duration::from_micros(1), "t"),
+            Err(range)
+        );
+        assert_eq!(
+            en::timestamp(max + Duration::from_nanos(999), "t"),
+            Ok(MAX_TIMESTAMP_MICROS.to_le_bytes())
+        );
+        assert_eq!(
+            en::timestamp(UNIX_EPOCH - Duration::from_nanos(1), "t"),
+            Err(range)
+        );
+        assert_eq!(
+            de::timestamp(&(MAX_TIMESTAMP_MICROS + 1).to_le_bytes(), 2, "t"),
+            Err(DecodeError::new(2, "t", DecodeErrorKind::Range))
+        );
+    }
+
+    #[test]
+    fn durations_are_micros() {
+        let max = Duration::from_micros(MAX_DURATION_MICROS);
+        for (duration, micros) in [(Duration::ZERO, 0), (max, MAX_DURATION_MICROS)] {
+            let bytes = en::duration(duration, "t").unwrap();
+            assert_eq!(bytes, micros.to_le_bytes());
+            assert_eq!(unsafe { read::<DurationCell>(&bytes, 0) }, duration);
+            assert_eq!(de::duration(&bytes, 0, "t"), Ok(()));
+        }
+        assert_eq!(
+            en::duration(Duration::from_nanos(2_999), "t"),
+            Ok(2u64.to_le_bytes())
+        );
+
+        let range = EncodeError::new("t", EncodeErrorKind::Range);
+        assert_eq!(
+            en::duration(max + Duration::from_micros(1), "t"),
+            Err(range)
+        );
+        assert_eq!(en::duration(Duration::MAX, "t"), Err(range));
+        assert_eq!(
+            de::duration(&(MAX_DURATION_MICROS + 1).to_le_bytes(), 2, "t"),
+            Err(DecodeError::new(2, "t", DecodeErrorKind::Range))
+        );
+        // Unchecked bytes past the range still read without overflow.
+        assert_eq!(
+            unsafe { read::<DurationCell>(&u64::MAX.to_le_bytes(), 0) },
+            Duration::from_micros(u64::MAX)
+        );
     }
 
     #[test]
