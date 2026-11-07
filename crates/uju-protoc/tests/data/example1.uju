@@ -6,7 +6,7 @@
 // variants: string, bytes
 // collections: vec<T>, set<T>, map<T>, array<T, N>
 // option<T>: collections cannot be optional
-// consts: integers, floats, bool, and string
+// consts: integers, floats, bool, string, duration, and timestamp
 // type: a scalar under a name of its own
 // union: one of several variants, each with fields, a value, or nothing
 //
@@ -39,6 +39,8 @@ const MinHeight: i32 = -100
 const Gravity: f32 = -9.81
 const PvpEnabled: bool = true
 const Motd: string = "Welcome!\n\u{1F44B}"
+const RespawnDelay: duration = 1500ms
+const SeasonStart: timestamp = 2026-11-07T12:00:00Z
 
 // A `type` is laid out as the scalar it names, constraints included.
 type PartyId = u64

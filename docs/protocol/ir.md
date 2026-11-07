@@ -23,8 +23,9 @@ files sit in their own directory, so a namespace named `schema` cannot
 collide with the root.
 
 All numbers are JSON integers, except float constraints and float consts,
-which keep their fraction (`1.0`). `fingerprint` and `u64` values can exceed
-2^53, so read them as 64-bit integers, not as doubles.
+which keep their fraction (`1.0`). `fingerprint`, `u64` values, and
+`duration` and `timestamp` consts can exceed 2^53, so read them as 64-bit
+integers, not as doubles.
 
 ## `schema.json`
 
@@ -232,6 +233,9 @@ bounds it.
 }
 ```
 
-`type` is an integer type, `f32`, `f64`, `bool`, or `string`, and `value` is
-the matching JSON value. A float keeps the value written in source, so an
-`f32` const must be rounded to `f32` when read.
+`type` is an integer type, `f32`, `f64`, `bool`, `string`, `duration`, or
+`timestamp`, and `value` is the matching JSON value. A float keeps the value
+written in source, so an `f32` const must be rounded to `f32` when read. A
+`duration` is an integer of microseconds, and a `timestamp` an integer of
+microseconds since the Unix epoch, so `30s` is `30000000` and
+`2026-11-07T12:00:00Z` is `1794052800000000`.

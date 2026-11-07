@@ -76,8 +76,8 @@ impl Generator<'_> {
             TypeKind::F32 => "f32".to_string(),
             TypeKind::F64 => "f64".to_string(),
             TypeKind::Bool => "bool".to_string(),
-            TypeKind::Timestamp => "::std::time::SystemTime".to_string(),
-            TypeKind::Duration => "::std::time::Duration".to_string(),
+            TypeKind::Timestamp => SYSTEM_TIME.to_string(),
+            TypeKind::Duration => DURATION.to_string(),
             TypeKind::Entity => "__w::Entity".to_string(),
             TypeKind::String => STRING.to_string(),
             TypeKind::Bytes => match ty.constraints.fixed_length() {

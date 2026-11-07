@@ -18,7 +18,7 @@ Attributes go above the declaration they describe, each as `@name` or
 `@name(args)`:
 
 ```
-@timeout_ms(1000)
+@timeout(1000ms)
 @lock(Inventory, Gold)
 @replicate(ops(InventoryOp))
 struct Trade {
@@ -26,7 +26,9 @@ struct Trade {
 }
 ```
 
-- An argument is a literal (`1000`, `-0.5`, `"text"`, `true`), a path
+- An argument is a literal (`1000`, `-0.5`, `"text"`, `true`, a
+  [duration](#durations) such as `1000ms`, a
+  [timestamp](#timestamps) such as `2026-11-07T12:00:00Z`), a path
   (`Gold`, `demo.items.Gold`), or a call of a path with arguments
   (`ops(InventoryOp)`). Arguments are separated by commas, and a trailing
   comma is allowed.
@@ -116,6 +118,8 @@ const MaxNameLength: u16 = 16
 const TickRate: f32 = 30.0
 const PvpEnabled: bool = true
 const Greeting: string = "Welcome!\n"
+const RespawnDelay: duration = 30s
+const SeasonStart: timestamp = 2026-11-07T12:00:00Z
 
 message[in] SetName {
     const MinLength: u8 = 2
@@ -124,7 +128,7 @@ message[in] SetName {
 ```
 
 - The type is an integer (`i8` to `i64`, `u8` to `u64`), a float (`f32`,
-  `f64`), `bool`, or `string`, without constraints.
+  `f64`), `bool`, `string`, `duration`, or `timestamp`, without constraints.
 - An integer must fit its type. A float takes an integer or a float literal
   (`2` or `2.0`) and must be finite in its type. NaN and infinities can't be
   written.
@@ -133,19 +137,72 @@ message[in] SetName {
   not capped, since it never goes on the wire.
 - `true` and `false` are only literals where a value is expected, so they
   stay usable as names.
+- A `duration` takes a [duration literal](#durations) and a `timestamp` a
+  [timestamp literal](#timestamps). Each takes nothing else, so
+  `const T: duration = 1000` is an error, and an integer or float type
+  rejects both.
 
 A const goes at the top of a namespace or in a struct or message, like a
 nested type. Consts and types share each scope, so a const can't have the
 name of a type declared beside it, and a type path that reaches a const is
 an error. Consts never go on the wire, but they count toward the
-[fingerprint](wire-format.md#fingerprint).
+[fingerprint](wire-format.md#fingerprint), by value rather than by
+spelling: `1000ms` and `1s` are the same const, as are
+`2026-11-07T12:00:00.000Z` and `2026-11-07T12:00:00Z`.
 
 The Rust backend emits `pub const MAX_NAME_LENGTH: u16 = 16;` in the
 namespace's module, and a nested const in its parent's module, as
 `set_name::MIN_LENGTH`. A string is a `&str`.
 
+A `duration` is a `::std::time::Duration`, still a `const`:
+
+```rust
+pub const RESPAWN_DELAY: ::std::time::Duration =
+    ::std::time::Duration::from_micros(30000000);
+```
+
+`SystemTime` has no `const` constructor, so a `timestamp` is a `static`
+computed on first use:
+
+```rust
+pub static SEASON_START: ::std::sync::LazyLock<::std::time::SystemTime> =
+    ::std::sync::LazyLock::new(|| {
+        ::std::time::UNIX_EPOCH + ::std::time::Duration::from_micros(1794052800000000)
+    });
+```
+
 > **TODO.** Constraints and array lengths can't refer to consts yet, as in
 > `string[max_length=MaxNameLength]` or `array<u32, SlotCount>`.
+
+### Durations
+
+A duration literal is an integer with its unit attached, such as `1000ms`,
+`30s` or `5m`, so a name never carries its unit, as `timeout_ms` would.
+
+- The units are `us`, `ms`, `s`, `m` and `h`. There is no `ns`, since a
+  `duration` counts microseconds on the wire, and no `d`, since a day's
+  length is ambiguous.
+- The unit follows the integer with no space: `30s`, not `30 s`.
+- Only integers: `1500ms`, not `1.5s`, so nothing rounds.
+- One unit per literal: `90m`, not `1h30m`.
+- A `duration` requires a unit, so `1000` alone is an integer, not a
+  duration.
+- The value goes from `0` to 10000 years. A negative or larger one is an
+  error.
+
+### Timestamps
+
+A timestamp literal is a UTC date and time in RFC 3339, such as
+`2026-11-07T12:00:00Z`.
+
+- It ends in `Z`. Offsets such as `+02:00` are errors, and `T` and `Z` are
+  uppercase.
+- Seconds may take a fraction of exactly 3 or 6 digits, milliseconds or
+  microseconds: `2026-11-07T12:00:00.250Z`, `2026-11-07T12:00:00.250125Z`.
+- The date must exist, and the year goes from 1970 to 9999, since a
+  `timestamp` counts microseconds since the Unix epoch on the wire.
+- There are no leap seconds: seconds go up to `59`.
+
 
 ## Types
 

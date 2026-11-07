@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::lexer::{Span, Spanned};
+use crate::lexer::{Rfc3339, Span, Spanned};
 
 pub type Ident<'src> = Spanned<&'src str>;
 
@@ -136,6 +136,25 @@ pub enum Literal {
     Float(f64),
     Bool(bool),
     String(String),
+    /// `30s`: a count of `unit`s, unchecked against `duration`'s range.
+    Duration(i128, DurationUnit),
+    /// `2026-11-07T12:00:00Z`: microseconds since the Unix epoch.
+    Timestamp(u64),
+}
+
+/// The unit written right after a duration literal's count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurationUnit {
+    /// `us`: a microsecond.
+    Us,
+    /// `ms`: a millisecond.
+    Ms,
+    /// `s`: a second.
+    S,
+    /// `m`: a minute.
+    M,
+    /// `h`: an hour.
+    H,
 }
 
 /// Which way a message travels, as written in `message[in]`.
@@ -378,6 +397,49 @@ impl Prim {
     }
 }
 
+impl DurationUnit {
+    /// Every unit, smallest first.
+    pub const ALL: [DurationUnit; 5] = [
+        DurationUnit::Us,
+        DurationUnit::Ms,
+        DurationUnit::S,
+        DurationUnit::M,
+        DurationUnit::H,
+    ];
+
+    pub fn from_suffix(suffix: &str) -> Option<Self> {
+        Some(match suffix {
+            "us" => DurationUnit::Us,
+            "ms" => DurationUnit::Ms,
+            "s" => DurationUnit::S,
+            "m" => DurationUnit::M,
+            "h" => DurationUnit::H,
+            _ => return None,
+        })
+    }
+
+    pub fn suffix(self) -> &'static str {
+        match self {
+            DurationUnit::Us => "us",
+            DurationUnit::Ms => "ms",
+            DurationUnit::S => "s",
+            DurationUnit::M => "m",
+            DurationUnit::H => "h",
+        }
+    }
+
+    /// How many microseconds one of this unit lasts.
+    pub fn micros(self) -> u64 {
+        match self {
+            DurationUnit::Us => 1,
+            DurationUnit::Ms => 1_000,
+            DurationUnit::S => 1_000_000,
+            DurationUnit::M => 60_000_000,
+            DurationUnit::H => 3_600_000_000,
+        }
+    }
+}
+
 impl fmt::Display for Path<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (index, (segment, _)) in self.segments.iter().enumerate() {
@@ -468,6 +530,8 @@ impl fmt::Display for Literal {
             Literal::Float(value) => write!(f, "{value:?}"),
             Literal::Bool(value) => write!(f, "{value}"),
             Literal::String(value) => write!(f, "{value:?}"),
+            Literal::Duration(count, unit) => write!(f, "{count}{unit}"),
+            Literal::Timestamp(micros) => write!(f, "{}", Rfc3339(*micros)),
         }
     }
 }
@@ -489,6 +553,12 @@ impl fmt::Display for TypeKind<'_> {
 impl fmt::Display for Prim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+impl fmt::Display for DurationUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.suffix())
     }
 }
 
@@ -642,6 +712,39 @@ mod tests {
         });
         assert_eq!(item.keyword(), "union");
         assert_eq!(item.body(), None, "a union holds no nested declarations");
+    }
+
+    #[test]
+    fn duration_units_round_trip_and_scale() {
+        for unit in DurationUnit::ALL {
+            assert_eq!(DurationUnit::from_suffix(unit.suffix()), Some(unit));
+            assert_eq!(unit.to_string(), unit.suffix());
+        }
+        assert_eq!(
+            DurationUnit::ALL.map(DurationUnit::micros),
+            [1, 1_000, 1_000_000, 60_000_000, 3_600_000_000]
+        );
+        assert_eq!(DurationUnit::from_suffix("ns"), None);
+        assert_eq!(DurationUnit::from_suffix("d"), None);
+    }
+
+    #[test]
+    fn duration_and_timestamp_literals_print_as_written() {
+        assert_eq!(Literal::Duration(30, DurationUnit::S).to_string(), "30s");
+        assert_eq!(
+            Literal::Duration(1000, DurationUnit::Ms).to_string(),
+            "1000ms"
+        );
+        assert_eq!(Literal::Duration(-5, DurationUnit::M).to_string(), "-5m");
+        assert_eq!(Literal::Timestamp(0).to_string(), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            Literal::Timestamp(1_000_250_000).to_string(),
+            "1970-01-01T00:16:40.250Z"
+        );
+        assert_eq!(
+            Literal::Timestamp(1_000_250_125).to_string(),
+            "1970-01-01T00:16:40.250125Z"
+        );
     }
 
     #[test]

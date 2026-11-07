@@ -1244,6 +1244,30 @@ mod tests {
     }
 
     #[test]
+    fn canonical_text_spells_times_by_value() {
+        let (schema, _) = compiled(&[concat!(
+            "namespace a\n",
+            "const D: duration = 1000ms\n",
+            "const L: duration = 90m\n",
+            "const O: duration = 1001ms\n",
+            "const T: timestamp = 2026-11-07T12:00:00.000000Z\n",
+            "const U: timestamp = 2026-11-07T12:00:00.250000Z\n",
+            "const Z: duration = 0h\n",
+        )]);
+        assert_eq!(
+            canonical(&schema),
+            concat!(
+                "const a.D: duration = 1s\n",
+                "const a.L: duration = 90m\n",
+                "const a.O: duration = 1001ms\n",
+                "const a.T: timestamp = 2026-11-07T12:00:00Z\n",
+                "const a.U: timestamp = 2026-11-07T12:00:00.250Z\n",
+                "const a.Z: duration = 0s\n",
+            )
+        );
+    }
+
+    #[test]
     fn fingerprints_cover_unions_and_types() {
         let fingerprint = |src: &str| {
             compiled(&[&format!("namespace a\n{src}\n")])
@@ -1363,6 +1387,24 @@ mod tests {
         assert_ne!(
             fingerprint(r#"const A: string = "x\"\nconst a.B: string = \"y""#),
             fingerprint("const A: string = \"x\"\nconst B: string = \"y\""),
+        );
+
+        // Durations and timestamps count by value, not by spelling.
+        assert_eq!(
+            fingerprint("const D: duration = 1000ms"),
+            fingerprint("const D: duration = 1s")
+        );
+        assert_ne!(
+            fingerprint("const D: duration = 1s"),
+            fingerprint("const D: duration = 2s")
+        );
+        assert_eq!(
+            fingerprint("const T: timestamp = 2026-01-01T00:00:00.000Z"),
+            fingerprint("const T: timestamp = 2026-01-01T00:00:00Z")
+        );
+        assert_ne!(
+            fingerprint("const T: timestamp = 2026-01-01T00:00:00Z"),
+            fingerprint("const T: timestamp = 2026-01-01T00:00:01Z")
         );
     }
 

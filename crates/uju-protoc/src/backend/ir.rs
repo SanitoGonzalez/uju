@@ -188,6 +188,10 @@ fn const_json(json: &mut Json, schema: &ir::Schema, id: ConstId) {
         ConstValue::Float(value) => json.entry_num("value", format!("{value:?}")),
         ConstValue::Bool(value) => json.entry_bool("value", *value),
         ConstValue::String(value) => json.entry("value", value),
+        // Microseconds, since the Unix epoch for a timestamp.
+        ConstValue::Duration(micros) | ConstValue::Timestamp(micros) => {
+            json.entry_num("value", micros)
+        }
     }
     json.end('}');
 }
@@ -639,6 +643,8 @@ mod tests {
             "const Whole: f32 = 2\n",
             "const On: bool = true\n",
             "const Text: string = \"say \\\"hi\\\"\\n\"\n",
+            "const Delay: duration = 30s\n",
+            "const Start: timestamp = 2026-11-07T12:00:00Z\n",
             "message[in] M { const Inner: u16 = 7 }\n",
         )]);
         let namespace = file(&files, "namespaces/a.json");
@@ -650,10 +656,14 @@ mod tests {
                 {"name": "Whole", "path": "a.Whole", "parent": null, "type": "f32", "value": 2.0},
                 {"name": "On", "path": "a.On", "parent": null, "type": "bool", "value": true},
                 {"name": "Text", "path": "a.Text", "parent": null, "type": "string", "value": "say \"hi\"\n"},
+                {"name": "Delay", "path": "a.Delay", "parent": null, "type": "duration", "value": 30_000_000},
+                {"name": "Start", "path": "a.Start", "parent": null, "type": "timestamp", "value": 1_794_052_800_000_000u64},
                 {"name": "Inner", "path": "a.M.Inner", "parent": "a.M", "type": "u16", "value": 7},
             ])
         );
         assert!(files[1].contents.contains(r#""value": 2.0"#));
+        assert!(files[1].contents.contains(r#""value": 30000000"#));
+        assert!(files[1].contents.contains(r#""value": 1794052800000000"#));
         assert!(
             namespace["defs"]
                 .as_array()

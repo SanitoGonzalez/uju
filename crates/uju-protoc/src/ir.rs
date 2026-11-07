@@ -3,6 +3,9 @@ pub mod wire;
 
 use std::fmt;
 
+use crate::lexer::Rfc3339;
+use crate::parser::ast::DurationUnit;
+
 pub use lower::lower;
 
 /// Index of a [`Namespace`] in [`Schema::namespaces`].
@@ -119,7 +122,8 @@ pub struct Const {
     /// The declaration this one is nested in, if any.
     pub parent: Option<TypeId>,
     pub name: String,
-    /// An integer, a float, [`TypeKind::Bool`], or [`TypeKind::String`].
+    /// An integer, a float, [`TypeKind::Bool`], [`TypeKind::String`],
+    /// [`TypeKind::Duration`], or [`TypeKind::Timestamp`].
     pub ty: TypeKind,
     pub value: ConstValue,
 }
@@ -132,6 +136,10 @@ pub enum ConstValue {
     Float(f64),
     Bool(bool),
     String(String),
+    /// Microseconds, however the literal spelled them.
+    Duration(u64),
+    /// Microseconds since the Unix epoch.
+    Timestamp(u64),
 }
 
 /// Which way a message travels.
@@ -428,7 +436,10 @@ impl fmt::Display for EnumRepr {
     }
 }
 
-/// Prints as written in source: `16`, `0.5`, `true`, `"hi\n"`.
+/// Prints as written in source: `16`, `0.5`, `true`, `"hi\n"`. A duration
+/// takes the largest unit that divides it exactly, so `1000ms` prints as
+/// `1s`, and a timestamp prints as canonical RFC 3339, so both print the same
+/// for every spelling of a value.
 impl fmt::Display for ConstValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -437,6 +448,16 @@ impl fmt::Display for ConstValue {
             ConstValue::Float(value) => write!(f, "{value:?}"),
             ConstValue::Bool(value) => write!(f, "{value}"),
             ConstValue::String(value) => write!(f, "{value:?}"),
+            ConstValue::Duration(0) => f.write_str("0s"),
+            ConstValue::Duration(micros) => {
+                let unit = DurationUnit::ALL
+                    .into_iter()
+                    .rev()
+                    .find(|unit| micros % unit.micros() == 0)
+                    .unwrap_or(DurationUnit::Us);
+                write!(f, "{}{unit}", micros / unit.micros())
+            }
+            ConstValue::Timestamp(micros) => write!(f, "{}", Rfc3339(*micros)),
         }
     }
 }

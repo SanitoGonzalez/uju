@@ -49,6 +49,8 @@ const RESULT: &str = "::core::result::Result";
 const OPTION: &str = "::core::option::Option";
 const STRING: &str = "::std::string::String";
 const VEC: &str = "::std::vec::Vec";
+const DURATION: &str = "::std::time::Duration";
+const SYSTEM_TIME: &str = "::std::time::SystemTime";
 
 /// View methods a field accessor must not shadow; such fields get a
 /// trailing `_`.

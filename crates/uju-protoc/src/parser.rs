@@ -155,6 +155,8 @@ where
         Token::Int(value) => Literal::Int(value),
         Token::Float(value) => Literal::Float(value),
         Token::Str(value) => Literal::String(value),
+        Token::Duration((count, unit)) => Literal::Duration(count, unit),
+        Token::Timestamp(micros) => Literal::Timestamp(micros),
         Token::Ident("true") => Literal::Bool(true),
         Token::Ident("false") => Literal::Bool(false),
     }
@@ -819,6 +821,33 @@ mod tests {
     }
 
     #[test]
+    fn consts_take_duration_and_timestamp_literals() {
+        let src = concat!(
+            "namespace a\n",
+            "const Micro: duration = 250us\n",
+            "const Milli: duration = 1000ms\n",
+            "const Second: duration = 30s\n",
+            "const Minute: duration = 5m\n",
+            "const Hour: duration = 2h\n",
+            "const Start: timestamp = 2026-11-07T12:00:00Z\n",
+            "const Precise: timestamp = 2026-11-07T12:00:00.250125Z\n",
+        );
+        let schema = schema_of(src);
+        let value = |name| const_of(&schema.items, name).value.0.clone();
+        assert_eq!(value("Micro"), Literal::Duration(250, DurationUnit::Us));
+        assert_eq!(value("Milli"), Literal::Duration(1000, DurationUnit::Ms));
+        assert_eq!(value("Second"), Literal::Duration(30, DurationUnit::S));
+        assert_eq!(value("Minute"), Literal::Duration(5, DurationUnit::M));
+        assert_eq!(value("Hour"), Literal::Duration(2, DurationUnit::H));
+        assert_eq!(value("Start"), Literal::Timestamp(1_794_052_800_000_000));
+        assert_eq!(value("Precise"), Literal::Timestamp(1_794_052_800_250_125));
+        let precise = const_of(&schema.items, "Precise");
+        assert_eq!(precise.ty.to_string(), "timestamp");
+        assert_eq!(&src[precise.value.1.clone()], "2026-11-07T12:00:00.250125Z");
+        assert_eq!(precise.value.0.to_string(), "2026-11-07T12:00:00.250125Z");
+    }
+
+    #[test]
     fn malformed_consts_are_reported() {
         assert_eq!(
             errors_of("namespace a\nconst A: i32 =\nstruct S {}\n")[0].message,
@@ -1116,6 +1145,30 @@ mod tests {
             attr.to_string(),
             "@a(-1, 2.5, \"s\", true, false, B, c.d.E, f(g(1), h.I))"
         );
+    }
+
+    #[test]
+    fn attribute_arguments_take_durations_and_timestamps() {
+        let src = "namespace a\n@timeout(1000ms) @since(2026-01-01T00:00:00.500Z) struct S {}\n";
+        let schema = schema_of(src);
+        let [timeout, since] = item(&schema, "S").attrs() else {
+            panic!("expected two attributes");
+        };
+        let [AttributeArg::Literal((Literal::Duration(1000, DurationUnit::Ms), span))] =
+            &timeout.args[..]
+        else {
+            panic!("unexpected arguments: {:?}", timeout.args);
+        };
+        assert_eq!(&src[span.clone()], "1000ms");
+        assert!(matches!(
+            since.args[..],
+            [AttributeArg::Literal((
+                Literal::Timestamp(1_767_225_600_500_000),
+                _
+            ))]
+        ));
+        assert_eq!(timeout.to_string(), "@timeout(1000ms)");
+        assert_eq!(since.to_string(), "@since(2026-01-01T00:00:00.500Z)");
     }
 
     #[test]

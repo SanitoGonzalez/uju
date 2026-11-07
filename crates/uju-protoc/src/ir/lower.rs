@@ -126,8 +126,9 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         }
     }
 
-    /// Check a const's type, which must be a number, `bool`, or `string`
-    /// without constraints, and its value against the type.
+    /// Check a const's type, which must be a number, `bool`, `string`,
+    /// `duration`, or `timestamp` without constraints, and its value against
+    /// the type.
     fn lower_const(&mut self, site: &ConstSite<'a, 'src>) -> Const {
         let source = site.source;
         let item = site.item;
@@ -151,7 +152,12 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                 if prim.is_int()
                     || matches!(
                         prim,
-                        ast::Prim::F32 | ast::Prim::F64 | ast::Prim::Bool | ast::Prim::String
+                        ast::Prim::F32
+                            | ast::Prim::F64
+                            | ast::Prim::Bool
+                            | ast::Prim::String
+                            | ast::Prim::Duration
+                            | ast::Prim::Timestamp
                     ) =>
             {
                 prim_type(*prim)
@@ -161,7 +167,8 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                     source,
                     &item.ty.span,
                     format!(
-                        "a const cannot be `{kind}`; it takes an integer, a float, `bool`, or `string`"
+                        "a const cannot be `{kind}`; it takes an integer, a float, `bool`, `string`, \
+                         `duration`, or `timestamp`"
                     ),
                 );
                 return lowered(TypeKind::Bool, ConstValue::Bool(false));
@@ -202,6 +209,26 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             _ => match (&ty, literal) {
                 (TypeKind::Bool, ast::Literal::Bool(value)) => (Some(ConstValue::Bool(*value)), ""),
                 (TypeKind::Bool, _) => (None, "`true` or `false`"),
+                (TypeKind::Duration, ast::Literal::Duration(count, unit)) => {
+                    // Overflow is out of range too, so it can't wrap into it.
+                    let micros = count
+                        .checked_mul(unit.micros() as i128)
+                        .filter(|micros| (0..=MAX_DURATION_MICROS as i128).contains(micros));
+                    if micros.is_none() {
+                        self.error(
+                            source,
+                            span,
+                            format!("`{literal}` is out of range for `{kind_name}`"),
+                        );
+                    }
+                    let micros = micros.unwrap_or(0) as u64;
+                    (Some(ConstValue::Duration(micros)), "")
+                }
+                (TypeKind::Duration, _) => (None, "a duration such as `30s`"),
+                (TypeKind::Timestamp, ast::Literal::Timestamp(micros)) => {
+                    (Some(ConstValue::Timestamp(*micros)), "")
+                }
+                (TypeKind::Timestamp, _) => (None, "a timestamp such as `2026-01-01T00:00:00Z`"),
                 (_, ast::Literal::String(value)) => (Some(ConstValue::String(value.clone())), ""),
                 _ => (None, "a string"),
             },
@@ -212,6 +239,8 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                 ast::Literal::Float(_) => "a float",
                 ast::Literal::Bool(_) => "a bool",
                 ast::Literal::String(_) => "a string",
+                ast::Literal::Duration(..) => "a duration",
+                ast::Literal::Timestamp(_) => "a timestamp",
             };
             self.error(
                 source,
@@ -948,6 +977,10 @@ fn refs(ty: &Type, out: &mut Vec<TypeId>) {
     }
 }
 
+/// The longest `duration` a const can take, in microseconds: 10000 Julian
+/// years, or 100 centuries of 36525 days.
+const MAX_DURATION_MICROS: u64 = 100 * 36_525 * 86_400 * 1_000_000;
+
 /// Which constraints a type takes.
 enum Class {
     /// Integers, with the inclusive range of the type.
@@ -1405,19 +1438,170 @@ mod tests {
             ),
             (
                 "const A: bytes = \"x\"",
-                "a const cannot be `bytes`; it takes an integer, a float, `bool`, or `string`",
+                "a const cannot be `bytes`; it takes an integer, a float, `bool`, `string`, `duration`, or `timestamp`",
             ),
             (
-                "const A: timestamp = 0",
-                "a const cannot be `timestamp`; it takes an integer, a float, `bool`, or `string`",
+                "const A: uuid = 0",
+                "a const cannot be `uuid`; it takes an integer, a float, `bool`, `string`, `duration`, or `timestamp`",
             ),
             (
                 "enum E { X }\nconst A: E = 0",
-                "a const cannot be `E`; it takes an integer, a float, `bool`, or `string`",
+                "a const cannot be `E`; it takes an integer, a float, `bool`, `string`, `duration`, or `timestamp`",
             ),
             (
                 "const A: vec<u8> = 0",
-                "a const cannot be `vec<u8>`; it takes an integer, a float, `bool`, or `string`",
+                "a const cannot be `vec<u8>`; it takes an integer, a float, `bool`, `string`, `duration`, or `timestamp`",
+            ),
+        ];
+        for (src, expected) in cases {
+            assert_eq!(
+                messages(&[&format!("namespace a\n{src}\n")]),
+                [expected],
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn duration_and_timestamp_consts_lower_to_micros() {
+        let schema = compiled(&[concat!(
+            "namespace a\n",
+            "const Zero: duration = 0s\n",
+            "const Micro: duration = 250us\n",
+            "const Second: duration = 1000ms\n",
+            "const Hour: duration = 2h\n",
+            "const Longest: duration = 87660000h\n",
+            "const Epoch: timestamp = 1970-01-01T00:00:00Z\n",
+            "const Start: timestamp = 2026-11-07T12:00:00.250125Z\n",
+        )]);
+        let value = |name| {
+            (
+                constant(&schema, name).ty.clone(),
+                constant(&schema, name).value.clone(),
+            )
+        };
+        assert_eq!(value("Zero"), (TypeKind::Duration, ConstValue::Duration(0)));
+        assert_eq!(
+            value("Micro"),
+            (TypeKind::Duration, ConstValue::Duration(250))
+        );
+        assert_eq!(
+            value("Second"),
+            (TypeKind::Duration, ConstValue::Duration(1_000_000))
+        );
+        assert_eq!(
+            value("Hour"),
+            (TypeKind::Duration, ConstValue::Duration(7_200_000_000))
+        );
+        assert_eq!(
+            value("Longest"),
+            (
+                TypeKind::Duration,
+                ConstValue::Duration(315_576_000_000_000_000)
+            )
+        );
+        assert_eq!(
+            value("Epoch"),
+            (TypeKind::Timestamp, ConstValue::Timestamp(0))
+        );
+        assert_eq!(
+            value("Start"),
+            (
+                TypeKind::Timestamp,
+                ConstValue::Timestamp(1_794_052_800_250_125)
+            )
+        );
+    }
+
+    #[test]
+    fn equal_spellings_lower_to_equal_values() {
+        let schema = compiled(&[concat!(
+            "namespace a\n",
+            "const A: duration = 90m\n",
+            "const B: duration = 5400s\n",
+            "const C: duration = 5400000000us\n",
+            "const D: timestamp = 2026-11-07T12:00:00Z\n",
+            "const E: timestamp = 2026-11-07T12:00:00.000Z\n",
+            "const F: timestamp = 2026-11-07T12:00:00.000000Z\n",
+        )]);
+        let value = |name| constant(&schema, name).value.clone();
+        assert_eq!(value("A"), value("B"));
+        assert_eq!(value("A"), value("C"));
+        assert_eq!(value("D"), value("E"));
+        assert_eq!(value("D"), value("F"));
+    }
+
+    #[test]
+    fn duration_and_timestamp_consts_are_checked() {
+        let cases = [
+            (
+                "const A: duration = -1s",
+                "`-1s` is out of range for `duration`",
+            ),
+            (
+                "const A: duration = 87660001h",
+                "`87660001h` is out of range for `duration`",
+            ),
+            (
+                "const A: duration = 315576000000000001us",
+                "`315576000000000001us` is out of range for `duration`",
+            ),
+            // Past `i128` once scaled, so it must not wrap into range.
+            (
+                "const A: duration = 170141183460469231731687303715884105727h",
+                "`170141183460469231731687303715884105727h` is out of range for `duration`",
+            ),
+            (
+                "const A: duration = 1000",
+                "`duration` takes a duration such as `30s`, found an integer",
+            ),
+            (
+                "const A: duration = 1.5",
+                "`duration` takes a duration such as `30s`, found a float",
+            ),
+            (
+                "const A: duration = 2026-01-01T00:00:00Z",
+                "`duration` takes a duration such as `30s`, found a timestamp",
+            ),
+            (
+                "const A: timestamp = 0",
+                "`timestamp` takes a timestamp such as `2026-01-01T00:00:00Z`, found an integer",
+            ),
+            (
+                "const A: timestamp = \"2026-01-01T00:00:00Z\"",
+                "`timestamp` takes a timestamp such as `2026-01-01T00:00:00Z`, found a string",
+            ),
+            (
+                "const A: timestamp = 30s",
+                "`timestamp` takes a timestamp such as `2026-01-01T00:00:00Z`, found a duration",
+            ),
+            (
+                "const A: u64 = 30s",
+                "`u64` takes an integer, found a duration",
+            ),
+            (
+                "const A: i64 = 2026-01-01T00:00:00Z",
+                "`i64` takes an integer, found a timestamp",
+            ),
+            (
+                "const A: f64 = 30s",
+                "`f64` takes a number, found a duration",
+            ),
+            (
+                "const A: f32 = 2026-01-01T00:00:00Z",
+                "`f32` takes a number, found a timestamp",
+            ),
+            (
+                "const A: bool = 1s",
+                "`bool` takes `true` or `false`, found a duration",
+            ),
+            (
+                "const A: string = 2026-01-01T00:00:00Z",
+                "`string` takes a string, found a timestamp",
+            ),
+            (
+                "const A: duration[max=1] = 1s",
+                "a const's type takes no constraints",
             ),
         ];
         for (src, expected) in cases {

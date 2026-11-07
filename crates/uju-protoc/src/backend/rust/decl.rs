@@ -6,6 +6,7 @@ use super::*;
 impl Generator<'_> {
     pub(super) fn constant(&self, out: &mut Out, id: ConstId) {
         let item = self.schema.constant(id);
+        let name = &self.const_names[id.0];
         let (ty, value) = match (&item.ty, &item.value) {
             (_, ConstValue::Int(value)) => (self.schema.kind_name(&item.ty), value.to_string()),
             (TypeKind::F32, ConstValue::Float(value)) => {
@@ -14,11 +15,21 @@ impl Generator<'_> {
             (_, ConstValue::Float(value)) => ("f64".into(), format!("{value:?}")),
             (_, ConstValue::Bool(value)) => ("bool".into(), value.to_string()),
             (_, ConstValue::String(value)) => ("&str".into(), string_literal(value)),
+            (_, ConstValue::Duration(micros)) => (
+                DURATION.into(),
+                format!("{DURATION}::from_micros({micros})"),
+            ),
+            // `SystemTime` has no `const` constructor, so a timestamp is a
+            // `static` computed on first use.
+            (_, ConstValue::Timestamp(micros)) => {
+                out.line(format!(
+                    "pub static {name}: ::std::sync::LazyLock<{SYSTEM_TIME}> = \
+                     ::std::sync::LazyLock::new(|| ::std::time::UNIX_EPOCH + {DURATION}::from_micros({micros}));"
+                ));
+                return;
+            }
         };
-        out.line(format!(
-            "pub const {}: {ty} = {value};",
-            self.const_names[id.0]
-        ));
+        out.line(format!("pub const {name}: {ty} = {value};"));
     }
 
     pub(super) fn enumeration(&self, out: &mut Out, id: TypeId, item: &crate::ir::Enum) {

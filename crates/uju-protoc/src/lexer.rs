@@ -2,6 +2,8 @@ use std::fmt;
 
 use logos::Logos;
 
+use crate::parser::ast::DurationUnit;
+
 pub type Span = logos::Span;
 pub type Spanned<T> = (T, Span);
 
@@ -72,8 +74,32 @@ pub enum Token<'src> {
     Ident(&'src str),
 
     #[regex(r"-?[0-9]+", int)]
-    #[regex(r"-?[0-9]+(\.[0-9]+)?[A-Za-z_][0-9A-Za-z_]*", malformed_number)]
+    #[regex(
+        r"-?[0-9]+(\.[0-9]+)?[A-Za-z_][0-9A-Za-z_]*",
+        malformed_number,
+        priority = 3
+    )]
     Int(i128),
+
+    /// `30s`: an integer count and its unit, written without a space.
+    #[regex(r"-?[0-9]+(us|ms|s|m|h)", duration, priority = 4)]
+    Duration((i128, DurationUnit)),
+
+    /// `2026-11-07T12:00:00Z`, with an optional 3- or 6-digit fraction of a
+    /// second: microseconds since the Unix epoch.
+    #[regex(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{3}|\.[0-9]{6})?Z",
+        timestamp,
+        priority = 4
+    )]
+    // Anything else that starts like a date, so that it is reported once
+    // rather than as a run of numbers.
+    #[regex(
+        r"[0-9]+-[0-9]+-[0-9]+([A-Za-z][0-9A-Za-z:.+-]*)?",
+        malformed_timestamp,
+        priority = 3
+    )]
+    Timestamp(u64),
 
     #[regex(r"-?[0-9]+\.[0-9]+", float)]
     Float(f64),
@@ -94,6 +120,15 @@ pub enum LexError {
     MalformedNumber,
     UnterminatedString,
     InvalidEscape,
+    /// An integer followed by letters that are not a duration unit: `5d`.
+    UnknownDurationUnit,
+    /// More than one unit in a duration: `1h30m`.
+    CompoundDuration,
+    /// Starts like a date but is not `YYYY-MM-DDTHH:MM:SS[.fff[fff]]Z`.
+    MalformedTimestamp,
+    /// Well formed, but names a date or time that does not exist.
+    InvalidTimestamp,
+    TimestampBeforeEpoch,
 }
 
 /// Tokenize `src`, returning every token that could be read along with every
@@ -179,8 +214,147 @@ fn unterminated_string<'src>(_: &mut logos::Lexer<'src, Token<'src>>) -> Callbac
     Err(LexError::UnterminatedString)
 }
 
-fn malformed_number<'src>(_: &mut logos::Lexer<'src, Token<'src>>) -> Callback<i128> {
+/// Tell an integer with a bad unit, or with several, from other malformed
+/// numbers.
+fn malformed_number<'src>(lex: &mut logos::Lexer<'src, Token<'src>>) -> Callback<i128> {
+    let slice = lex.slice();
+    let rest = slice
+        .strip_prefix('-')
+        .unwrap_or(slice)
+        .trim_start_matches(|ch: char| ch.is_ascii_digit());
+    if rest.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return Err(LexError::UnknownDurationUnit);
+    }
+    // `1h30m`: units with counts between them.
+    let mut units = rest
+        .split(|ch: char| ch.is_ascii_digit())
+        .filter(|unit| !unit.is_empty());
+    let ends_in_unit = rest.ends_with(|ch: char| ch.is_ascii_alphabetic());
+    if ends_in_unit && units.all(|unit| DurationUnit::from_suffix(unit).is_some()) {
+        return Err(LexError::CompoundDuration);
+    }
     Err(LexError::MalformedNumber)
+}
+
+fn duration<'src>(lex: &mut logos::Lexer<'src, Token<'src>>) -> Callback<(i128, DurationUnit)> {
+    let slice = lex.slice();
+    let split = slice
+        .trim_end_matches(|ch: char| ch.is_ascii_alphabetic())
+        .len();
+    let unit = DurationUnit::from_suffix(&slice[split..]).expect("the regex admits only units");
+    let count = slice[..split].parse().map_err(|_| LexError::IntOverflow)?;
+    Ok((count, unit))
+}
+
+/// Validate a timestamp's date and time and convert it to microseconds since
+/// the Unix epoch.
+fn timestamp<'src>(lex: &mut logos::Lexer<'src, Token<'src>>) -> Callback<u64> {
+    let slice = lex.slice();
+    // The regex fixes every field's position and digit count.
+    let field = |range: std::ops::Range<usize>| -> u64 {
+        slice[range].parse().expect("the regex admits only digits")
+    };
+    let (year, month, day) = (field(0..4), field(5..7), field(8..10));
+    let (hour, minute, second) = (field(11..13), field(14..16), field(17..19));
+    let fraction = match &slice[19..slice.len() - 1] {
+        "" => 0,
+        digits => {
+            let value: u64 = digits[1..].parse().expect("the regex admits only digits");
+            if digits.len() == 4 {
+                value * 1_000
+            } else {
+                value
+            }
+        }
+    };
+
+    let valid = (1..=12).contains(&month)
+        && (1..=days_in_month(year, month)).contains(&day)
+        && hour <= 23
+        && minute <= 59
+        && second <= 59;
+    if !valid {
+        return Err(LexError::InvalidTimestamp);
+    }
+    if year < 1970 {
+        return Err(LexError::TimestampBeforeEpoch);
+    }
+
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    Ok(seconds * 1_000_000 + fraction)
+}
+
+fn malformed_timestamp<'src>(_: &mut logos::Lexer<'src, Token<'src>>) -> Callback<u64> {
+    Err(LexError::MalformedTimestamp)
+}
+
+fn is_leap_year(year: u64) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+fn days_in_month(year: u64, month: u64) -> u64 {
+    match month {
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Days from 1970-01-01 to a date in the proleptic Gregorian calendar, on or
+/// after it.
+fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
+    // Count from 0000-03-01 so that the leap day ends each year.
+    let year = if month <= 2 { year - 1 } else { year };
+    let (era, year_of_era) = (year / 400, year % 400);
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// The date `days` after 1970-01-01, as `(year, month, day)`.
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let days = days + 719_468;
+    let (era, day_of_era) = (days / 146_097, days % 146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = era * 400 + year_of_era + u64::from(month <= 2);
+    (year, month, day)
+}
+
+/// Microseconds since the Unix epoch, printed as RFC 3339 in UTC: with no
+/// fraction when it is zero, else with 3 digits if they suffice, else 6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rfc3339(pub u64);
+
+impl fmt::Display for Rfc3339 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let micros = self.0 % 1_000_000;
+        let seconds = self.0 / 1_000_000;
+        let (year, month, day) = civil_from_days(seconds / 86_400);
+        let time = seconds % 86_400;
+        write!(
+            f,
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+            time / 3_600,
+            time / 60 % 60,
+            time % 60
+        )?;
+        match micros {
+            0 => {}
+            _ if micros.is_multiple_of(1_000) => write!(f, ".{:03}", micros / 1_000)?,
+            _ => write!(f, ".{micros:06}")?,
+        }
+        f.write_str("Z")
+    }
 }
 
 /// Consume a `/* */` comment, which may nest, after its opening delimiter.
@@ -237,6 +411,8 @@ impl fmt::Display for Token<'_> {
             Token::Int(x) => write!(f, "{x}"),
             Token::Float(x) => write!(f, "{x}"),
             Token::Str(x) => write!(f, "{x:?}"),
+            Token::Duration((count, unit)) => write!(f, "{count}{unit}"),
+            Token::Timestamp(micros) => write!(f, "{}", Rfc3339(*micros)),
         }
     }
 }
@@ -251,6 +427,22 @@ impl fmt::Display for LexError {
             LexError::MalformedNumber => f.write_str("malformed number literal"),
             LexError::UnterminatedString => f.write_str("unterminated string literal"),
             LexError::InvalidEscape => f.write_str("invalid escape in string literal"),
+            LexError::UnknownDurationUnit => {
+                f.write_str("unknown duration unit; use `us`, `ms`, `s`, `m` or `h`")
+            }
+            LexError::CompoundDuration => {
+                f.write_str("a duration literal takes a single unit, such as `90m`")
+            }
+            LexError::MalformedTimestamp => f.write_str(
+                "malformed timestamp literal; expected `YYYY-MM-DDTHH:MM:SSZ`, \
+                 optionally with 3 or 6 digits of fraction before the `Z`",
+            ),
+            LexError::InvalidTimestamp => {
+                f.write_str("timestamp literal names a date or time that does not exist")
+            }
+            LexError::TimestampBeforeEpoch => {
+                f.write_str("timestamp literal is before `1970-01-01T00:00:00Z`")
+            }
         }
     }
 }
@@ -563,7 +755,9 @@ mod tests {
 
     #[test]
     fn unsupported_number_forms_are_reported() {
-        for src in ["0x1f", "0b1010", "1_000", "1e5", "1.5e3", "-7z", "4d"] {
+        for src in [
+            "0x1f", "0b1010", "1_000", "1e5", "1.5e3", "1.5s", "-0.5ms", "1h30",
+        ] {
             assert_eq!(
                 errors(src),
                 [(LexError::MalformedNumber, 0..src.len())],
@@ -581,6 +775,167 @@ mod tests {
                 Token::Float(-0.25),
             ]
         );
+    }
+
+    #[test]
+    fn duration_literals_take_every_unit() {
+        assert_eq!(
+            tokens("250us 1000ms 30s 5m 2h 0s -1s 007ms"),
+            [
+                Token::Duration((250, DurationUnit::Us)),
+                Token::Duration((1000, DurationUnit::Ms)),
+                Token::Duration((30, DurationUnit::S)),
+                Token::Duration((5, DurationUnit::M)),
+                Token::Duration((2, DurationUnit::H)),
+                Token::Duration((0, DurationUnit::S)),
+                Token::Duration((-1, DurationUnit::S)),
+                Token::Duration((7, DurationUnit::Ms)),
+            ]
+        );
+        assert_eq!(
+            tokens("1000"),
+            [Token::Int(1000)],
+            "a bare integer stays one"
+        );
+        assert_eq!(
+            tokens("30s)"),
+            [Token::Duration((30, DurationUnit::S)), Token::ParenClose]
+        );
+        assert_eq!(
+            tokens("30 s"),
+            [Token::Int(30), Token::Ident("s")],
+            "the unit is attached"
+        );
+        let (spanned, _) = lex("x 1000ms");
+        assert_eq!(spanned[1].1, 2..8);
+        assert_eq!(spanned[1].0.to_string(), "1000ms");
+    }
+
+    #[test]
+    fn bad_duration_literals_are_reported() {
+        for src in ["5d", "10ns", "3sec", "30S", "-7z", "4d"] {
+            assert_eq!(
+                errors(src),
+                [(LexError::UnknownDurationUnit, 0..src.len())],
+                "{src}"
+            );
+        }
+        for src in ["1h30m", "1m30s", "1s500ms"] {
+            assert_eq!(
+                errors(src),
+                [(LexError::CompoundDuration, 0..src.len())],
+                "{src}"
+            );
+        }
+        assert_eq!(errors("1.5s"), [(LexError::MalformedNumber, 0..4)]);
+        assert_eq!(
+            errors("340282366920938463463374607431768211456s"),
+            [(LexError::IntOverflow, 0..40)]
+        );
+    }
+
+    #[test]
+    fn timestamp_literals_count_microseconds_since_the_epoch() {
+        assert_eq!(
+            tokens(concat!(
+                "1970-01-01T00:00:00Z ",
+                "2026-11-07T12:00:00Z ",
+                "2026-11-07T12:00:00.250Z ",
+                "2026-11-07T12:00:00.250125Z ",
+                "2024-02-29T00:00:00Z ",
+                "2000-02-29T23:59:59Z ",
+                "9999-12-31T23:59:59.999999Z",
+            )),
+            [
+                Token::Timestamp(0),
+                Token::Timestamp(1_794_052_800_000_000),
+                Token::Timestamp(1_794_052_800_250_000),
+                Token::Timestamp(1_794_052_800_250_125),
+                Token::Timestamp(1_709_164_800_000_000),
+                Token::Timestamp(951_868_799_000_000),
+                Token::Timestamp(253_402_300_799_999_999),
+            ]
+        );
+        let (spanned, _) = lex("x 2026-11-07T12:00:00.250Z)");
+        assert_eq!(spanned[1].1, 2..26);
+        assert_eq!(spanned[2].0, Token::ParenClose);
+    }
+
+    #[test]
+    fn timestamps_print_canonically() {
+        for (src, printed) in [
+            ("1970-01-01T00:00:00Z", "1970-01-01T00:00:00Z"),
+            ("2026-11-07T12:00:00.000Z", "2026-11-07T12:00:00Z"),
+            ("2026-11-07T12:00:00.000000Z", "2026-11-07T12:00:00Z"),
+            ("2026-11-07T12:00:00.250000Z", "2026-11-07T12:00:00.250Z"),
+            ("2026-11-07T12:00:00.250Z", "2026-11-07T12:00:00.250Z"),
+            ("2026-11-07T12:00:00.000125Z", "2026-11-07T12:00:00.000125Z"),
+            ("2024-02-29T23:59:59Z", "2024-02-29T23:59:59Z"),
+            ("2100-03-01T00:00:00Z", "2100-03-01T00:00:00Z"),
+            ("9999-12-31T23:59:59.999999Z", "9999-12-31T23:59:59.999999Z"),
+        ] {
+            assert_eq!(tokens(src)[0].to_string(), printed, "{src}");
+        }
+        // Every day of a leap and a common year round-trips.
+        for day in 0..(366 + 365) {
+            let days = 19_723 + day; // 2024-01-01.
+            let printed = Rfc3339(days * 86_400_000_000).to_string();
+            assert_eq!(tokens(&printed), [Token::Timestamp(days * 86_400_000_000)]);
+        }
+    }
+
+    #[test]
+    fn impossible_timestamps_are_reported() {
+        for src in [
+            "2023-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-00-01T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-01-00T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T23:60:00Z",
+            "2026-01-01T23:59:60Z",
+        ] {
+            assert_eq!(
+                errors(src),
+                [(LexError::InvalidTimestamp, 0..src.len())],
+                "{src}"
+            );
+        }
+        for src in ["1969-12-31T23:59:59Z", "0000-01-01T00:00:00Z"] {
+            assert_eq!(
+                errors(src),
+                [(LexError::TimestampBeforeEpoch, 0..src.len())],
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_timestamps_are_reported_once() {
+        for src in [
+            "2026-11-07",
+            "2026-1-07T12:00:00Z",
+            "26-11-07T12:00:00Z",
+            "2026-11-07T12:00Z",
+            "2026-11-07T12:00:00",
+            "2026-11-07t12:00:00z",
+            "2026-11-07T12:00:00+02:00",
+            "2026-11-07T12:00:00-02:00",
+            "2026-11-07T12:00:00.2Z",
+            "2026-11-07T12:00:00.25Z",
+            "2026-11-07T12:00:00.2501Z",
+            "2026-11-07T12:00:00.25012Z",
+            "2026-11-07T12:00:00.2501250Z",
+            "2026-11-07T12:00:00ZZ",
+        ] {
+            assert_eq!(
+                errors(src),
+                [(LexError::MalformedTimestamp, 0..src.len())],
+                "{src}"
+            );
+        }
     }
 
     #[test]

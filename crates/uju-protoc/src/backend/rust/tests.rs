@@ -273,6 +273,28 @@ fn consts_are_shouty_beside_their_scope() {
 }
 
 #[test]
+fn time_consts_are_std_times() {
+    let contents = generated(
+        &["namespace a\n\
+           const RespawnDelay: duration = 30s\n\
+           const Zero: duration = 0s\n\
+           const SeasonStart: timestamp = 2026-11-07T12:00:00Z\n"],
+        None,
+    );
+    for line in [
+        "pub const RESPAWN_DELAY: ::std::time::Duration = \
+         ::std::time::Duration::from_micros(30000000);",
+        "pub const ZERO: ::std::time::Duration = ::std::time::Duration::from_micros(0);",
+        // `SystemTime` has no `const` constructor.
+        "pub static SEASON_START: ::std::sync::LazyLock<::std::time::SystemTime> = \
+         ::std::sync::LazyLock::new(|| ::std::time::UNIX_EPOCH + \
+         ::std::time::Duration::from_micros(1794052800000000));",
+    ] {
+        assert!(contents.contains(line), "no `{line}` in\n{contents}");
+    }
+}
+
+#[test]
 fn colliding_consts_are_reported() {
     let schema = compile(&["namespace a\nconst MaxHp: u8 = 1\nconst MAXHp: u8 = 2\n"])
         .unwrap()

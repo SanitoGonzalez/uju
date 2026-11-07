@@ -350,7 +350,12 @@ constraints, and messages with their direction. A union is listed as
 `union a.U { A { x: u8, }, B(u8), C, }`, and a `type` as
 `type a.Level = u8[max=100]`. Consts follow, sorted the same way, with
 their type and value. They never go on the wire, but peers must agree on
-them too.
+them too. A `duration` const is spelled in the largest unit that divides it
+exactly, as `const a.D: duration = 1s` for `1000ms`, and a `timestamp`
+const as RFC 3339 in UTC with no fraction when it is zero, else 3 digits
+when whole milliseconds and 6 otherwise, as
+`const a.T: timestamp = 2026-11-07T12:00:00Z`. So every spelling of a value
+hashes the same.
 
 Renaming anything, reordering fields or variants, or changing a constraint
 or a const changes the fingerprint. The order in which sources are compiled does not. FNV-1a is not
