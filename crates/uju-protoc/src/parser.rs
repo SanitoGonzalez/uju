@@ -833,15 +833,7 @@ mod tests {
             (
                 vec!["client".into(), "sim".into()],
                 false,
-                vec!["hub<GuildBank>".into()]
-            )
-        );
-        assert_eq!(
-            endpoints("GuildNotice"),
-            (
-                vec!["hub<Guild>".into(), "hub<GuildBank>".into()],
-                false,
-                vec!["client".into()]
+                vec!["hub<Guild>".into()]
             )
         );
         assert_eq!(

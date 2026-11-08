@@ -228,14 +228,7 @@ mod tests {
         assert_eq!(links("Status"), ["sim -> client", "hub -> client"]);
         assert_eq!(
             links("Deposit"),
-            [
-                "client -> hub<foo.bar.GuildBank>",
-                "sim -> hub<foo.bar.GuildBank>"
-            ]
-        );
-        assert_eq!(
-            links("GuildNotice"),
-            ["hub<foo.bar.Guild | foo.bar.GuildBank> -> client"]
+            ["client -> hub<foo.bar.Guild>", "sim -> hub<foo.bar.Guild>"]
         );
         // Resolved through `use foo.bar`.
         assert_eq!(links("GuildExp"), ["sim -> hub<foo.bar.Guild>"]);

@@ -163,16 +163,13 @@ fn a_role_decodes_what_it_receives_and_encodes_what_it_sends() {
 fn hub_kinds_are_generated_for_hubs_and_sims_only() {
     for role in [Role::Hub, Role::Sim] {
         let contents = generated(&[EXAMPLE1, EXAMPLE2], Some(role));
-        assert!(
-            contents.contains("impl __w::Encode for GuildBank "),
-            "{role}"
-        );
-        assert!(contents.contains("pub struct GuildBankView"), "{role}");
-        assert!(contents.contains("impl __w::HubKind for self::foo::bar::GuildBank {"));
+        assert!(contents.contains("impl __w::Encode for Guild "), "{role}");
+        assert!(contents.contains("pub struct GuildView"), "{role}");
+        assert!(contents.contains("impl __w::HubKind for self::foo::bar::Guild {"));
     }
     for role in [Role::Client, Role::Entry, Role::Edge] {
         let contents = generated(&[EXAMPLE1, EXAMPLE2], Some(role));
-        assert!(!contents.contains("GuildBank {"), "{role}");
+        assert!(!contents.contains("struct Guild {"), "{role}");
         assert!(!contents.contains("HubKind"), "{role}");
     }
     // A sender names the object by the kind's key.
@@ -842,7 +839,6 @@ fn hub_kinds_are_structs_with_a_kind_in_the_root() {
         "impl __w::Encode for Guild {",
         "pub struct GuildView<'a>",
         "pub mod guild {",
-        "pub struct GuildBank {",
     ] {
         assert!(namespace.contains(line), "no `{line}` in\n{namespace}");
     }
@@ -858,8 +854,6 @@ fn hub_kinds_are_structs_with_a_kind_in_the_root() {
         ),
         "{root}"
     );
-    assert!(root.contains("impl __w::HubKind for self::foo::bar::GuildBank {"));
-    assert!(root.contains("const ID: u16 = 2;"));
     assert!(
         files[1..]
             .iter()

@@ -403,9 +403,6 @@ type GuildId = u64
 hub(GuildId) Guild {
     name: string[max_length=24],
     level: u8,
-}
-
-hub(GuildId) GuildBank {
     gold: u64,
 }
 ```
@@ -417,8 +414,7 @@ hub(GuildId) GuildBank {
   type nested in the kind.
 - The body takes what a struct's body takes, nested declarations and
   consts included. It is the object's state, the unit a hub stores, locks
-  and caches. State to lock or cache apart goes in a kind of its own under
-  the same key, as `GuildBank` beside `Guild`.
+  and caches. An object is one kind: a guild's bank is a field of `Guild`.
 - A hub kind goes only at the top level of a namespace. One nested in a
   struct, a message or another kind is an error.
 - Each kind has a `u16` id, dense from `1` over every kind, ordered by

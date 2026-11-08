@@ -120,9 +120,6 @@ hub(GuildId) Guild {
     name: string[max_length=24],
     level: Level,
     ranks: map<PartyId, Rank>,
-}
-
-hub(GuildId) GuildBank {
     gold: u64,
 }
 
@@ -211,14 +208,9 @@ message(hub<Guild> -> client) GuildState {
     guild: GuildInfo,
 }
 
-// `hub<Kind>` names the kind a message goes to. As a sender, bare `hub`
-// is any kind, and `hub<A> | hub<B>` only those.
-message(client | sim -> hub<GuildBank>) Deposit {
+// `hub<Kind>` names the kind a message goes to.
+message(client | sim -> hub<Guild>) Deposit {
     amount: u64[min=1],
-}
-
-message(hub<Guild> | hub<GuildBank> -> client) GuildNotice {
-    text: string[max_length=64],
 }
 
 message(client -> sim) MyRequest {
