@@ -11,6 +11,9 @@
 // union: one of several variants, each with fields, a value, or nothing
 // hub: a hub kind, keyed, with a struct's body
 // message: between roles, as `(client -> sim)`, `(sim <-> sim)`, or `(client -> hub<Kind>)`
+// audience: a keyed set of clients a component can be visible to
+// component: an ECS component, with `@replicate`, `@visibility`, and `@halo`
+// tag: a component with no value
 //
 // `uentity` and `uuid` are left out until the Rust backend supports them.
 
@@ -128,6 +131,60 @@ struct GuildInfo {
     name: string[max_length=24],
     level: Level,
 }
+
+// An audience splits who sees a component by a key, fixed-size and with no
+// float, as a hub key.
+type FactionId = u32
+
+audience Faction: FactionId
+audience Stealth: u8
+
+// A component replaces its whole value on change by default, is seen by
+// every client nearby, and reaches neighbor shards.
+component Health {
+    hp: u32,
+    max_hp: u32,
+}
+
+// `patch` sends the fields that changed, and `owner` only the controlling
+// client sees it.
+@replicate(patch)
+@visibility(owner)
+component Stats {
+    strength: u8,
+    level: Level,
+    title: option<string[max_length=16]>,
+    buffs: vec<u16>[max_length=8],
+}
+
+// `ops` sends operations of a union, applied by the receiver.
+@replicate(ops(PartyOp))
+@visibility(Faction)
+component Roster {
+    members: vec<Member>[max_length=8],
+}
+
+// No client sees it, so it reaches neighbor shards only when asked.
+@visibility(none)
+@halo(true)
+component Brain {
+    struct Goal {
+        target: entity,
+        until: timestamp,
+    }
+
+    goal: option<Goal>,
+}
+
+// A tag has no value: only its addition and removal travel.
+tag Dead
+
+@visibility(Stealth)
+tag Hidden
+
+@visibility(none)
+@halo(false)
+tag Thinking
 
 // A message names its endpoints: the roles sending it, an arrow, and the
 // roles receiving it. `<->` goes both ways, and `|` lists roles.

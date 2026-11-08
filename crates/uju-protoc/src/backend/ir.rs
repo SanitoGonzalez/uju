@@ -88,7 +88,12 @@ fn namespace(schema: &ir::Schema, wire: &Wire, id: NamespaceId, name: &str) -> S
     json.key("defs");
     json.begin('[');
     for (index, def) in schema.defs.iter().enumerate() {
-        if def.namespace == id {
+        // Step 4 of the components plan writes these.
+        let later = matches!(
+            def.kind,
+            DefKind::Audience(_) | DefKind::Component(_) | DefKind::Tag(_)
+        );
+        if def.namespace == id && !later {
             json.item();
             def_json(&mut json, schema, wire, TypeId(index));
         }
@@ -212,6 +217,9 @@ fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
             json.entry("kind", "type");
             json.key("target");
             type_json(json, schema, wire, &item.target);
+        }
+        DefKind::Audience(_) | DefKind::Component(_) | DefKind::Tag(_) => {
+            unreachable!("not written yet")
         }
     }
 

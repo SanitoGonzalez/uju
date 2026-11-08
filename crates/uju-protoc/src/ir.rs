@@ -52,6 +52,70 @@ pub enum DefKind {
     Union(Union),
     Type(TypeDef),
     Hub(Hub),
+    Audience(Audience),
+    Component(Component),
+    Tag(Tag),
+}
+
+/// `audience Name: Key`: a set of clients a component can be visible to.
+/// An entity holds at most one key of it, and an observer a set of keys.
+/// Not a type: only `@visibility` names it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Audience {
+    /// Fixed-size and free of floats, as a map key.
+    pub key: Type,
+}
+
+/// An ECS component. Laid out and validated as a struct is, but not a
+/// type: nothing names it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Component {
+    /// Never empty: a component without fields is a [`Tag`].
+    pub fields: Vec<Field>,
+    pub replicate: Replicate,
+    pub visibility: Visibility,
+    /// Whether neighbor sim shards replicating the cell receive it.
+    pub halo: bool,
+}
+
+/// A component without a value: only its addition and removal travel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tag {
+    pub visibility: Visibility,
+    /// Whether neighbor sim shards replicating the cell receive it.
+    pub halo: bool,
+}
+
+/// What a component's delta sends when it changes, from `@replicate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replicate {
+    /// The whole value. The default.
+    Replace,
+    /// The top-level fields marked dirty.
+    Patch,
+    /// Operations of this union, which the receiver applies.
+    Ops(TypeId),
+}
+
+/// Which clients receive a component or tag, from `@visibility`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    /// Every client whose view covers the entity's cell. The default.
+    Public,
+    /// Only the client controlling the entity.
+    Owner,
+    /// No client.
+    None,
+    /// The clients whose observer set for this audience holds the entity's
+    /// key.
+    Audience(TypeId),
+}
+
+impl Visibility {
+    /// Whether some client receives it.
+    pub fn reaches_clients(self) -> bool {
+        self != Visibility::None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,7 +452,12 @@ impl Schema {
             TypeKind::Array(item, _) => self.is_fixed_in(item, visiting),
             TypeKind::Named(id) => match &self.def(*id).kind {
                 DefKind::Enum(_) => true,
-                DefKind::Message(_) | DefKind::Union(_) => false,
+                // Audiences and tags are never named by a type; lowering
+                // reports it.
+                DefKind::Message(_)
+                | DefKind::Union(_)
+                | DefKind::Audience(_)
+                | DefKind::Tag(_) => false,
                 DefKind::Type(item) => {
                     if visiting.contains(id) {
                         return true;
@@ -398,7 +467,9 @@ impl Schema {
                     visiting.pop();
                     fixed
                 }
-                DefKind::Struct(Struct { fields }) | DefKind::Hub(Hub { fields, .. }) => {
+                DefKind::Struct(Struct { fields })
+                | DefKind::Hub(Hub { fields, .. })
+                | DefKind::Component(Component { fields, .. }) => {
                     if visiting.contains(id) {
                         return true;
                     }

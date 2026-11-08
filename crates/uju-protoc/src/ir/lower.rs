@@ -121,7 +121,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
     }
 
     fn lower_def(&mut self, id: TypeId, site: &TypeSite<'a, 'src>) -> Def {
-        self.check_attrs(site.source, site.item.attrs());
+        self.check_attrs(site.source, site.item.attrs(), site.item.keyword());
         let kind = match site.item {
             ast::Item::Enum(item) => DefKind::Enum(self.lower_enum(site.source, item)),
             ast::Item::Struct(item) => DefKind::Struct(self.lower_struct(site.source, id, item)),
@@ -130,6 +130,13 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             ast::Item::Type(item) => DefKind::Type(self.lower_type_def(site.source, id, item)),
             ast::Item::Hub(item) => DefKind::Hub(self.lower_hub(site.source, id, item)),
             ast::Item::Const(_) => unreachable!("consts are not type sites"),
+            ast::Item::Audience(item) => {
+                DefKind::Audience(self.lower_audience(site.source, id, item))
+            }
+            ast::Item::Component(item) => {
+                DefKind::Component(self.lower_component(site.source, id, item))
+            }
+            ast::Item::Tag(item) => DefKind::Tag(self.lower_tag(site.source, id, item)),
         };
         Def {
             namespace: site.namespace,
@@ -139,9 +146,10 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         }
     }
 
-    /// Check a declaration's attributes, each given once. No attribute is
-    /// defined yet, so every one is unknown.
-    fn check_attrs(&mut self, source: SourceId, attrs: &[ast::Attribute<'src>]) {
+    /// Check a declaration's attributes: each given once, known, and on a
+    /// declaration it applies to. Their arguments are checked where the
+    /// declaration is lowered.
+    fn check_attrs(&mut self, source: SourceId, attrs: &[ast::Attribute<'src>], keyword: &str) {
         let mut seen = HashSet::new();
         for attr in attrs {
             let (name, span) = &attr.name;
@@ -149,7 +157,187 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                 self.error(source, span, format!("duplicate attribute `{name}`"));
                 continue;
             }
-            self.error(source, span, format!("unknown attribute `{name}`"));
+            let message = match (*name, keyword) {
+                ("replicate", "component") | ("visibility" | "halo", "component" | "tag") => {
+                    continue;
+                }
+                ("replicate", "tag") => {
+                    "a tag has no value to replicate; `@replicate` goes only on a component"
+                        .to_string()
+                }
+                ("replicate", _) => "`@replicate` goes only on a component".to_string(),
+                ("visibility" | "halo", _) => {
+                    format!("`@{name}` goes only on a component or a tag")
+                }
+                _ => format!("unknown attribute `{name}`"),
+            };
+            self.error(source, span, message);
+        }
+    }
+
+    /// The first attribute named `name`; later ones are reported as
+    /// duplicates.
+    fn attr<'i>(attrs: &'i [ast::Attribute<'src>], name: &str) -> Option<&'i ast::Attribute<'src>> {
+        attrs.iter().find(|attr| attr.name.0 == name)
+    }
+
+    /// The single argument of `attr`, reporting any other count.
+    fn single_arg<'i>(
+        &mut self,
+        source: SourceId,
+        attr: &'i ast::Attribute<'src>,
+        expected: &str,
+    ) -> Option<&'i ast::AttributeArg<'src>> {
+        match &attr.args[..] {
+            [arg] => Some(arg),
+            [] => {
+                self.error(
+                    source,
+                    &attr.span,
+                    format!("`@{}` takes one argument: {expected}", attr.name.0),
+                );
+                None
+            }
+            [_, extra, ..] => {
+                self.error(
+                    source,
+                    extra.span(),
+                    format!("`@{}` takes one argument: {expected}", attr.name.0),
+                );
+                None
+            }
+        }
+    }
+
+    /// `@replicate(replace | patch | ops(Union))`, `replace` when absent.
+    /// The union resolves where the component is declared.
+    fn lower_replicate(
+        &mut self,
+        source: SourceId,
+        scope: Option<TypeId>,
+        attrs: &[ast::Attribute<'src>],
+    ) -> Replicate {
+        const EXPECTED: &str = "`replace`, `patch` or `ops(Union)`";
+        let Some(attr) = Self::attr(attrs, "replicate") else {
+            return Replicate::Replace;
+        };
+        let Some(arg) = self.single_arg(source, attr, EXPECTED) else {
+            return Replicate::Replace;
+        };
+        match arg {
+            ast::AttributeArg::Path(path) if is_word(path, "replace") => Replicate::Replace,
+            ast::AttributeArg::Path(path) if is_word(path, "patch") => Replicate::Patch,
+            ast::AttributeArg::Call { path, args, span } if is_word(path, "ops") => {
+                let [ast::AttributeArg::Path(op)] = &args[..] else {
+                    self.error(source, span, "`ops` takes one argument: the op union");
+                    return Replicate::Replace;
+                };
+                match self.resolver.resolve(source, scope, op) {
+                    Ok(id) if matches!(self.resolver.types[id.0].item, ast::Item::Union(_)) => {
+                        Replicate::Ops(id)
+                    }
+                    Ok(_) => {
+                        self.error(
+                            source,
+                            &op.span,
+                            format!("`{op}` is not a union; the op type of `ops` must be a union"),
+                        );
+                        Replicate::Replace
+                    }
+                    Err(diagnostic) => {
+                        self.diagnostics.push(diagnostic);
+                        Replicate::Replace
+                    }
+                }
+            }
+            _ => {
+                self.error(
+                    source,
+                    arg.span(),
+                    format!("`{arg}` is not a replication mode; expected {EXPECTED}"),
+                );
+                Replicate::Replace
+            }
+        }
+    }
+
+    /// `@visibility(public | owner | none | Audience)`, `public` when absent.
+    /// The audience resolves where the component or tag is declared.
+    fn lower_visibility(
+        &mut self,
+        source: SourceId,
+        scope: Option<TypeId>,
+        attrs: &[ast::Attribute<'src>],
+    ) -> Visibility {
+        const EXPECTED: &str = "`public`, `owner`, `none` or an audience";
+        let Some(attr) = Self::attr(attrs, "visibility") else {
+            return Visibility::Public;
+        };
+        let Some(arg) = self.single_arg(source, attr, EXPECTED) else {
+            return Visibility::Public;
+        };
+        let ast::AttributeArg::Path(path) = arg else {
+            self.error(
+                source,
+                arg.span(),
+                format!("`{arg}` is not a visibility; expected {EXPECTED}"),
+            );
+            return Visibility::Public;
+        };
+        if is_word(path, "public") {
+            return Visibility::Public;
+        }
+        if is_word(path, "owner") {
+            return Visibility::Owner;
+        }
+        if is_word(path, "none") {
+            return Visibility::None;
+        }
+        match self.resolver.resolve(source, scope, path) {
+            Ok(id) if matches!(self.resolver.types[id.0].item, ast::Item::Audience(_)) => {
+                Visibility::Audience(id)
+            }
+            Ok(_) => {
+                self.error(
+                    source,
+                    &path.span,
+                    format!("`{path}` is not an audience; expected {EXPECTED}"),
+                );
+                Visibility::Public
+            }
+            Err(diagnostic) => {
+                self.diagnostics.push(diagnostic);
+                Visibility::Public
+            }
+        }
+    }
+
+    /// `@halo(true | false)`; when absent, `true` unless no client sees
+    /// the component, as a missing halo only fails once cells land on
+    /// different shards.
+    fn lower_halo(
+        &mut self,
+        source: SourceId,
+        attrs: &[ast::Attribute<'src>],
+        visibility: Visibility,
+    ) -> bool {
+        let default = visibility != Visibility::None;
+        let Some(attr) = Self::attr(attrs, "halo") else {
+            return default;
+        };
+        let Some(arg) = self.single_arg(source, attr, "`true` or `false`") else {
+            return default;
+        };
+        match arg {
+            ast::AttributeArg::Literal((ast::Literal::Bool(value), _)) => *value,
+            _ => {
+                self.error(
+                    source,
+                    arg.span(),
+                    format!("`{arg}` is not a bool; `@halo` takes `true` or `false`"),
+                );
+                default
+            }
         }
     }
 
@@ -159,7 +347,7 @@ impl<'a, 'src> Lowerer<'a, 'src> {
     fn lower_const(&mut self, site: &ConstSite<'a, 'src>) -> Const {
         let source = site.source;
         let item = site.item;
-        self.check_attrs(source, &item.attrs);
+        self.check_attrs(source, &item.attrs, "const");
         let lowered = |ty, value| Const {
             namespace: site.namespace,
             parent: site.parent,
@@ -445,6 +633,61 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             key,
             fields: self.lower_fields(source, id, &item.body.fields),
         }
+    }
+
+    /// An audience's key is resolved and checked as a hub kind's is.
+    fn lower_audience(
+        &mut self,
+        source: SourceId,
+        id: TypeId,
+        item: &ast::Audience<'src>,
+    ) -> Audience {
+        let written = match &item.key.kind {
+            ast::TypeKind::Option(inner) => {
+                self.error(source, &item.key.span, "an audience key cannot be optional");
+                &**inner
+            }
+            _ => &item.key,
+        };
+        let scope = self.resolver.types[id.0].parent;
+        let key = self.lower_type(source, scope, written);
+        self.check_key(source, scope, written, &key, "an audience key");
+        Audience { key }
+    }
+
+    /// Attribute paths resolve where the component is declared, as a hub
+    /// key does, and its fields inside it.
+    fn lower_component(
+        &mut self,
+        source: SourceId,
+        id: TypeId,
+        item: &ast::Component<'src>,
+    ) -> Component {
+        let name = item.name.0;
+        if item.body.fields.is_empty() {
+            self.error(
+                source,
+                &item.name.1,
+                format!("a component with no fields is a tag; write `tag {name}`"),
+            );
+        }
+        let scope = self.resolver.types[id.0].parent;
+        let replicate = self.lower_replicate(source, scope, &item.attrs);
+        let visibility = self.lower_visibility(source, scope, &item.attrs);
+        let halo = self.lower_halo(source, &item.attrs, visibility);
+        Component {
+            fields: self.lower_fields(source, id, &item.body.fields),
+            replicate,
+            visibility,
+            halo,
+        }
+    }
+
+    fn lower_tag(&mut self, source: SourceId, id: TypeId, item: &ast::Tag<'src>) -> Tag {
+        let scope = self.resolver.types[id.0].parent;
+        let visibility = self.lower_visibility(source, scope, &item.attrs);
+        let halo = self.lower_halo(source, &item.attrs, visibility);
+        Tag { visibility, halo }
     }
 
     fn lower_union(&mut self, source: SourceId, id: TypeId, item: &ast::Union<'src>) -> Union {
@@ -782,6 +1025,26 @@ impl<'a, 'src> Lowerer<'a, 'src> {
                             source,
                             &ty.span,
                             "a hub kind is not a type; declare a struct for what you send",
+                        );
+                        TypeKind::Bool
+                    }
+                    ast::Item::Component(_) => {
+                        self.error(
+                            source,
+                            &ty.span,
+                            "a component is not a type; declare a struct for what you send",
+                        );
+                        TypeKind::Bool
+                    }
+                    ast::Item::Tag(_) => {
+                        self.error(source, &ty.span, "a tag is not a type; it has no value");
+                        TypeKind::Bool
+                    }
+                    ast::Item::Audience(_) => {
+                        self.error(
+                            source,
+                            &ty.span,
+                            "an audience is not a type; name its key's type instead",
                         );
                         TypeKind::Bool
                     }
@@ -1138,11 +1401,13 @@ impl<'a, 'src> Lowerer<'a, 'src> {
             DefKind::Enum(_) => {}
             DefKind::Struct(Struct { fields })
             | DefKind::Message(Message { fields, .. })
-            | DefKind::Hub(Hub { fields, .. }) => {
+            | DefKind::Hub(Hub { fields, .. })
+            | DefKind::Component(Component { fields, .. }) => {
                 for field in fields {
                     refs(&field.ty, &mut targets);
                 }
             }
+            DefKind::Audience(_) | DefKind::Tag(_) => {}
             DefKind::Union(item) => {
                 for variant in &item.variants {
                     match &variant.data {
@@ -1178,6 +1443,12 @@ impl<'a, 'src> Lowerer<'a, 'src> {
         }
         marks[index] = Mark::Black;
     }
+}
+
+/// Whether `path` is the single word `word`, as `replace` in
+/// `@replicate(replace)`.
+fn is_word(path: &ast::Path<'_>, word: &str) -> bool {
+    matches!(&path.segments[..], [(segment, _)] if *segment == word)
 }
 
 /// The named types a value of `ty` refers to, directly or through a
@@ -1629,7 +1900,7 @@ mod tests {
     }
 
     #[test]
-    fn every_attribute_is_unknown_for_now() {
+    fn attributes_go_only_where_they_apply() {
         let src = concat!(
             "namespace a\n",
             "@visibility(Faction)\n",
@@ -1643,6 +1914,9 @@ mod tests {
             "@halo(false) type T = u8\n",
             "@cached hub(u64) H {}\n",
             "@timeout_ms(1000) const C: u8 = 1\n",
+            "@replicate(patch) tag D\n",
+            "@visibility(public) audience F: u8\n",
+            "@lock(x) component P { x: u8 }\n",
         );
         let errors = compile(&[src]).expect_err("expected errors");
         assert_eq!(
@@ -1651,12 +1925,25 @@ mod tests {
                 .map(|error| (&src[error.span.clone()], error.message.as_str()))
                 .collect::<Vec<_>>(),
             [
-                ("visibility", "unknown attribute `visibility`"),
-                ("replicate", "unknown attribute `replicate`"),
+                (
+                    "visibility",
+                    "`@visibility` goes only on a component or a tag"
+                ),
+                ("replicate", "`@replicate` goes only on a component"),
                 ("large", "unknown attribute `large`"),
                 ("lock", "unknown attribute `lock`"),
-                ("halo", "unknown attribute `halo`"),
+                ("halo", "`@halo` goes only on a component or a tag"),
                 ("cached", "unknown attribute `cached`"),
+                (
+                    "replicate",
+                    "a tag has no value to replicate; `@replicate` goes only on a component"
+                ),
+                (
+                    "visibility",
+                    "`@visibility` goes only on a component or a tag"
+                ),
+                ("lock", "unknown attribute `lock`"),
+                // Consts lower after every type.
                 ("timeout_ms", "unknown attribute `timeout_ms`"),
             ]
         );
@@ -2787,5 +3074,354 @@ mod tests {
             "union Inner { A(Id), B }\n",
             "union Outer { I(Inner), L { all: vec<Inner>, id: Id } }\n",
         )]);
+    }
+
+    fn component<'a>(schema: &'a Schema, name: &str) -> &'a Component {
+        let DefKind::Component(item) = &def(schema, name).1.kind else {
+            panic!("`{name}` is not a component");
+        };
+        item
+    }
+
+    fn tag<'a>(schema: &'a Schema, name: &str) -> &'a Tag {
+        let DefKind::Tag(item) = &def(schema, name).1.kind else {
+            panic!("`{name}` is not a tag");
+        };
+        item
+    }
+
+    #[test]
+    fn components_tags_and_audiences_lower_with_their_attributes() {
+        let schema = compiled(&[concat!(
+            "namespace a\n",
+            "type FactionId = u32\n",
+            "audience Faction: FactionId\n",
+            "audience Stealth: u8\n",
+            "union Op { Add(u8), Clear }\n",
+            "component Plain { x: u8 }\n",
+            "@replicate(replace) @visibility(public) @halo(true)\n",
+            "component Spelled { x: u8 }\n",
+            "@replicate(patch) @visibility(owner)\n",
+            "component Stats { hp: u32, mp: u32 }\n",
+            "@replicate(ops(Op)) @visibility(none)\n",
+            "component Inventory { items: vec<u8> }\n",
+            "@visibility(none) @halo(true)\n",
+            "component Shared { x: u8 }\n",
+            "@visibility(Faction) @halo(false)\n",
+            "component Chatter { x: u8 }\n",
+            "tag Dead\n",
+            "@visibility(a.Stealth)\n",
+            "tag Hidden\n",
+            "@visibility(none)\n",
+            "tag Marked\n",
+        )]);
+        let (op, _) = def(&schema, "Op");
+        let (faction, faction_def) = def(&schema, "Faction");
+        let (stealth, _) = def(&schema, "Stealth");
+        let DefKind::Audience(audience) = &faction_def.kind else {
+            panic!("expected an audience");
+        };
+        assert_eq!(schema.type_name(&audience.key), "a.FactionId");
+
+        let summary = |item: &Component| (item.replicate, item.visibility, item.halo);
+        let plain = component(&schema, "Plain");
+        assert_eq!(
+            summary(plain),
+            (Replicate::Replace, Visibility::Public, true)
+        );
+        assert_eq!(plain.fields.len(), 1);
+        assert_eq!(summary(component(&schema, "Spelled")), summary(plain));
+        assert_eq!(
+            summary(component(&schema, "Stats")),
+            (Replicate::Patch, Visibility::Owner, true)
+        );
+        // No client sees it, so neighbor shards don't get it either unless
+        // asked.
+        assert_eq!(
+            summary(component(&schema, "Inventory")),
+            (Replicate::Ops(op), Visibility::None, false)
+        );
+        assert_eq!(
+            summary(component(&schema, "Shared")),
+            (Replicate::Replace, Visibility::None, true)
+        );
+        assert_eq!(
+            summary(component(&schema, "Chatter")),
+            (Replicate::Replace, Visibility::Audience(faction), false)
+        );
+
+        let summary = |item: &Tag| (item.visibility, item.halo);
+        assert_eq!(summary(tag(&schema, "Dead")), (Visibility::Public, true));
+        assert_eq!(
+            summary(tag(&schema, "Hidden")),
+            (Visibility::Audience(stealth), true)
+        );
+        assert_eq!(summary(tag(&schema, "Marked")), (Visibility::None, false));
+    }
+
+    #[test]
+    fn component_attributes_are_validated() {
+        let prelude = concat!(
+            "namespace a\n",
+            "audience Faction: u8\n",
+            "union Op { A }\n",
+            "struct S {}\n",
+        );
+        let cases = [
+            (
+                "@replicate",
+                "@replicate",
+                "`@replicate` takes one argument: `replace`, `patch` or `ops(Union)`",
+            ),
+            (
+                "@replicate(patch, replace)",
+                "replace",
+                "`@replicate` takes one argument: `replace`, `patch` or `ops(Union)`",
+            ),
+            (
+                "@replicate(diff)",
+                "diff",
+                "`diff` is not a replication mode; expected `replace`, `patch` or `ops(Union)`",
+            ),
+            (
+                "@replicate(\"patch\")",
+                "\"patch\"",
+                "`\"patch\"` is not a replication mode; expected `replace`, `patch` or `ops(Union)`",
+            ),
+            (
+                "@replicate(a.patch)",
+                "a.patch",
+                "`a.patch` is not a replication mode; expected `replace`, `patch` or `ops(Union)`",
+            ),
+            (
+                "@replicate(patch(Op))",
+                "patch(Op)",
+                "`patch(Op)` is not a replication mode; expected `replace`, `patch` or `ops(Union)`",
+            ),
+            (
+                "@replicate(ops(Op, Op))",
+                "ops(Op, Op)",
+                "`ops` takes one argument: the op union",
+            ),
+            (
+                "@replicate(ops(1))",
+                "ops(1)",
+                "`ops` takes one argument: the op union",
+            ),
+            (
+                "@replicate(ops(S))",
+                "S",
+                "`S` is not a union; the op type of `ops` must be a union",
+            ),
+            (
+                "@replicate(ops(Faction))",
+                "Faction",
+                "`Faction` is not a union; the op type of `ops` must be a union",
+            ),
+            (
+                "@replicate(ops(Missing))",
+                "Missing",
+                "cannot find `Missing` in this scope",
+            ),
+            (
+                "@visibility(team)",
+                "team",
+                "cannot find `team` in this scope",
+            ),
+            (
+                "@visibility(S)",
+                "S",
+                "`S` is not an audience; expected `public`, `owner`, `none` or an audience",
+            ),
+            (
+                "@visibility(Op)",
+                "Op",
+                "`Op` is not an audience; expected `public`, `owner`, `none` or an audience",
+            ),
+            (
+                "@visibility(\"owner\")",
+                "\"owner\"",
+                "`\"owner\"` is not a visibility; expected `public`, `owner`, `none` or an audience",
+            ),
+            (
+                "@visibility(owner, none)",
+                "none",
+                "`@visibility` takes one argument: `public`, `owner`, `none` or an audience",
+            ),
+            (
+                "@halo",
+                "@halo",
+                "`@halo` takes one argument: `true` or `false`",
+            ),
+            (
+                "@halo(1)",
+                "1",
+                "`1` is not a bool; `@halo` takes `true` or `false`",
+            ),
+            (
+                "@halo(yes)",
+                "yes",
+                "`yes` is not a bool; `@halo` takes `true` or `false`",
+            ),
+        ];
+        for (attr, written, expected) in cases {
+            let src = format!("{prelude}{attr}\ncomponent C {{ x: u8 }}\n");
+            assert_eq!(
+                spanned(&src),
+                [(written.to_string(), expected.to_string())],
+                "{attr}"
+            );
+        }
+        // Tags check `@visibility` and `@halo` the same way.
+        assert_eq!(
+            spanned(&format!("{prelude}@visibility(S) @halo(0) tag T\n")),
+            [
+                (
+                    "S".to_string(),
+                    "`S` is not an audience; expected `public`, `owner`, `none` or an audience"
+                        .to_string()
+                ),
+                (
+                    "0".to_string(),
+                    "`0` is not a bool; `@halo` takes `true` or `false`".to_string()
+                ),
+            ]
+        );
+        // Attribute paths resolve where the component is declared, outside
+        // its body.
+        assert_eq!(
+            messages(&[
+                "namespace a\n@replicate(ops(Op))\ncomponent C { x: u8, union Op { A } }\n"
+            ]),
+            ["cannot find `Op` in this scope"]
+        );
+        // And across namespaces, through `use`.
+        compiled(&[
+            "namespace b\naudience Faction: u8\nunion Op { A }\n",
+            "namespace a\nuse b\n@replicate(ops(b.Op)) @visibility(b.Faction)\ncomponent C { x: u8 }\n",
+        ]);
+    }
+
+    #[test]
+    fn a_component_without_fields_is_a_tag() {
+        assert_eq!(
+            spanned("namespace a\ncomponent Dead {}\n"),
+            [(
+                "Dead".to_string(),
+                "a component with no fields is a tag; write `tag Dead`".to_string()
+            )]
+        );
+        assert_eq!(
+            messages(&["namespace a\ncomponent Dead { const X: u8 = 1 }\n"]),
+            ["a component with no fields is a tag; write `tag Dead`"]
+        );
+    }
+
+    #[test]
+    fn audience_keys_are_fixed_size_and_hold_no_float() {
+        compiled(&[concat!(
+            "namespace a\n",
+            "enum E: u8 { A }\n",
+            "type Id = u64\n",
+            "struct Pair { a: u32, b: E }\n",
+            "audience A: u8\n",
+            "audience B: E\n",
+            "audience C: Id\n",
+            "audience D: Pair\n",
+            "audience G: array<u8, 4>\n",
+        )]);
+        let prelude = "namespace a\nstruct Position { x: f32, y: f32 }\n";
+        let cases = [
+            (
+                "f32",
+                "`f32` holds a float; an audience key cannot hold a float",
+            ),
+            (
+                "Position",
+                "`Position` holds a float through field `x`; an audience key cannot hold a float",
+            ),
+            (
+                "string",
+                "`string` is variable-size; an audience key must be fixed-size",
+            ),
+            ("option<u64>", "an audience key cannot be optional"),
+            (
+                "array<u64, 9000>",
+                "`array<u64, 9000>` takes 72000 bytes; a message holds at most 65535",
+            ),
+        ];
+        for (key, expected) in cases {
+            let src = format!("{prelude}audience K: {key}\n");
+            assert_eq!(messages(&[&src]), [expected], "{key}");
+        }
+    }
+
+    #[test]
+    fn components_tags_and_audiences_are_not_types() {
+        let prelude = concat!(
+            "namespace a\n",
+            "component C { x: u8 }\n",
+            "tag T\n",
+            "audience A: u8\n",
+        );
+        let cases = [
+            (
+                "C",
+                "a component is not a type; declare a struct for what you send",
+            ),
+            ("T", "a tag is not a type; it has no value"),
+            (
+                "A",
+                "an audience is not a type; name its key's type instead",
+            ),
+        ];
+        for (name, error) in cases {
+            for decl in [
+                format!("struct S {{ x: {name} }}"),
+                format!("message(sim -> client) M {{ x: option<{name}> }}"),
+                format!("struct S {{ x: vec<a.{name}> }}"),
+                format!("struct S {{ x: map<u8, {name}> }}"),
+                format!("union U {{ X({name}) }}"),
+                format!("type X = {name}"),
+                format!("hub({name}) H {{}}"),
+                format!("audience K: {name}"),
+                format!("component K {{ x: {name} }}"),
+            ] {
+                let src = format!("{prelude}{decl}\n");
+                let written = if decl.contains("a.") {
+                    format!("a.{name}")
+                } else {
+                    name.to_string()
+                };
+                assert_eq!(spanned(&src), [(written, error.to_string())], "{decl}");
+            }
+        }
+        // A component can't name itself either.
+        assert_eq!(
+            messages(&["namespace a\ncomponent C { c: vec<C> }\n"]),
+            ["a component is not a type; declare a struct for what you send"]
+        );
+        // Nor are they hub kinds.
+        assert_eq!(
+            messages(&[&format!("{prelude}message(sim -> hub<C>) M {{}}\n")]),
+            ["`C` is not a hub kind"]
+        );
+    }
+
+    #[test]
+    fn component_fields_are_checked_as_a_struct_s() {
+        assert_eq!(
+            messages(&["namespace a\ncomponent C { x: u8, x: u8 }\n"]),
+            ["duplicate field `x`"]
+        );
+        assert_eq!(
+            messages(&["namespace a\ncomponent C { x: array<u64, 9000> }\n"]),
+            ["`array<u64, 9000>` takes 72000 bytes; a message holds at most 65535"]
+        );
+        // Recursion through a nested declaration is still recursion.
+        assert_eq!(
+            messages(&["namespace a\ncomponent C { s: S, struct S { s: vec<S> } }\n"]),
+            ["`S` refers to itself; recursive types are not allowed"]
+        );
     }
 }

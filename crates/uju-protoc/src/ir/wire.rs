@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::ir::{
-    ConstId, ConstValue, DefKind, Field, Link, Number, Role, Schema, Type, TypeId, TypeKind,
-    VariantData,
+    ConstId, ConstValue, DefKind, Field, Link, Number, Replicate, Role, Schema, Type, TypeId,
+    TypeKind, VariantData, Visibility,
 };
 
 /// The largest encoded message, in bytes. Every length, count, and offset
@@ -142,7 +142,7 @@ pub enum Sequence {
     Prefixed { count: Width, prefix: Width },
 }
 
-/// Layout of a struct, message, or hub kind.
+/// Layout of a struct, message, hub kind, or component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub size: Size,
@@ -212,7 +212,8 @@ pub struct Space {
 /// cannot talk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fingerprints {
-    /// What clients see: the messages with a client endpoint, what they
+    /// What clients see: the messages with a client endpoint, the
+    /// components and tags clients see, every audience, what they all
     /// reach, and every const.
     pub client: u64,
     /// Everything.
@@ -236,7 +237,8 @@ pub struct Error {
 pub struct Wire {
     /// Indexed by [`TypeId`].
     sizes: Vec<Size>,
-    /// Indexed by [`TypeId`]; `Some` for structs, messages, and hub kinds.
+    /// Indexed by [`TypeId`]; `Some` for structs, messages, hub kinds, and
+    /// components.
     layouts: Vec<Option<Layout>>,
     /// Indexed by [`TypeId`]; `Some` for unions.
     unions: Vec<Option<UnionLayout>>,
@@ -248,6 +250,16 @@ pub struct Wire {
     /// Indexed by [`TypeId`]; `Some` for hub kinds.
     hub_ids: Vec<Option<u16>>,
     hubs: Vec<TypeId>,
+    /// Indexed by [`TypeId`]; `Some` for components and tags.
+    component_ids: Vec<Option<u16>>,
+    /// Components and tags in id order from 1: those clients see, then
+    /// the rest.
+    components: Vec<TypeId>,
+    /// How many of `components` clients see.
+    client_components: usize,
+    /// Indexed by [`TypeId`]; `Some` for audiences.
+    audience_ids: Vec<Option<u16>>,
+    audiences: Vec<TypeId>,
     fingerprints: Fingerprints,
 }
 
@@ -325,6 +337,63 @@ impl Wire {
             }
         }
 
+        // Components and tags share one space. Those clients see come first,
+        // so their ids never shift when a server-only one changes, and the
+        // rest follow, so server links carry both without colliding.
+        let mut components: Vec<(bool, String, TypeId)> = schema
+            .defs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, def)| {
+                let visibility = match &def.kind {
+                    DefKind::Component(item) => item.visibility,
+                    DefKind::Tag(item) => item.visibility,
+                    _ => return None,
+                };
+                Some((
+                    !visibility.reaches_clients(),
+                    schema.qualified(TypeId(index)),
+                    TypeId(index),
+                ))
+            })
+            .collect();
+        components.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+        let client_components = components.iter().filter(|(server, ..)| !server).count();
+        let mut component_ids = vec![None; len];
+        for (index, (_, _, id)) in components.iter().enumerate() {
+            // From 1, as message ids.
+            component_ids[id.0] = u16::try_from(index + 1).ok();
+            if component_ids[id.0].is_none() {
+                builder.errors.push(Error {
+                    def: *id,
+                    variant: None,
+                    field: None,
+                    message: format!("more than {} components and tags", u16::MAX),
+                });
+            }
+        }
+
+        let mut audiences: Vec<(String, TypeId)> = schema
+            .defs
+            .iter()
+            .enumerate()
+            .filter(|(_, def)| matches!(def.kind, DefKind::Audience(_)))
+            .map(|(index, _)| (schema.qualified(TypeId(index)), TypeId(index)))
+            .collect();
+        audiences.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut audience_ids = vec![None; len];
+        for (index, (_, id)) in audiences.iter().enumerate() {
+            audience_ids[id.0] = u16::try_from(index + 1).ok();
+            if audience_ids[id.0].is_none() {
+                builder.errors.push(Error {
+                    def: *id,
+                    variant: None,
+                    field: None,
+                    message: format!("more than {} audiences", u16::MAX),
+                });
+            }
+        }
+
         if !builder.errors.is_empty() {
             return Err(builder.errors);
         }
@@ -339,6 +408,11 @@ impl Wire {
                 .collect(),
             hub_ids,
             hubs: hubs.into_iter().map(|(_, id)| id).collect(),
+            component_ids,
+            components: components.into_iter().map(|(_, _, id)| id).collect(),
+            client_components,
+            audience_ids,
+            audiences: audiences.into_iter().map(|(_, id)| id).collect(),
             fingerprints: Fingerprints {
                 client: fnv1a(canonical(schema, Scope::Client).as_bytes()),
                 internal: fnv1a(canonical(schema, Scope::Internal).as_bytes()),
@@ -355,15 +429,15 @@ impl Wire {
         sequence(ty, &mut |id| self.sizes[id.0]).map(|(sequence, _)| sequence)
     }
 
-    /// The layout of a struct, message, or hub kind.
+    /// The layout of a struct, message, hub kind, or component.
     ///
     /// # Panics
     ///
-    /// When `id` is not a struct, message, or hub kind.
+    /// When `id` is not a struct, message, hub kind, or component.
     pub fn layout(&self, id: TypeId) -> &Layout {
         self.layouts[id.0]
             .as_ref()
-            .expect("only structs, messages, and hub kinds have a layout")
+            .expect("only structs, messages, hub kinds, and components have a layout")
     }
 
     /// The layout of a union.
@@ -414,6 +488,34 @@ impl Wire {
     /// Every hub kind, in id order from 1.
     pub fn hubs(&self) -> &[TypeId] {
         &self.hubs
+    }
+
+    /// The id of component or tag `id`, `None` for any other declaration.
+    pub fn component_id(&self, id: TypeId) -> Option<u16> {
+        self.component_ids[id.0]
+    }
+
+    /// Every component and tag, in id order from 1: those clients see,
+    /// by qualified name, then those with `visibility=none`, by qualified
+    /// name.
+    pub fn components(&self) -> &[TypeId] {
+        &self.components
+    }
+
+    /// The components and tags clients see, which take ids
+    /// `1..=client_components().len()`.
+    pub fn client_components(&self) -> &[TypeId] {
+        &self.components[..self.client_components]
+    }
+
+    /// The id of audience `id`, `None` for any other declaration.
+    pub fn audience_id(&self, id: TypeId) -> Option<u16> {
+        self.audience_ids[id.0]
+    }
+
+    /// Every audience, in id order from 1.
+    pub fn audiences(&self) -> &[TypeId] {
+        &self.audiences
     }
 
     /// Hashes of what peers must agree on, names included.
@@ -467,6 +569,24 @@ impl Builder<'_> {
                 }
                 self.object(id, &item.fields)
             }
+            DefKind::Component(item) => self.object(id, &item.fields),
+            DefKind::Audience(item) => {
+                // The key travels in frames, so it must fit as a value.
+                if let Some(size) = self.oversized(&item.key) {
+                    self.errors.push(Error {
+                        def: id,
+                        variant: None,
+                        field: None,
+                        message: format!(
+                            "`{}` takes {size} bytes; a message holds at most {MAX_SIZE}",
+                            self.schema.type_name(&item.key)
+                        ),
+                    });
+                }
+                self.size(&item.key)
+            }
+            // No value: only its addition and removal travel.
+            DefKind::Tag(_) => Size::Fixed(0),
             DefKind::Union(item) => self.union(id, &item.variants),
             // A scalar, so never too large.
             DefKind::Type(item) => self.size(&item.target),
@@ -527,7 +647,8 @@ impl Builder<'_> {
         size
     }
 
-    /// Lays out the fields of a struct, message, or hub kind, or of a union's
+    /// Lays out the fields of a struct, message, hub kind, or component, or
+    /// of a union's
     /// variant.
     fn layout(&mut self, id: TypeId, variant: Option<usize>, fields: &[Field]) -> Layout {
         let mut bits = 0;
@@ -760,6 +881,11 @@ enum Scope {
 /// as `message(client -> hub<a.Party>, hub<a.Guild> | hub<a.Party> -> client)`.
 /// For clients, a message lists only the links with a client end, and a hub
 /// kind only its key and name, as `hub(u64) a.Party`.
+///
+/// Components and tags spell every attribute, defaults included, as
+/// `@replicate(ops(a.Op)) @visibility(public) @halo(true) component a.C { .. }`
+/// and `@visibility(a.Stealth) @halo(true) tag a.Hidden`. For clients,
+/// `@halo` is left out. An audience is `audience a.Faction: a.FactionId`.
 fn canonical(schema: &Schema, scope: Scope) -> String {
     let listed = match scope {
         Scope::Internal => vec![true; schema.defs.len()],
@@ -784,6 +910,18 @@ fn canonical(schema: &Schema, scope: Scope) -> String {
             }
         }
         out.push_str(" }");
+    };
+    // `@halo` is between servers only, so clients never hash it.
+    let visibility = |out: &mut String, visibility: Visibility, halo: bool| {
+        let _ = match visibility {
+            Visibility::Public => write!(out, "@visibility(public) "),
+            Visibility::Owner => write!(out, "@visibility(owner) "),
+            Visibility::None => write!(out, "@visibility(none) "),
+            Visibility::Audience(id) => write!(out, "@visibility({}) ", schema.qualified(id)),
+        };
+        if scope == Scope::Internal {
+            let _ = write!(out, "@halo({halo}) ");
+        }
     };
     let mut out = String::new();
     for (name, id) in defs {
@@ -833,6 +971,24 @@ fn canonical(schema: &Schema, scope: Scope) -> String {
             DefKind::Type(item) => {
                 let _ = write!(out, "type {name} = {}", schema.type_name(&item.target));
             }
+            DefKind::Audience(item) => {
+                let _ = write!(out, "audience {name}: {}", schema.type_name(&item.key));
+            }
+            DefKind::Component(item) => {
+                let replicate = match item.replicate {
+                    Replicate::Replace => "replace".to_string(),
+                    Replicate::Patch => "patch".to_string(),
+                    Replicate::Ops(op) => format!("ops({})", schema.qualified(op)),
+                };
+                let _ = write!(out, "@replicate({replicate}) ");
+                visibility(&mut out, item.visibility, item.halo);
+                let _ = write!(out, "component {name}");
+                fields(&mut out, &item.fields);
+            }
+            DefKind::Tag(item) => {
+                visibility(&mut out, item.visibility, item.halo);
+                let _ = write!(out, "tag {name}");
+            }
         }
         out.push('\n');
     }
@@ -866,12 +1022,25 @@ fn canonical(schema: &Schema, scope: Scope) -> String {
 }
 
 /// Which declarations the client fingerprint lists: every message with a
-/// client end, whatever they reach, and each hub kind they name, with what
-/// its key reaches. Hub kinds are listed by key and name.
+/// client end, each hub kind they name, with what its key reaches, every
+/// component and tag clients see, every audience, and whatever they all
+/// reach. Hub kinds are listed by key and name.
 fn client_listed(schema: &Schema) -> Vec<bool> {
     let mut listed = vec![false; schema.defs.len()];
     let mut todo = Vec::new();
     for (index, def) in schema.defs.iter().enumerate() {
+        let visibility = match &def.kind {
+            DefKind::Audience(_) => Some(Visibility::Public),
+            DefKind::Component(item) => Some(item.visibility),
+            DefKind::Tag(item) => Some(item.visibility),
+            _ => None,
+        };
+        if let Some(visibility) = visibility {
+            if visibility.reaches_clients() {
+                todo.push(TypeId(index));
+            }
+            continue;
+        }
         let DefKind::Message(item) = &def.kind else {
             continue;
         };
@@ -910,6 +1079,21 @@ fn client_listed(schema: &Schema) -> Vec<bool> {
                             types.extend(fields.iter().map(|field| &field.ty));
                         }
                     }
+                }
+            }
+            DefKind::Audience(item) => types.push(&item.key),
+            DefKind::Component(item) => {
+                types.extend(item.fields.iter().map(|field| &field.ty));
+                if let Replicate::Ops(op) = item.replicate {
+                    todo.push(op);
+                }
+                if let Visibility::Audience(audience) = item.visibility {
+                    todo.push(audience);
+                }
+            }
+            DefKind::Tag(item) => {
+                if let Visibility::Audience(audience) = item.visibility {
+                    todo.push(audience);
                 }
             }
         }
@@ -975,8 +1159,13 @@ mod tests {
             DefKind::Struct(item) => &item.fields,
             DefKind::Message(item) => &item.fields,
             DefKind::Hub(item) => &item.fields,
-            DefKind::Enum(_) | DefKind::Union(_) | DefKind::Type(_) => {
-                panic!("only structs, messages, and hub kinds have fields")
+            DefKind::Component(item) => &item.fields,
+            DefKind::Enum(_)
+            | DefKind::Union(_)
+            | DefKind::Type(_)
+            | DefKind::Audience(_)
+            | DefKind::Tag(_) => {
+                panic!("only structs, messages, hub kinds, and components have fields")
             }
         }
     }
@@ -1716,6 +1905,211 @@ mod tests {
         ] {
             assert_ne!(base, fingerprint(changed), "{changed}");
         }
+    }
+
+    #[test]
+    fn components_lay_out_as_structs() {
+        let (schema, wire) = compiled(&[concat!(
+            "namespace a\n",
+            "struct S { a: bool, x: u16, name: string[max_length=8], hp: option<u32> }\n",
+            "component C { a: bool, x: u16, name: string[max_length=8], hp: option<u32> }\n",
+        )]);
+        assert_eq!(wire.layout(id(&schema, "C")), wire.layout(id(&schema, "S")));
+    }
+
+    #[test]
+    fn components_and_tags_share_ids_with_client_ones_first() {
+        let (schema, wire) = compiled(&[
+            concat!(
+                "namespace b\n",
+                "audience Stealth: u8\n",
+                "@visibility(none) component Cooldowns { x: u8 }\n",
+                "@visibility(Stealth) tag Hidden\n",
+                "@visibility(owner) component Bag { x: u8 }\n",
+            ),
+            concat!(
+                "namespace a\n",
+                "audience Faction: u32\n",
+                "@visibility(none) tag Busy\n",
+                "tag Dead\n",
+                "component Health { hp: u32 }\n",
+                "struct S {}\n",
+            ),
+        ]);
+        let names = |ids: &[TypeId]| -> Vec<String> {
+            ids.iter().map(|id| schema.qualified(*id)).collect()
+        };
+        assert_eq!(
+            names(wire.components()),
+            [
+                "a.Dead",
+                "a.Health",
+                "b.Bag",
+                "b.Hidden",
+                "a.Busy",
+                "b.Cooldowns"
+            ]
+        );
+        assert_eq!(
+            names(wire.client_components()),
+            ["a.Dead", "a.Health", "b.Bag", "b.Hidden"]
+        );
+        for (index, id) in wire.components().iter().enumerate() {
+            assert_eq!(wire.component_id(*id), Some(index as u16 + 1), "no id is 0");
+        }
+        assert_eq!(wire.component_id(id(&schema, "S")), None);
+        assert_eq!(wire.component_id(id(&schema, "Faction")), None);
+
+        assert_eq!(names(wire.audiences()), ["a.Faction", "b.Stealth"]);
+        assert_eq!(wire.audience_id(id(&schema, "Faction")), Some(1));
+        assert_eq!(wire.audience_id(id(&schema, "Stealth")), Some(2));
+        assert_eq!(wire.audience_id(id(&schema, "Dead")), None);
+
+        // A server-only component never shifts a client one's id.
+        let (schema, wire) = compiled(&["namespace a\n@visibility(none) tag A\ntag B\n"]);
+        assert_eq!(wire.component_id(id(&schema, "B")), Some(1));
+        assert_eq!(wire.component_id(id(&schema, "A")), Some(2));
+
+        let (_, wire) = compiled(&["namespace a\nstruct S {}\n"]);
+        assert!(wire.components().is_empty());
+        assert!(wire.audiences().is_empty());
+    }
+
+    const COMPONENTS: &str = concat!(
+        "namespace a\n",
+        "type FactionId = u32\n",
+        "audience Faction: FactionId\n",
+        "audience Stealth: u8\n",
+        "struct Item { id: u32 }\n",
+        "struct Secret { x: u8 }\n",
+        "union Op { Add(Item), Clear }\n",
+        "component Health { hp: u32 }\n",
+        "@replicate(ops(Op)) @visibility(owner) @halo(false)\n",
+        "component Inventory { items: vec<Item> }\n",
+        "@replicate(patch) @visibility(none)\n",
+        "component Brain { secret: Secret }\n",
+        "@visibility(Faction) component Chatter { x: u8 }\n",
+        "@visibility(Stealth) tag Hidden\n",
+        "@visibility(none) tag Busy\n",
+    );
+
+    #[test]
+    fn canonical_text_spells_out_components_tags_and_audiences() {
+        let (schema, _) = compiled(&[COMPONENTS]);
+        assert_eq!(
+            canonical(&schema, Scope::Internal),
+            concat!(
+                "@replicate(patch) @visibility(none) @halo(false) component a.Brain { secret: a.Secret, }\n",
+                "@visibility(none) @halo(false) tag a.Busy\n",
+                "@replicate(replace) @visibility(a.Faction) @halo(true) component a.Chatter { x: u8, }\n",
+                "audience a.Faction: a.FactionId\n",
+                "type a.FactionId = u32\n",
+                "@replicate(replace) @visibility(public) @halo(true) component a.Health { hp: u32, }\n",
+                "@visibility(a.Stealth) @halo(true) tag a.Hidden\n",
+                "@replicate(ops(a.Op)) @visibility(owner) @halo(false) component a.Inventory { items: vec<a.Item>, }\n",
+                "struct a.Item { id: u32, }\n",
+                "union a.Op { Add(a.Item), Clear, }\n",
+                "struct a.Secret { x: u8, }\n",
+                "audience a.Stealth: u8\n",
+            )
+        );
+        // Clients see no `@halo`, nothing with `visibility=none`, and nothing
+        // only those reach.
+        assert_eq!(
+            canonical(&schema, Scope::Client),
+            concat!(
+                "@replicate(replace) @visibility(a.Faction) component a.Chatter { x: u8, }\n",
+                "audience a.Faction: a.FactionId\n",
+                "type a.FactionId = u32\n",
+                "@replicate(replace) @visibility(public) component a.Health { hp: u32, }\n",
+                "@visibility(a.Stealth) tag a.Hidden\n",
+                "@replicate(ops(a.Op)) @visibility(owner) component a.Inventory { items: vec<a.Item>, }\n",
+                "struct a.Item { id: u32, }\n",
+                "union a.Op { Add(a.Item), Clear, }\n",
+                "audience a.Stealth: u8\n",
+            )
+        );
+    }
+
+    #[test]
+    fn every_audience_is_in_the_client_fingerprint() {
+        let (schema, _) = compiled(&["namespace a\nstruct K {}\naudience Unused: u8\n"]);
+        assert_eq!(canonical(&schema, Scope::Client), "audience a.Unused: u8\n");
+    }
+
+    #[test]
+    fn fingerprints_cover_components_tags_and_audiences() {
+        let fingerprints = |src: &str| {
+            compiled(&[&format!("{COMPONENTS}{src}\n")])
+                .1
+                .fingerprints()
+        };
+        let base = fingerprints("");
+        // Server-only changes leave clients alone.
+        for changed in [
+            "@visibility(none) component Extra { x: u8 }",
+            "@visibility(none) tag Extra",
+        ] {
+            let changed_fingerprints = fingerprints(changed);
+            assert_eq!(base.client, changed_fingerprints.client, "{changed}");
+            assert_ne!(base.internal, changed_fingerprints.internal, "{changed}");
+        }
+        let swap = |from: &str, to: &str| {
+            assert!(COMPONENTS.contains(from), "{from}");
+            compiled(&[&COMPONENTS.replace(from, to)]).1.fingerprints()
+        };
+        for (from, to) in [
+            // Halo, and what only a `visibility=none` component reaches.
+            ("@halo(false)\n", "\n"),
+            ("component Health", "@halo(false) component Health"),
+            ("struct Secret { x: u8 }", "struct Secret { x: u16 }"),
+            (
+                "component Brain { secret: Secret }",
+                "component Brain { secret: Secret, y: u8 }",
+            ),
+            ("@visibility(none) tag Busy", "@visibility(none) tag Idle"),
+            ("@replicate(patch) @visibility(none)", "@visibility(none)"),
+        ] {
+            let changed = swap(from, to);
+            assert_eq!(base.client, changed.client, "{from} -> {to}");
+            assert_ne!(base.internal, changed.internal, "{from} -> {to}");
+        }
+        // What clients see changes both.
+        for (from, to) in [
+            (
+                "component Health { hp: u32 }",
+                "component Health { hp: u16 }",
+            ),
+            ("component Health", "@replicate(patch) component Health"),
+            ("component Health", "@visibility(owner) component Health"),
+            ("@visibility(Stealth) tag Hidden", "tag Hidden"),
+            ("@visibility(Faction)", "@visibility(Stealth)"),
+            ("audience Stealth: u8", "audience Stealth: u16"),
+            ("type FactionId = u32", "type FactionId = u64"),
+            ("union Op { Add(Item), Clear }", "union Op { Add(Item) }"),
+            ("struct Item { id: u32 }", "struct Item { id: u64 }"),
+            ("@visibility(none) tag Busy", "tag Busy"),
+            ("@visibility(none) tag Busy", "@visibility(public) tag Busy"),
+        ] {
+            let changed = swap(from, to);
+            assert_ne!(base.client, changed.client, "{from} -> {to}");
+            assert_ne!(base.internal, changed.internal, "{from} -> {to}");
+        }
+        // Defaults hash as if spelled out.
+        assert_eq!(
+            base,
+            swap(
+                "component Health",
+                "@replicate(replace) @visibility(public) @halo(true) component Health"
+            )
+        );
+        assert_eq!(
+            base,
+            swap(
+                "@visibility(none) tag Busy",
+                "@visibility(none) @halo(false) tag Busy"
+            )
+        );
     }
 
     #[test]

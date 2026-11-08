@@ -1,7 +1,7 @@
 # Schema
 
 > **Status.** Only attributes, naming, consts, types, unions, messages, hub
-> kinds, and the planned component declarations are written up here. Until
+> kinds, and components are written up here. Until
 > the rest of the language is, `crates/uju-protoc/tests/data/example1.uju`
 > shows every declaration kind, type and constraint.
 
@@ -18,11 +18,10 @@ Attributes go above the declaration they describe, each as `@name` or
 `@name(args)`:
 
 ```
-@timeout(1000ms)
-@lock(Inventory, Gold)
 @replicate(ops(InventoryOp))
-struct Trade {
-    gold: u32,
+@visibility(owner)
+component Inventory {
+    items: vec<Item>[max_length=64],
 }
 ```
 
@@ -38,15 +37,25 @@ struct Trade {
   is an error.
 - Line breaks carry no meaning, but by convention each attribute takes a
   line of its own.
-- Attributes go on `const`, `type`, `enum`, `union`, `struct`, `message`
-  and `hub` declarations, at the top of a namespace or nested. They are not
-  allowed on `namespace`, `use`, fields or variants, and one with no
-  declaration after it is an error.
+- Attributes go on `const`, `type`, `enum`, `union`, `struct`, `message`,
+  `hub`, `audience`, `component` and `tag` declarations, at the top of a
+  namespace or nested. They are not allowed on `namespace`, `use`, fields
+  or variants, and one with no declaration after it is an error.
 
 Constraints keep their brackets after the type, as in `u8[max=10]`. They
 belong to the type, while attributes describe the declaration.
 
-No attribute is defined yet, so `ujuc` reports each one as unknown.
+Three attributes are defined, all for [components](#components):
+
+| Attribute | Goes on | Default |
+|---|---|---|
+| [`@replicate`](#replication-modes) | `component` | `replace` |
+| [`@visibility`](#visibility) | `component`, `tag` | `public` |
+| [`@halo`](#halo) | `component`, `tag` | `true`, but `false` with `@visibility(none)` |
+
+One of them on any other declaration is an error naming where it goes,
+such as "`@replicate` goes only on a component". `ujuc` reports any other
+attribute as unknown.
 
 ## Naming
 
@@ -58,6 +67,7 @@ name has a convention:
 | Namespace segment | `snake_case` | `namespace demo.character` |
 | Enum, struct, message | `PascalCase` | `message(sim -> client) SpawnPlayer` |
 | Hub kind | `PascalCase` | `hub(GuildId) Guild` |
+| Component, tag, audience | `PascalCase` | `component Health`, `tag Dead`, `audience Faction` |
 | Enum variant | `PascalCase` | `Blue` |
 | Union | `PascalCase` | `union InventoryOp` |
 | Union variant | `PascalCase` | `Remove(u8)` |
@@ -448,53 +458,181 @@ are, so `hub: u8` is still a valid field.
 
 ## Components
 
-> **TODO.** Nothing below is implemented yet.
-
-Every ECS component that leaves its process is declared in the schema, and
-the compiler generates it. That covers the components replicated to edges
-and clients, and also the ones sent to another shard on
-[migration](../architectures/topology.md#entity-migration) or written to
-storage. Components that never leave their shard are written by hand in Rust.
+Every ECS component that leaves its shard is declared in the schema: the
+ones replicated to edges, clients and neighbor shards, and the ones that
+travel with their entity on
+[migration](../architectures/topology.md#entity-migration). Components that
+never leave their shard are written by hand in Rust.
 
 ```
 namespace demo.character
+
+type FactionId = u32
+
+audience Faction: FactionId
 
 component Health {
     hp: u32,
     max_hp: u32,
 }
 
-component[visibility=owner] Inventory {
+@replicate(patch)
+@visibility(owner)
+component Stats {
+    strength: u16,
+    agility: u16,
+}
+
+@replicate(ops(InventoryOp))
+@visibility(owner)
+component Inventory {
     items: vec<Item>[max_length=64],
 }
 
-component[visibility=server] Cooldowns {
+@visibility(none)
+component Cooldowns {
     slots: array<u32, 8>,
 }
+
+tag Dead
+
+@visibility(Faction)
+tag Disguised
 ```
 
 | Kind | Example | Declared in | Id on the wire |
 |---|---|---|---|
-| Seen by clients | `Health`, a transform | schema, `component` | static, from the compiler |
-| Crosses processes, seen by no client | `Cooldowns` | schema, `component[visibility=server]` | static, from the compiler |
+| Seen by clients | `Health`, a transform | schema, `component` or `tag` | static, from the compiler |
+| Crosses processes, seen by no client | `Cooldowns` | schema, `@visibility(none)` | static, from the compiler |
 | Never leaves its shard, rebuilt on arrival | an AI cache, a physics body | Rust, `#[derive(Component)]` | none |
+
+- `component`, `tag` and `audience` go only at the top level of a
+  namespace. One nested in a struct, a message, a hub kind or a component
+  is an error.
+- A component's body takes what a struct's body takes, nested declarations
+  and consts included, and its fields are laid out and checked as a
+  struct's are.
+- Each is a keyword only where a declaration starts, as `hub` is, so
+  `tag: u8` is still a valid field.
+
+> **Not generated yet.** `ujuc` checks components, tags and audiences, and
+> gives them ids and fingerprint coverage, but the Rust backend and the
+> [IR JSON](ir.md) leave them out for now.
+
+### Tags
+
+A component that carries no data is a `tag`. It has no body, so no value
+and no patch: only its addition and removal go on the wire.
+
+```
+tag Dead
+```
+
+A component with no fields is an error that suggests a tag, "a component
+with no fields is a tag; write `tag Dead`", so a tag has one spelling. That
+holds for a body that declares only nested types or consts too. A tag
+takes `@visibility` and `@halo`, but not `@replicate`: "a tag has no value
+to replicate".
+
+### Replication modes
+
+`@replicate` says what a change to a component sends. Every component also
+has a full encoding, which an entity's arrival, snapshots and resyncs send,
+so the mode only decides what goes in a delta:
+
+| Mode | A change sends | Fits |
+|---|---|---|
+| `replace`, the default | The whole value | Small components whose fields change together, such as a transform or health |
+| `patch` | The top-level fields that changed | Structs with many fields, of which few change at once |
+| `ops(Union)` | Operations of the named [union](#unions) | Large collections, or anything with its own semantics, such as an inventory |
+
+- A `patch` is shallow: a nested struct or a collection that changes is sent
+  whole.
+- `ops` names a union, the component's op type. Naming anything else is an
+  error, "`X` is not a union; the op type of `ops` must be a union". The
+  user writes how each op applies, in every language that receives the
+  component.
+- The default is explicit, not derived from size, so adding a field never
+  changes how a component travels.
 
 ### Visibility
 
-`visibility` says which clients receive a component, and so how edges
-deliver it (see [Shared cell frames](../architectures/topology.md#shared-cell-frames)):
+`@visibility` says which clients receive a component or tag:
 
-- `public`, the default: every client whose view covers the cell, in the
-  cell's shared frame.
-- `team`: the clients of one visibility class, in a split of the cell's frame.
+- `public`, the default: every client whose view covers the entity's cell,
+  in the cell's [shared frame](../architectures/topology.md#shared-cell-frames).
 - `owner`: only the client controlling the entity, outside cell frames.
-- `server`: no client. Edges never receive it.
+- `none`: no client. Edges never receive it, and client code leaves it out.
+- An [audience](#audiences), by path: the clients nearby whose observer
+  holds the entity's key for that audience.
+
+Any other path is an error, "`X` is not an audience; expected `public`,
+`owner`, `none` or an audience".
+
+### Halo
+
+`@halo(true)` or `@halo(false)` says whether the neighbor sim shards that
+[replicate](../architectures/topology.md#replicas-between-shards) a cell
+receive the component. It defaults to `true`, except with
+`@visibility(none)`, where it defaults to `false`. A missing `halo` would
+only fail once two cells land on different shards, which moves with load,
+so the default is the safe one. `@halo` takes its value: a bare `@halo` is
+an error.
+
+Migration takes no attribute: every component declared in the schema
+travels with its entity.
+
+### Audiences
+
+An audience splits who sees a component nearby by a key the user declares:
+
+```
+type FactionId = u32
+
+audience Faction: FactionId
+audience Stealth: u8
+
+@visibility(Faction)
+component FactionChatter { line: u16 }
+
+@visibility(Stealth)
+tag Hidden
+```
+
+- An entity holds zero or one key per audience, and an observer, the
+  client's character, holds a set of keys. A component reaches the
+  observer when its set holds the entity's key.
+- The key goes after a `:`, as a `const`'s type does, since an audience has
+  no body. It follows the rules of a [hub key](#hub-kinds): fixed-size, no
+  float, and not optional.
+- A component or tag names one audience at most. Data two audiences see is
+  split into two components.
+
+### Attribute paths
+
+The paths in `@replicate(ops(..))` and `@visibility(..)` resolve where the
+component or tag is declared, at the top of its namespace, as a hub key
+does, so `use` declarations apply. A union nested in the component itself
+is not in scope there. A path that resolves to nothing is reported as any
+unknown name is, so `@visibility(team)` gives "cannot find `team` in this
+scope".
+
+### Not types
+
+Components, tags and audiences are state, not types, as hub kinds are.
+Naming one where a type goes, in a field, a collection, an `option`, a
+union variant, a `type` target or a key, is an error:
+
+- "a component is not a type; declare a struct for what you send"
+- "a tag is not a type; it has no value"
+- "an audience is not a type; name its key's type instead"
 
 ### Ids
 
-Each component gets a `u16` id, in its own dense space from `1`, ordered by
-fully qualified name, like [message ids](wire-format.md#message-ids).
-Components are part of the [fingerprint](wire-format.md#fingerprint).
+Components and tags share one `u16` id space, and audiences have one of
+their own. See [Component ids](wire-format.md#component-ids) and
+[Audience ids](wire-format.md#audience-ids). Components, tags and audiences
+are part of the [fingerprints](wire-format.md#fingerprint).
 
 The wire uses only these static ids. `uju::ecs` keeps assigning its own ids
 at startup to index storage, since one `World` holds generated and
@@ -502,27 +640,7 @@ hand-written components alike. Those ids come from sorting the names of the
 components a binary links, so they differ between binaries, such as a sim
 and an edge, and never go on the wire.
 
-### What the compiler generates
-
-- The owned Rust type and its `Component` registration, which carries the
-  static id.
-- A view, as for any struct.
-- A patch type with `diff` and `apply`, as the planned `struct[patch]`
-  attribute would generate (see [Wire Format](wire-format.md#todo)), so
-  replication sends only the changed fields.
-
-The generated code goes into the user's shared crate rather than a crate of
-its own, so the user can add inherent `impl` blocks to the generated types.
-
 ### Open questions
 
-- **Math types**: which schema types map to the Rust math types systems
-  compute with, such as `parry3d::glamx::Vec3`, instead of packed wire
-  structs.
 - **Extra derives**: how a user adds derives or attributes to a generated
   type, by a schema attribute or a `ujuc` option.
-- **Built-in components**: `uju::ecs` ships `Transform3` and `Velocity3`
-  written by hand. Replicating them takes a schema of uju's own, which users
-  compile with theirs.
-- **Halo replicas**: whether `server` components go to the neighbor sim
-  shards that replicate a cell, or only `public` ones do.

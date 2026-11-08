@@ -27,6 +27,9 @@ pub enum Item<'src> {
     Union(Union<'src>),
     Type(TypeDecl<'src>),
     Hub(Hub<'src>),
+    Audience(Audience<'src>),
+    Component(Component<'src>),
+    Tag(Tag<'src>),
 }
 
 /// `@name` or `@name(args)`, written above a declaration. Each declaration
@@ -113,6 +116,32 @@ pub struct Hub<'src> {
     pub key: Type<'src>,
     pub name: Ident<'src>,
     pub body: Body<'src>,
+}
+
+/// `audience Name: Key`: a set of clients a component can be visible to,
+/// split by a `Key`. Only at the top level of a namespace.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Audience<'src> {
+    pub attrs: Vec<Attribute<'src>>,
+    pub name: Ident<'src>,
+    pub key: Type<'src>,
+}
+
+/// `component Name { ... }`: an ECS component, whose body is its value.
+/// Only at the top level of a namespace.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Component<'src> {
+    pub attrs: Vec<Attribute<'src>>,
+    pub name: Ident<'src>,
+    pub body: Body<'src>,
+}
+
+/// `tag Name`: a component carrying no data. Only at the top level of a
+/// namespace.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tag<'src> {
+    pub attrs: Vec<Attribute<'src>>,
+    pub name: Ident<'src>,
 }
 
 /// `union Name { A { x: u8 }, B(u8), C }`: a sum type whose variants
@@ -282,6 +311,9 @@ impl<'src> Item<'src> {
             Item::Union(item) => &item.name,
             Item::Type(item) => &item.name,
             Item::Hub(item) => &item.name,
+            Item::Audience(item) => &item.name,
+            Item::Component(item) => &item.name,
+            Item::Tag(item) => &item.name,
         }
     }
 
@@ -294,6 +326,9 @@ impl<'src> Item<'src> {
             Item::Union(item) => &item.attrs,
             Item::Type(item) => &item.attrs,
             Item::Hub(item) => &item.attrs,
+            Item::Audience(item) => &item.attrs,
+            Item::Component(item) => &item.attrs,
+            Item::Tag(item) => &item.attrs,
         }
     }
 
@@ -306,6 +341,9 @@ impl<'src> Item<'src> {
             Item::Union(item) => &mut item.attrs,
             Item::Type(item) => &mut item.attrs,
             Item::Hub(item) => &mut item.attrs,
+            Item::Audience(item) => &mut item.attrs,
+            Item::Component(item) => &mut item.attrs,
+            Item::Tag(item) => &mut item.attrs,
         }
     }
 
@@ -318,6 +356,9 @@ impl<'src> Item<'src> {
             Item::Union(_) => "union",
             Item::Type(_) => "type",
             Item::Hub(_) => "hub",
+            Item::Audience(_) => "audience",
+            Item::Component(_) => "component",
+            Item::Tag(_) => "tag",
         }
     }
 
@@ -326,7 +367,13 @@ impl<'src> Item<'src> {
             Item::Struct(item) => Some(&item.body),
             Item::Message(item) => Some(&item.body),
             Item::Hub(item) => Some(&item.body),
-            Item::Enum(_) | Item::Const(_) | Item::Union(_) | Item::Type(_) => None,
+            Item::Component(item) => Some(&item.body),
+            Item::Enum(_)
+            | Item::Const(_)
+            | Item::Union(_)
+            | Item::Type(_)
+            | Item::Audience(_)
+            | Item::Tag(_) => None,
         }
     }
 }
@@ -740,6 +787,21 @@ mod tests {
         });
         assert_eq!(item.keyword(), "union");
         assert_eq!(item.body(), None, "a union holds no nested declarations");
+
+        let item = Item::Component(Component {
+            attrs: Vec::new(),
+            name: ("Health", 10..16),
+            body: Body::default(),
+        });
+        assert_eq!(item.keyword(), "component");
+        assert_eq!(item.body(), Some(&Body::default()));
+
+        let item = Item::Tag(Tag {
+            attrs: Vec::new(),
+            name: ("Dead", 4..8),
+        });
+        assert_eq!(item.keyword(), "tag");
+        assert_eq!(item.body(), None);
     }
 
     #[test]

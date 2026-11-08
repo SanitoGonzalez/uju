@@ -353,6 +353,28 @@ fully qualified name. With the object's key, it picks the object's slot,
 `hash(kind, key)`. A message to a hub never carries it, since the
 message's id implies it.
 
+### Component ids
+
+Components and [tags](schema.md#tags) share one `u16` id space, so a delta
+names an addition, a removal or a section by one id whatever its kind:
+
+- Those clients see, with any `@visibility` but `none`, take ids from `1`,
+  dense, ordered by fully qualified name.
+- `@visibility(none)` ones follow them, dense, ordered the same way.
+- A space holds at most 65535 components and tags.
+
+Clients only ever see the first run, so a change to a `none` component
+never shifts their ids. Servers see one space, so a
+[halo](schema.md#halo) stream or a migration that carries both kinds names
+each without ambiguity.
+
+### Audience ids
+
+Every [audience](schema.md#audiences) has a `u16` id, dense from `1` over
+every audience, ordered by fully qualified name. With an entity's key, it
+names the sub-frame of a cell's delta that the entity's components travel
+in.
+
 ## Fingerprint
 
 The compiler emits two `u64` fingerprints of the schema:
@@ -360,11 +382,12 @@ The compiler emits two `u64` fingerprints of the schema:
 - `internal` covers every declaration and const.
 - `client` covers what clients see: every message with a link that has
   `client` at either end, every declaration such a message reaches, the
-  key and name of every hub kind it names, with what the key reaches, and
-  every const.
+  key and name of every hub kind it names, with what the key reaches, every
+  component and tag clients see, every audience, every declaration those
+  reach, such as field types, an `ops` union or a key, and every const.
 
-Changing a message between servers changes `internal` only, so clients
-built from the old schema still match.
+Changing a message between servers, or a `@visibility(none)` component,
+changes `internal` only, so clients built from the old schema still match.
 
 Each is the 64-bit FNV-1a hash of a canonical text listing its
 declarations, sorted by fully qualified name, with every name included:
@@ -383,6 +406,21 @@ largest unit that divides it exactly, as `const a.D: duration = 1s` for
 when it is zero, else 3 digits when whole milliseconds and 6 otherwise, as
 `const a.T: timestamp = 2026-11-07T12:00:00Z`. So every spelling of a value
 hashes the same.
+
+Components, tags and audiences are listed with every attribute spelled out,
+defaults included, so writing a default hashes the same as leaving it out.
+Visibility is `public`, `owner`, `none` or the audience's qualified name,
+and an `ops` union is qualified:
+
+```
+audience a.Faction: a.FactionId
+@replicate(ops(a.InventoryOp)) @visibility(owner) @halo(true) component a.Inventory { items: vec<a.Item>[max_length=64], }
+@visibility(a.Stealth) @halo(true) tag a.Hidden
+```
+
+The canonical text of `client` leaves out `@halo`, which matters only
+between servers, so changing it leaves `client` alone. It also leaves out
+`@visibility(none)` components and tags, and what only they reach.
 
 A message spells its links normalized, so every way of writing its
 endpoints hashes the same. Its role pairs are listed once each,
@@ -452,14 +490,9 @@ fixed, and for a hub receiver the kind's id and the key's encoded size (see
 - Time narrowing: a `resolution` constraint on `timestamp` and `duration`
   (such as `duration[resolution=1ms, max=1h]`) that, together with `max`,
   narrows them as [integers](#integers) are.
-- `struct[patch]` attribute: generate a patch struct (every field optional)
-  with `diff` and `apply`, for replicating ECS components.
-- Component ids: the compiler assigns every component declared in the
-  schema a static id, as it does for messages, and replication names
-  components by it. The ids `uju::ecs::component` assigns at startup come
-  from sorting the names of the components a binary links, so they are only
-  valid inside that binary: a sim that links one component an edge does not
-  shifts every id after it. See [Components](schema.md#components).
+- Patch types for `@replicate(patch)` components: a layout of their own,
+  whose presence bits are the component's field dirty mask, so the sim
+  encodes a patch with no `diff`. See [Components](schema.md#replication-modes).
 - Rust backend: mark the generated code `#[rustfmt::skip]`, so `cargo fmt`
   leaves it alone and regenerating it changes nothing. Today the output is
   not formatted as rustfmt would, and users have to exclude its directory

@@ -466,10 +466,10 @@ The subscriber set is part of the cell's state and moves with it.
 Every cell carries `(epoch, seq)`. The epoch increments on each ownership
 change.
 
-> **TODO.** Deltas name components by the static ids the protocol compiler
-> assigns (see [Components](../protocol/schema.md#components)). The ids
-> `uju::ecs` assigns at startup differ between binaries that link different
-> components, such as a sim and an edge.
+Deltas name components by the static ids the protocol compiler assigns
+(see [Component ids](../protocol/wire-format.md#component-ids)), never by
+the ids `uju::ecs` assigns at startup, which differ between binaries that
+link different components, such as a sim and an edge.
 
 ### Cell handoff
 

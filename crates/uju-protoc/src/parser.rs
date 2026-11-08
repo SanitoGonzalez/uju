@@ -225,8 +225,9 @@ where
     )
     .boxed();
 
-    // `type`, `union`, and `hub` are keywords only where a declaration
-    // starts, so they stay usable as names, as in a field `type: u8`.
+    // `type`, `union`, `hub`, `component`, `tag` and `audience` are
+    // keywords only where a declaration starts, so they stay usable as
+    // names, as in a field `type: u8`.
     let type_item = just(Token::Ident("type"))
         .ignore_then(ident)
         .then_ignore(just(Token::Equal))
@@ -348,12 +349,17 @@ where
             .validate(|members, _, emitter| {
                 let body = collect_body(members, emitter);
                 for item in &body.items {
-                    if let Item::Hub(hub) = item {
-                        emitter.emit(Rich::custom(
-                            hub.name.1.clone(),
-                            "a hub kind must be declared at the top level of a namespace",
-                        ));
-                    }
+                    let what = match item {
+                        Item::Hub(_) => "a hub kind",
+                        Item::Audience(_) => "an audience",
+                        Item::Component(_) => "a component",
+                        Item::Tag(_) => "a tag",
+                        _ => continue,
+                    };
+                    emitter.emit(Rich::custom(
+                        item.name().1.clone(),
+                        format!("{what} must be declared at the top level of a namespace"),
+                    ));
                 }
                 body
             })
@@ -446,7 +452,7 @@ where
                     .delimited_by(just(Token::ParenOpen), just(Token::ParenClose)),
             )
             .then(ident)
-            .then(body)
+            .then(body.clone())
             .map(|((key, name), body)| {
                 Item::Hub(Hub {
                     attrs: Vec::new(),
@@ -456,11 +462,47 @@ where
                 })
             });
 
+        // `component Name { ... }`, `tag Name` and `audience Name: Key`.
+        // Like `hub`, parsed in any body, so that `body` can report one
+        // nested there.
+        let component_item = just(Token::Ident("component"))
+            .ignore_then(ident)
+            .then(body)
+            .map(|(name, body)| {
+                Item::Component(Component {
+                    attrs: Vec::new(),
+                    name,
+                    body,
+                })
+            });
+
+        let tag_item = just(Token::Ident("tag")).ignore_then(ident).map(|name| {
+            Item::Tag(Tag {
+                attrs: Vec::new(),
+                name,
+            })
+        });
+
+        let audience_item = just(Token::Ident("audience"))
+            .ignore_then(ident)
+            .then_ignore(just(Token::Colon))
+            .then(ty.clone())
+            .map(|(name, key)| {
+                Item::Audience(Audience {
+                    attrs: Vec::new(),
+                    name,
+                    key,
+                })
+            });
+
         choice((
             enum_item,
             struct_item,
             message_item,
             hub_item,
+            component_item,
+            tag_item,
+            audience_item,
             const_item,
             union_item.clone(),
             type_item.clone(),
@@ -1251,6 +1293,186 @@ mod tests {
         assert_eq!(
             error("namespace a\nhub(u64) Guild { x: u8 y: u8 }\n"),
             ("y".into(), "found 'y' expected '[', ',', or '}'".into())
+        );
+    }
+
+    #[test]
+    fn components_tags_and_audiences_parse() {
+        let src = concat!(
+            "namespace a\n",
+            "audience Faction: FactionId\n",
+            "audience Stealth: u8[max=3]\n",
+            "component Health { hp: u32, max_hp: u32 }\n",
+            "@replicate(ops(InventoryOp))\n",
+            "@halo(false)\n",
+            "component Inventory {\n",
+            "    const MaxSlots: u8 = 64\n",
+            "    struct Slot { item: u32 }\n",
+            "    slots: vec<Slot>,\n",
+            "}\n",
+            "component Empty {}\n",
+            "tag Dead\n",
+            "@visibility(Stealth)\n",
+            "tag Hidden\n",
+            "tag Last",
+        );
+        let schema = schema_of(src);
+        assert_eq!(
+            schema.items.iter().map(Item::keyword).collect::<Vec<_>>(),
+            [
+                "audience",
+                "audience",
+                "component",
+                "component",
+                "component",
+                "tag",
+                "tag",
+                "tag"
+            ]
+        );
+
+        let Item::Audience(faction) = item(&schema, "Faction") else {
+            panic!("expected an audience");
+        };
+        assert_eq!(faction.key.to_string(), "FactionId");
+        assert_eq!(&src[faction.key.span.clone()], "FactionId");
+        let Item::Audience(stealth) = item(&schema, "Stealth") else {
+            panic!("expected an audience");
+        };
+        assert_eq!(stealth.key.to_string(), "u8[max=3]");
+
+        assert_eq!(fields(item(&schema, "Health")), ["hp: u32", "max_hp: u32"]);
+        assert!(attrs(item(&schema, "Health")).is_empty());
+        assert_eq!(
+            attrs(item(&schema, "Inventory")),
+            ["@replicate(ops(InventoryOp))", "@halo(false)"]
+        );
+        assert_eq!(fields(item(&schema, "Inventory")), ["slots: vec<Slot>"]);
+        assert_eq!(
+            item(&schema, "Inventory")
+                .body()
+                .unwrap()
+                .items
+                .iter()
+                .map(Item::keyword)
+                .collect::<Vec<_>>(),
+            ["const", "struct"]
+        );
+        let Item::Component(empty) = item(&schema, "Empty") else {
+            panic!("expected a component");
+        };
+        assert_eq!(empty.body, Body::default(), "lowering rejects it");
+
+        let Item::Tag(dead) = item(&schema, "Dead") else {
+            panic!("expected a tag");
+        };
+        assert_eq!(&src[dead.name.1.clone()], "Dead");
+        assert!(attrs(item(&schema, "Dead")).is_empty());
+        assert_eq!(attrs(item(&schema, "Hidden")), ["@visibility(Stealth)"]);
+        assert_eq!(item(&schema, "Hidden").body(), None);
+    }
+
+    #[test]
+    fn component_tag_and_audience_are_keywords_only_where_a_declaration_starts() {
+        let src = concat!(
+            "namespace a\n",
+            "struct S { component: u8, tag: u8, audience: u8 }\n",
+            "message(client -> sim) M { tag: u8 }\n",
+            "union U { tag { tag: u8 }, component(u8), audience }\n",
+            "struct tag {}\n",
+            "type component = u8\n",
+            "audience audience: tag\n",
+            "component C { tag: tag, component: component }\n",
+        );
+        let schema = schema_of(src);
+        assert_eq!(
+            fields(item(&schema, "S")),
+            ["component: u8", "tag: u8", "audience: u8"]
+        );
+        assert_eq!(fields(item(&schema, "M")), ["tag: u8"]);
+        assert_eq!(item(&schema, "tag").keyword(), "struct");
+        assert_eq!(item(&schema, "component").keyword(), "type");
+        let Item::Audience(audience) = item(&schema, "audience") else {
+            panic!("expected an audience");
+        };
+        assert_eq!(audience.key.to_string(), "tag");
+        assert_eq!(
+            fields(item(&schema, "C")),
+            ["tag: tag", "component: component"]
+        );
+    }
+
+    #[test]
+    fn components_tags_and_audiences_are_declared_only_at_the_top_level() {
+        for (src, name, what) in [
+            (
+                "namespace a\nstruct S { component Health { hp: u32 } }\n",
+                "Health",
+                "a component",
+            ),
+            (
+                "namespace a\nmessage(client -> sim) M { x: u8, tag Dead }\n",
+                "Dead",
+                "a tag",
+            ),
+            (
+                "namespace a\nhub(u64) Guild { audience Faction: u8 }\n",
+                "Faction",
+                "an audience",
+            ),
+            (
+                "namespace a\ncomponent C { x: u8, tag Dead }\n",
+                "Dead",
+                "a tag",
+            ),
+            (
+                "namespace a\ncomponent C { hub(u64) Party {} }\n",
+                "Party",
+                "a hub kind",
+            ),
+        ] {
+            let (tokens, _) = lex(src);
+            let (schema, errors) = parse(src, &tokens);
+            assert!(schema.is_some(), "parsing goes on");
+            assert_eq!(errors.len(), 1, "{src}: {errors:?}");
+            assert_eq!(&src[errors[0].span.clone()], name);
+            assert_eq!(
+                errors[0].message,
+                format!("{what} must be declared at the top level of a namespace")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_components_tags_and_audiences_are_reported() {
+        let error = |src: &str| {
+            let errors = errors_of(src);
+            (
+                src[errors[0].span.clone()].to_string(),
+                errors[0].message.clone(),
+            )
+        };
+        assert_eq!(
+            error("namespace a\ntag Dead {}\n"),
+            (
+                "{".into(),
+                "found '{' expected declaration, or end of input".into()
+            )
+        );
+        assert_eq!(
+            error("namespace a\ncomponent Health\n"),
+            ("".into(), "found end of input expected '{'".into())
+        );
+        assert_eq!(
+            error("namespace a\naudience Faction\n"),
+            ("".into(), "found end of input expected ':'".into())
+        );
+        assert_eq!(
+            error("namespace a\naudience Faction: u8 {}\n"),
+            (
+                "{".into(),
+                "found '{' expected '[', declaration, or end of input".into()
+            )
         );
     }
 

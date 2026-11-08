@@ -51,6 +51,12 @@ fn item_naming(source: SourceId, item: &ast::Item<'_>, out: &mut Vec<Diagnostic>
             expect(source, "hub kind", &item.name, Style::Pascal, out);
             body_naming(source, &item.body, out);
         }
+        ast::Item::Audience(item) => expect(source, "audience", &item.name, Style::Pascal, out),
+        ast::Item::Component(item) => {
+            expect(source, "component", &item.name, Style::Pascal, out);
+            body_naming(source, &item.body, out);
+        }
+        ast::Item::Tag(item) => expect(source, "tag", &item.name, Style::Pascal, out),
     }
 }
 
@@ -132,7 +138,10 @@ mod tests {
              const HTTP_PORT: u16 = 80\n\
              type party_id = u64\n\
              union op { add_item { SlotIndex: u8 }, remove(u8) }\n\
-             hub(u64) party_hub { enum role { tank } LeaderId: u64 }\n"]);
+             hub(u64) party_hub { enum role { tank } LeaderId: u64 }\n\
+             audience my_faction: u8\n\
+             component health_bar { struct inner_bar { X: u8 } MaxHp: u32 }\n\
+             tag is_dead\n"]);
         assert_eq!(
             warnings,
             [
@@ -155,6 +164,12 @@ mod tests {
                 "field `LeaderId` should be snake_case, like `leader_id`",
                 "enum `role` should be PascalCase, like `Role`",
                 "variant `tank` should be PascalCase, like `Tank`",
+                "audience `my_faction` should be PascalCase, like `MyFaction`",
+                "component `health_bar` should be PascalCase, like `HealthBar`",
+                "field `MaxHp` should be snake_case, like `max_hp`",
+                "struct `inner_bar` should be PascalCase, like `InnerBar`",
+                "field `X` should be snake_case, like `x`",
+                "tag `is_dead` should be PascalCase, like `IsDead`",
             ]
         );
     }

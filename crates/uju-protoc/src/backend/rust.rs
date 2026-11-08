@@ -233,6 +233,13 @@ impl<'a> Generator<'a> {
                 let owner = format!("declarations nested in {}", self.schema.qualified(parent));
                 claim(outer, name.clone(), owner);
             }
+            // Generated from step 8 of the components plan on.
+            if matches!(
+                def.kind,
+                DefKind::Audience(_) | DefKind::Component(_) | DefKind::Tag(_)
+            ) {
+                continue;
+            }
             claim(module, self.names[index].clone(), owner.clone());
             // A `type` is its own view.
             if !matches!(def.kind, DefKind::Enum(_) | DefKind::Type(_)) {
@@ -444,6 +451,9 @@ impl<'a> Generator<'a> {
                 DefKind::Hub(item) => self.object(out, *id, &item.fields, path),
                 DefKind::Type(item) => self.newtype(out, *id, item, path),
                 DefKind::Union(item) => self.union(out, *id, item, path),
+                DefKind::Audience(_) | DefKind::Component(_) | DefKind::Tag(_) => {
+                    unreachable!("never generated yet")
+                }
             }
         }
         for (name, child) in &module.children {
@@ -540,7 +550,9 @@ fn unsupported(schema: &Schema) -> Result<(), Error> {
     let mut errors = Vec::new();
     for (index, def) in schema.defs.iter().enumerate() {
         let fields = match &def.kind {
-            DefKind::Enum(_) => continue,
+            DefKind::Enum(_) | DefKind::Audience(_) | DefKind::Component(_) | DefKind::Tag(_) => {
+                continue;
+            }
             DefKind::Struct(item) => &item.fields,
             DefKind::Message(item) => &item.fields,
             DefKind::Hub(item) => {
@@ -696,7 +708,18 @@ fn string_literal(value: &str) -> String {
 fn roles(schema: &Schema, role: Option<Role>) -> (Vec<bool>, Vec<bool>) {
     let len = schema.defs.len();
     let Some(role) = role else {
-        return (vec![true; len], vec![true; len]);
+        // Every role's code, but what is not generated yet.
+        let all: Vec<bool> = schema
+            .defs
+            .iter()
+            .map(|def| {
+                !matches!(
+                    def.kind,
+                    DefKind::Audience(_) | DefKind::Component(_) | DefKind::Tag(_)
+                )
+            })
+            .collect();
+        return (all.clone(), all);
     };
     struct Marker<'a> {
         schema: &'a Schema,
@@ -731,6 +754,9 @@ fn roles(schema: &Schema, role: Option<Role>) -> (Vec<bool>, Vec<bool>) {
                     }
                 }
                 DefKind::Enum(_) => {}
+                DefKind::Audience(_) | DefKind::Component(_) | DefKind::Tag(_) => {
+                    unreachable!("never marked")
+                }
             }
             self.encode[id.0] |= enc;
             self.decode[id.0] |= dec;
@@ -781,9 +807,19 @@ fn roles(schema: &Schema, role: Option<Role>) -> (Vec<bool>, Vec<bool>) {
             }
         }
     }
+    // Audiences, components and tags are not generated yet, so what only
+    // they reach counts as reached by no message, and gets both.
     for (index, def) in schema.defs.iter().enumerate() {
         let reached = marker.encode[index] || marker.decode[index];
-        if !reached && !matches!(def.kind, DefKind::Message(_) | DefKind::Hub(_)) {
+        let skipped = matches!(
+            def.kind,
+            DefKind::Message(_)
+                | DefKind::Hub(_)
+                | DefKind::Audience(_)
+                | DefKind::Component(_)
+                | DefKind::Tag(_)
+        );
+        if !reached && !skipped {
             marker.mark(TypeId(index), (true, true));
         }
     }
@@ -831,6 +867,8 @@ fn traits(schema: &Schema) -> Vec<Traits> {
                 DefKind::Struct(item) => fields_traits(&item.fields, &traits),
                 DefKind::Message(item) => fields_traits(&item.fields, &traits),
                 DefKind::Hub(item) => fields_traits(&item.fields, &traits),
+                DefKind::Component(item) => fields_traits(&item.fields, &traits),
+                DefKind::Audience(_) | DefKind::Tag(_) => continue,
                 DefKind::Type(item) => type_traits(&item.target, &traits),
                 // A union has no variant to default to.
                 DefKind::Union(item) => {

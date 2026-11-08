@@ -580,10 +580,12 @@ impl Generator<'_> {
             DefKind::Struct(item) => &item.fields,
             DefKind::Message(item) => &item.fields,
             DefKind::Hub(item) => &item.fields,
+            DefKind::Component(item) => &item.fields,
             DefKind::Enum(_) | DefKind::Type(_) => {
                 unreachable!("enums and types are checked as what they hold")
             }
             DefKind::Union(_) => unreachable!("a union is never fixed-size"),
+            DefKind::Audience(_) | DefKind::Tag(_) => unreachable!("not a type"),
         };
         let bits: u32 = layout
             .fields
