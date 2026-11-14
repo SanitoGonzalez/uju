@@ -16,7 +16,6 @@ crossfire = "3.1"
 derive_more = { version = "2", features = ["deref", "deref_mut", "from"] }
 futures-util = "0.3"
 libc = "0.2"
-mimalloc = "0.1"
 parry2d = "0.31"
 parry3d = "0.31"
 proc-macro2 = "1"
