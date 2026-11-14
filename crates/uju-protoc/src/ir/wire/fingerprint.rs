@@ -168,7 +168,7 @@ pub(super) fn canonical(schema: &Schema, scope: Scope) -> String {
 /// client end, each hub kind they name, with what its key reaches, every
 /// component and tag clients see, every audience, and whatever they all
 /// reach. Hub kinds are listed by key and name.
-fn client_listed(schema: &Schema) -> Vec<bool> {
+pub(super) fn client_listed(schema: &Schema) -> Vec<bool> {
     let mut listed = vec![false; schema.defs.len()];
     let mut todo = Vec::new();
     for (index, def) in schema.defs.iter().enumerate() {

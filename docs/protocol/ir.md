@@ -15,7 +15,7 @@ ujuc protocol ir -o gen/ir schemas/
 
 | Path | Holds |
 |---|---|
-| `schema.json` | What spans namespaces: the fingerprints, the namespaces, and the message and hub kind id orders |
+| `schema.json` | What spans namespaces: the fingerprints, the namespaces, and the id orders of messages, hub kinds, components and audiences |
 | `namespaces/<name>.json` | One namespace's declarations, such as `namespaces/game.core.json` |
 
 A namespace's file changes only when the namespace itself changes. Namespace
@@ -31,15 +31,24 @@ integers, not as doubles.
 
 ```json
 {
-  "fingerprints": { "client": 4198648876519494714, "internal": 16186281289306324877 },
-  "namespaces": ["demo.guild"],
+  "fingerprints": { "client": 5065904886572146457, "internal": 18401690520226133482 },
+  "namespaces": ["demo.guild", "demo.world"],
   "links": [
     { "from": "client", "to": "sim", "messages": ["demo.guild.Ping"] },
     { "from": "client", "to": "hub", "messages": ["demo.guild.Rename"] },
     { "from": "sim", "to": "client", "messages": ["demo.guild.Ping"] },
     { "from": "hub", "to": "client", "messages": ["demo.guild.Renamed"] }
   ],
-  "hubs": ["demo.guild.Guild"]
+  "hubs": ["demo.guild.Guild"],
+  "components": [
+    "demo.world.Dead",
+    "demo.world.Hidden",
+    "demo.world.Inventory",
+    "demo.world.Stats",
+    "demo.world.Brain"
+  ],
+  "client_components": 4,
+  "audiences": ["demo.world.Faction"]
 }
 ```
 
@@ -52,6 +61,13 @@ integers, not as doubles.
   `i + 1`. Hub kinds share their role's pairs, as `client -> hub`.
 - `hubs`: qualified hub kind names in [id](wire-format.md#hub-kind-ids)
   order. The kind at index `i` has id `i + 1`.
+- `components`: qualified component and tag names in
+  [id](wire-format.md#component-ids) order. The one at index `i` has id
+  `i + 1`. Those clients see come first: `client_components` counts them,
+  so they take ids `1` to `client_components`.
+- `audiences`: qualified audience names in
+  [id](wire-format.md#audience-ids) order. The audience at index `i` has
+  id `i + 1`.
 
 ## Namespace files
 
@@ -69,7 +85,10 @@ integers, not as doubles.
 - `path`: its qualified name, as in `foo.bar.MyResponse.Result`, which is how
   other declarations refer to it
 - `parent`: the `path` of the declaration it is nested in, or `null`
-- `kind`: `enum`, `struct`, `message`, `union`, `type`, or `hub`
+- `client`: whether code for clients holds it. See
+  [Client declarations](#client-declarations)
+- `kind`: `enum`, `struct`, `message`, `union`, `type`, `hub`, `audience`,
+  `component`, or `tag`
 
 ### Enums
 
@@ -197,6 +216,113 @@ the wire, and a `kind`:
 A `type` is encoded as its `target`, which is a scalar, or a `named` enum or
 `type`.
 
+### Audiences
+
+```json
+{
+  "kind": "audience",
+  "id": 1,
+  "key": { "kind": "named", "path": "demo.world.FactionId", "constraints": {}, "wire": { ... } }
+}
+```
+
+An [audience](schema.md#audiences) has its `id`, from 1 as in `audiences`
+in `schema.json`, and its `key`, a [type](#types) as a field's is.
+
+### Components
+
+```json
+{
+  "kind": "component",
+  "id": 4,
+  "visibility": "public",
+  "audience": null,
+  "halo": true,
+  "replicate": "patch",
+  "ops": null,
+  "layout": { ... },
+  "fields": [ ... ],
+  "patch": {
+    "layout": {
+      "size": { "kind": "var", "max": 33 },
+      "bitmap": 1,
+      "boundaries": 1,
+      "boundary": 1,
+      "head": 2,
+      "vars": 2
+    },
+    "fields": [
+      { "name": "alive", "dirty": 0, "some": null, "value": { "kind": "bit", "bit": 5 } },
+      { "name": "hp", "dirty": 1, "some": null, "value": { "kind": "packed" } },
+      { "name": "level", "dirty": 2, "some": 6, "value": { "kind": "packed" } },
+      { "name": "title", "dirty": 3, "some": 7, "value": { "kind": "var", "slot": 0 } },
+      { "name": "name", "dirty": 4, "some": null, "value": { "kind": "var", "slot": 1 } }
+    ]
+  }
+}
+```
+
+A [component](schema.md#components) has:
+
+- `id`: its [id](wire-format.md#component-ids), shared with tags, as in
+  `components` in `schema.json`.
+- `visibility`: which clients receive it: `public`, `owner`, `none`, or
+  `audience`.
+- `audience`: the qualified name of the audience when `visibility` is
+  `audience`, otherwise `null`.
+- `halo`: whether neighbor sim shards replicating its cell receive it,
+  defaults applied.
+- `replicate`: what its delta sends: `replace`, `patch`, or `ops`.
+- `ops`: the qualified name of its op union when `replicate` is `ops`,
+  otherwise `null`.
+- `layout` and `fields`: its full encoding, exactly a struct's.
+- `patch`: its [patch](wire-format.md#patches) when `replicate` is
+  `patch`, otherwise `null`.
+
+A patch's `layout` has the keys of an object's. `fields` lists where each
+field sits in the patch, in declaration order, by `name`, as in the
+component's `fields`:
+
+- `dirty`: its dirty bit, set when it is sent.
+- `some`: for an `option` field, its bit set when it is sent as `Some`,
+  otherwise `null`.
+- `value`: where its value sits when sent:
+
+| `kind` | Other keys | Value |
+|---|---|---|
+| `bit` | `bit` | A `bool` or a `type` over one, stored as this bit |
+| `packed` | | A fixed-size value. Values are packed back to back after the head, in declaration order |
+| `var` | `slot` | A variable-size value in this var slot, empty when there is no value |
+
+### Tags
+
+```json
+{ "kind": "tag", "id": 2, "visibility": "audience", "audience": "demo.world.Faction", "halo": true }
+```
+
+A [tag](schema.md#tags) has its `id`, `visibility`, `audience`, and `halo`,
+as a component does. It has no value, so no layout.
+
+### Client declarations
+
+`client` is `true` for what the client
+[fingerprint](wire-format.md#fingerprint) lists, which is what code for
+clients holds: every message with a client end, every component and tag
+whose `visibility` is not `none`, every audience, and every declaration they
+reach. Every other declaration is `false`, such as a `visibility=none`
+component and the types only it reaches, so clients never learn their
+shapes.
+
+A `true` declaration can be nested in a `false` one, such as a struct in a
+`visibility=none` component that a public component names, or any const,
+since every const is `true`. Its `path` still names its parent, so code for
+clients places it under that path and leaves the parent's body out. Hiding a
+sensitive name is the schema author's job.
+
+A hub kind that a client message names is `true`, but clients know only its
+`id`, `key`, and name. Its `fields` and `layout` are servers' only, and the
+types only they reach are `false`.
+
 ### Types
 
 A type is a tree:
@@ -262,17 +388,20 @@ bounds it.
 ### Consts
 
 `consts` lists the namespace's consts, nested ones included, with `name`,
-`path`, and `parent` as for declarations:
+`path`, `parent`, and `client` as for declarations:
 
 ```json
 {
   "name": "MaxAddresses",
   "path": "foo.bar.MyRequest.MaxAddresses",
   "parent": "foo.bar.MyRequest",
+  "client": true,
   "type": "u8",
   "value": 14
 }
 ```
+
+`client` is always `true`, since both fingerprints list every const.
 
 `type` is an integer type, `f32`, `f64`, `bool`, `string`, `duration`, or
 `timestamp`, and `value` is the matching JSON value. A float keeps the value

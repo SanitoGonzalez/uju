@@ -1,15 +1,17 @@
 //! Emits the compiled IR as JSON (`ujuc protocol ir`), with the wire layout
 //! of every declaration, for generators written outside `ujuc`. Each
-//! namespace gets `namespaces/<name>.json`; the fingerprints and the message
-//! and hub kind id orders, which change with any message or kind, live in
-//! `schema.json`.
+//! namespace gets `namespaces/<name>.json`; the fingerprints and the id
+//! orders of messages, hub kinds, components and audiences, which change
+//! with any of them, live in `schema.json`.
 //! `docs/protocol/ir.md` describes the format.
 
 use crate::backend::{self, Backend, Error, GeneratedFile};
-use crate::ir::wire::{Int, Layout, Sequence, Size, Slot, UnionLayout, Width, Wire};
+use crate::ir::wire::{
+    Int, Layout, PatchLayout, PatchValue, Sequence, Size, Slot, UnionLayout, Width, Wire,
+};
 use crate::ir::{
-    self, ConstId, ConstValue, Constraints, DefKind, Field, NamespaceId, Number, Type, TypeId,
-    TypeKind, VariantData,
+    self, ConstId, ConstValue, Constraints, DefKind, Field, NamespaceId, Number, Replicate, Type,
+    TypeId, TypeKind, VariantData, Visibility,
 };
 
 /// The file holding what spans namespaces. Namespace files sit in their own
@@ -52,7 +54,8 @@ fn root(schema: &ir::Schema, wire: &Wire) -> String {
     }
     json.end(']');
 
-    // Index `i` of a list holds the message, or hub kind, with id `i + 1`.
+    // Index `i` of a list holds the message, hub kind, component or
+    // audience with id `i + 1`.
     let names = |json: &mut Json, ids: &[TypeId]| {
         json.begin('[');
         for id in ids {
@@ -75,6 +78,11 @@ fn root(schema: &ir::Schema, wire: &Wire) -> String {
     json.end(']');
     json.key("hubs");
     names(&mut json, wire.hubs());
+    json.key("components");
+    names(&mut json, wire.components());
+    json.entry_num("client_components", wire.client_components().len());
+    json.key("audiences");
+    names(&mut json, wire.audiences());
 
     json.end('}');
     json.finish()
@@ -88,12 +96,7 @@ fn namespace(schema: &ir::Schema, wire: &Wire, id: NamespaceId, name: &str) -> S
     json.key("defs");
     json.begin('[');
     for (index, def) in schema.defs.iter().enumerate() {
-        // Step 4 of the components plan writes these.
-        let later = matches!(
-            def.kind,
-            DefKind::Audience(_) | DefKind::Component(_) | DefKind::Tag(_)
-        );
-        if def.namespace == id && !later {
+        if def.namespace == id {
             json.item();
             def_json(&mut json, schema, wire, TypeId(index));
         }
@@ -123,6 +126,7 @@ fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
         Some(parent) => json.entry("parent", &schema.qualified(parent)),
         None => json.entry_null("parent"),
     }
+    json.entry_bool("client", wire.client(id));
 
     match &def.kind {
         DefKind::Enum(item) => {
@@ -218,8 +222,42 @@ fn def_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId) {
             json.key("target");
             type_json(json, schema, wire, &item.target);
         }
-        DefKind::Audience(_) | DefKind::Component(_) | DefKind::Tag(_) => {
-            unreachable!("not written yet")
+        DefKind::Audience(item) => {
+            json.entry("kind", "audience");
+            let audience = wire.audience_id(id).expect("an audience has an id");
+            json.entry_num("id", audience);
+            json.key("key");
+            type_json(json, schema, wire, &item.key);
+        }
+        DefKind::Component(item) => {
+            json.entry("kind", "component");
+            let component = wire.component_id(id).expect("a component has an id");
+            json.entry_num("id", component);
+            visibility_json(json, schema, item.visibility, item.halo);
+            let (replicate, ops) = match item.replicate {
+                Replicate::Replace => ("replace", None),
+                Replicate::Patch => ("patch", None),
+                Replicate::Ops(op) => ("ops", Some(op)),
+            };
+            json.entry("replicate", replicate);
+            match ops {
+                Some(op) => json.entry("ops", &schema.qualified(op)),
+                None => json.entry_null("ops"),
+            }
+            object_json(json, schema, wire, id, &item.fields);
+            match wire.patch(id) {
+                Some(patch) => {
+                    json.key("patch");
+                    patch_json(json, patch, &item.fields);
+                }
+                None => json.entry_null("patch"),
+            }
+        }
+        DefKind::Tag(item) => {
+            json.entry("kind", "tag");
+            let tag = wire.component_id(id).expect("a tag has a component id");
+            json.entry_num("id", tag);
+            visibility_json(json, schema, item.visibility, item.halo);
         }
     }
 
@@ -235,6 +273,8 @@ fn const_json(json: &mut Json, schema: &ir::Schema, id: ConstId) {
         Some(parent) => json.entry("parent", &schema.qualified(parent)),
         None => json.entry_null("parent"),
     }
+    // Every const is in both fingerprints.
+    json.entry_bool("client", true);
     json.entry("type", kind_name(&item.ty));
     match &item.value {
         ConstValue::Int(value) => json.entry_num("value", value),
@@ -250,7 +290,66 @@ fn const_json(json: &mut Json, schema: &ir::Schema, id: ConstId) {
     json.end('}');
 }
 
-/// The layout and fields of a struct, message, or hub kind.
+/// A component's or tag's `visibility`, the `audience` it names, and
+/// `halo`.
+fn visibility_json(json: &mut Json, schema: &ir::Schema, visibility: Visibility, halo: bool) {
+    let (name, audience) = match visibility {
+        Visibility::Public => ("public", None),
+        Visibility::Owner => ("owner", None),
+        Visibility::None => ("none", None),
+        Visibility::Audience(audience) => ("audience", Some(audience)),
+    };
+    json.entry("visibility", name);
+    match audience {
+        Some(audience) => json.entry("audience", &schema.qualified(audience)),
+        None => json.entry_null("audience"),
+    }
+    json.entry_bool("halo", halo);
+}
+
+/// A component's patch: its layout, and where each field sits in it.
+fn patch_json(json: &mut Json, patch: &PatchLayout, fields: &[Field]) {
+    json.begin('{');
+    json.key("layout");
+    json.begin('{');
+    json.key("size");
+    size_json(json, patch.size);
+    json.entry_num("bitmap", patch.bitmap);
+    json.entry_num("boundaries", patch.boundaries);
+    json.entry_width("boundary", patch.boundary);
+    json.entry_num("head", patch.head);
+    json.entry_num("vars", patch.vars);
+    json.end('}');
+
+    json.key("fields");
+    json.begin('[');
+    for (field, slot) in fields.iter().zip(&patch.fields) {
+        json.item();
+        json.begin('{');
+        json.entry("name", &field.name);
+        json.entry_num("dirty", slot.dirty);
+        json.entry_opt_num("some", slot.some);
+        json.key("value");
+        json.begin('{');
+        match slot.value {
+            PatchValue::Bit(bit) => {
+                json.entry("kind", "bit");
+                json.entry_num("bit", bit);
+            }
+            PatchValue::Packed => json.entry("kind", "packed"),
+            PatchValue::Var(slot) => {
+                json.entry("kind", "var");
+                json.entry_num("slot", slot);
+            }
+        }
+        json.end('}');
+        json.end('}');
+    }
+    json.end(']');
+    json.end('}');
+}
+
+/// The layout and fields of a struct, message, hub kind, or component.
 fn object_json(json: &mut Json, schema: &ir::Schema, wire: &Wire, id: TypeId, fields: &[Field]) {
     fields_json(json, schema, wire, wire.layout(id), fields);
 }
@@ -746,6 +845,283 @@ mod tests {
     }
 
     #[test]
+    fn the_root_lists_components_and_audiences_in_id_order() {
+        let files = generated(&[
+            "namespace b\ntag Dead\naudience Stealth: u8\n",
+            concat!(
+                "namespace a\n",
+                "audience Faction: u8\n",
+                "@visibility(none) component Brain { x: u8 }\n",
+                "@visibility(Faction) component Health { hp: u32 }\n",
+                "@visibility(none) tag Marked\n",
+            ),
+        ]);
+        let root = file(&files, "schema.json");
+        assert_eq!(
+            root["components"],
+            json!(["a.Health", "b.Dead", "a.Brain", "a.Marked"])
+        );
+        assert_eq!(root["client_components"], 2);
+        assert_eq!(root["audiences"], json!(["a.Faction", "b.Stealth"]));
+
+        let files = generated(&["namespace a\nstruct S {}\n"]);
+        let root = file(&files, "schema.json");
+        assert_eq!(root["components"], json!([]));
+        assert_eq!(root["client_components"], 0);
+        assert_eq!(root["audiences"], json!([]));
+    }
+
+    #[test]
+    fn audiences_carry_their_id_and_key() {
+        let sources = [concat!(
+            "namespace a\n",
+            "type FactionId = u16\n",
+            "audience Stealth: u8[max=3]\n",
+            "audience Faction: FactionId\n",
+        )];
+        let faction = def(&sources, "a.Faction");
+        assert_eq!(
+            faction,
+            json!({
+                "name": "Faction",
+                "path": "a.Faction",
+                "parent": null,
+                "client": true,
+                "kind": "audience",
+                "id": 1,
+                "key": {
+                    "kind": "named",
+                    "path": "a.FactionId",
+                    "constraints": {},
+                    "wire": {"size": {"kind": "fixed", "bytes": 2}},
+                },
+            })
+        );
+        let stealth = def(&sources, "a.Stealth");
+        assert_eq!(stealth["id"], 2);
+        assert_eq!(stealth["key"]["kind"], "u8");
+        assert_eq!(stealth["key"]["constraints"], json!({"max": 3}));
+    }
+
+    #[test]
+    fn components_carry_their_id_visibility_and_halo() {
+        let sources = [concat!(
+            "namespace a\n",
+            "audience Faction: u8\n",
+            "component Health { hp: u32 }\n",
+            "@visibility(owner) @halo(false) component Mana { mp: u32 }\n",
+            "@visibility(none) component Brain { x: u8 }\n",
+            "@visibility(none) @halo(true) component Aggro { x: u8 }\n",
+            "@visibility(Faction) component Chatter { x: u8 }\n",
+            "struct S { hp: u32 }\n",
+        )];
+        let visibility = |name: &str| {
+            let def = def(&sources, &format!("a.{name}"));
+            assert_eq!(def["kind"], "component");
+            (
+                def["id"].clone(),
+                def["visibility"].clone(),
+                def["audience"].clone(),
+                def["halo"].clone(),
+            )
+        };
+        assert_eq!(
+            visibility("Health"),
+            (json!(2), json!("public"), Value::Null, json!(true))
+        );
+        assert_eq!(
+            visibility("Mana"),
+            (json!(3), json!("owner"), Value::Null, json!(false))
+        );
+        assert_eq!(
+            visibility("Brain"),
+            (json!(5), json!("none"), Value::Null, json!(false))
+        );
+        assert_eq!(
+            visibility("Aggro"),
+            (json!(4), json!("none"), Value::Null, json!(true))
+        );
+        assert_eq!(
+            visibility("Chatter"),
+            (json!(1), json!("audience"), json!("a.Faction"), json!(true))
+        );
+
+        // Full encoding exactly as a struct's.
+        let health = def(&sources, "a.Health");
+        let s = def(&sources, "a.S");
+        assert_eq!(health["layout"], s["layout"]);
+        assert_eq!(health["fields"], s["fields"]);
+    }
+
+    #[test]
+    fn components_carry_their_replication_mode() {
+        let sources = [concat!(
+            "namespace a\n",
+            "union Op { Add(u8), Clear }\n",
+            "component Health { hp: u32 }\n",
+            "@replicate(ops(Op)) component Inventory { items: vec<u8> }\n",
+            "@replicate(patch)\n",
+            "component Stats {\n",
+            "    alive: bool,\n",
+            "    hp: u16,\n",
+            "    level: option<u8>,\n",
+            "    title: option<string[max_length=16]>,\n",
+            "    name: string[max_length=12],\n",
+            "}\n",
+        )];
+        let health = def(&sources, "a.Health");
+        assert_eq!(health["replicate"], "replace");
+        assert_eq!(health["ops"], Value::Null);
+        assert_eq!(health["patch"], Value::Null);
+
+        let inventory = def(&sources, "a.Inventory");
+        assert_eq!(inventory["replicate"], "ops");
+        assert_eq!(inventory["ops"], "a.Op");
+        assert_eq!(inventory["patch"], Value::Null);
+
+        // The example of `wire-format.md#patches`.
+        let stats = def(&sources, "a.Stats");
+        assert_eq!(stats["replicate"], "patch");
+        assert_eq!(stats["ops"], Value::Null);
+        assert_eq!(
+            stats["patch"],
+            json!({
+                "layout": {
+                    "size": {"kind": "var", "max": 33},
+                    "bitmap": 1,
+                    "boundaries": 1,
+                    "boundary": 1,
+                    "head": 2,
+                    "vars": 2,
+                },
+                "fields": [
+                    {"name": "alive", "dirty": 0, "some": null, "value": {"kind": "bit", "bit": 5}},
+                    {"name": "hp", "dirty": 1, "some": null, "value": {"kind": "packed"}},
+                    {"name": "level", "dirty": 2, "some": 6, "value": {"kind": "packed"}},
+                    {"name": "title", "dirty": 3, "some": 7, "value": {"kind": "var", "slot": 0}},
+                    {"name": "name", "dirty": 4, "some": null, "value": {"kind": "var", "slot": 1}},
+                ],
+            })
+        );
+        // The full encoding stays the object layout.
+        assert_eq!(stats["layout"]["head"], 4);
+        assert_eq!(
+            field(&stats, "title")["slot"],
+            json!({"kind": "var", "slot": 0, "presence": 2})
+        );
+    }
+
+    #[test]
+    fn tags_carry_their_id_visibility_and_halo() {
+        let sources = [concat!(
+            "namespace a\n",
+            "audience Stealth: u8\n",
+            "tag Dead\n",
+            "@visibility(Stealth) tag Hidden\n",
+            "@visibility(none) tag Marked\n",
+            "component Health { hp: u32 }\n",
+        )];
+        assert_eq!(
+            def(&sources, "a.Dead"),
+            json!({
+                "name": "Dead",
+                "path": "a.Dead",
+                "parent": null,
+                "client": true,
+                "kind": "tag",
+                "id": 1,
+                "visibility": "public",
+                "audience": null,
+                "halo": true,
+            })
+        );
+        let hidden = def(&sources, "a.Hidden");
+        assert_eq!(hidden["id"], 3);
+        assert_eq!(hidden["visibility"], "audience");
+        assert_eq!(hidden["audience"], "a.Stealth");
+        let marked = def(&sources, "a.Marked");
+        assert_eq!(marked["id"], 4);
+        assert_eq!(marked["visibility"], "none");
+        assert_eq!(marked["halo"], false);
+        assert_eq!(marked["client"], false);
+    }
+
+    #[test]
+    fn declarations_nested_in_a_component_name_it() {
+        let files = generated(&[concat!(
+            "namespace a\n",
+            "component C { mood: Mood, enum Mood: u8 { Calm } }\n",
+        )]);
+        let namespace = file(&files, "namespaces/a.json");
+        let paths: Vec<&Value> = namespace["defs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|def| &def["path"])
+            .collect();
+        assert_eq!(paths, [&json!("a.C"), &json!("a.C.Mood")]);
+        assert_eq!(namespace["defs"][1]["parent"], "a.C");
+    }
+
+    #[test]
+    fn declarations_say_whether_clients_see_them() {
+        let sources = [concat!(
+            "namespace a\n",
+            "struct Pos { x: f32 }\n",
+            "struct Secret { x: u8 }\n",
+            "struct State { x: u8 }\n",
+            "struct Internal { x: u8 }\n",
+            "audience Unused: u8\n",
+            "union Op { Add(u8) }\n",
+            "component Body { pos: Pos, shared: Brain.Shared }\n",
+            "@replicate(ops(Op)) @visibility(owner) component Bag { items: vec<u8> }\n",
+            "@visibility(none) component Brain {\n",
+            "    secret: Secret,\n",
+            "    enum Mood: u8 { Calm }\n",
+            "    struct Shared { x: u8 }\n",
+            "}\n",
+            "hub(u64) Guild { state: State }\n",
+            "message(client -> hub<Guild>) Join {}\n",
+            "message(sim -> hub<Guild>) Sync { internal: Internal }\n",
+        )];
+        let files = generated(&sources);
+        let namespace = file(&files, "namespaces/a.json");
+        let client: Vec<(String, bool)> = namespace["defs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|def| {
+                let path = def["path"].as_str().unwrap().to_string();
+                (path, def["client"].as_bool().unwrap())
+            })
+            .collect();
+        let expected = [
+            ("a.Pos", true),
+            ("a.Secret", false),
+            // A hub kind's fields are not listed for clients.
+            ("a.State", false),
+            ("a.Internal", false),
+            ("a.Unused", true),
+            ("a.Op", true),
+            ("a.Body", true),
+            ("a.Bag", true),
+            ("a.Brain", false),
+            ("a.Brain.Mood", false),
+            // Clients reach it, so they see it under its parent's path.
+            ("a.Brain.Shared", true),
+            // By key and name only.
+            ("a.Guild", true),
+            ("a.Join", true),
+            ("a.Sync", false),
+        ];
+        let expected: Vec<(String, bool)> = expected
+            .iter()
+            .map(|(path, client)| (path.to_string(), *client))
+            .collect();
+        assert_eq!(client, expected);
+    }
+
+    #[test]
     fn a_namespace_named_like_the_root_does_not_collide() {
         let files = generated(&["namespace schema\nstruct S {}\n"]);
         assert_eq!(files[0].path.to_str(), Some("schema.json"));
@@ -783,14 +1159,14 @@ mod tests {
         assert_eq!(
             namespace["consts"],
             json!([
-                {"name": "Count", "path": "a.Count", "parent": null, "type": "u64", "value": u64::MAX},
-                {"name": "Low", "path": "a.Low", "parent": null, "type": "i8", "value": -128},
-                {"name": "Whole", "path": "a.Whole", "parent": null, "type": "f32", "value": 2.0},
-                {"name": "On", "path": "a.On", "parent": null, "type": "bool", "value": true},
-                {"name": "Text", "path": "a.Text", "parent": null, "type": "string", "value": "say \"hi\"\n"},
-                {"name": "Delay", "path": "a.Delay", "parent": null, "type": "duration", "value": 30_000_000},
-                {"name": "Start", "path": "a.Start", "parent": null, "type": "timestamp", "value": 1_794_052_800_000_000u64},
-                {"name": "Inner", "path": "a.M.Inner", "parent": "a.M", "type": "u16", "value": 7},
+                {"name": "Count", "path": "a.Count", "parent": null, "client": true, "type": "u64", "value": u64::MAX},
+                {"name": "Low", "path": "a.Low", "parent": null, "client": true, "type": "i8", "value": -128},
+                {"name": "Whole", "path": "a.Whole", "parent": null, "client": true, "type": "f32", "value": 2.0},
+                {"name": "On", "path": "a.On", "parent": null, "client": true, "type": "bool", "value": true},
+                {"name": "Text", "path": "a.Text", "parent": null, "client": true, "type": "string", "value": "say \"hi\"\n"},
+                {"name": "Delay", "path": "a.Delay", "parent": null, "client": true, "type": "duration", "value": 30_000_000},
+                {"name": "Start", "path": "a.Start", "parent": null, "client": true, "type": "timestamp", "value": 1_794_052_800_000_000u64},
+                {"name": "Inner", "path": "a.M.Inner", "parent": "a.M", "client": true, "type": "u16", "value": 7},
             ])
         );
         assert!(files[1].contents.contains(r#""value": 2.0"#));

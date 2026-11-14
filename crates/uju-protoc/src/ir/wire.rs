@@ -9,7 +9,7 @@ mod layout;
 
 use crate::ir::{Role, Schema, Type, TypeId};
 
-use fingerprint::{Scope, canonical, fnv1a};
+use fingerprint::{Scope, canonical, client_listed, fnv1a};
 use ids::Ids;
 pub use ids::Space;
 pub use layout::{
@@ -54,6 +54,8 @@ pub struct Wire {
     layouts: Layouts,
     ids: Ids,
     fingerprints: Fingerprints,
+    /// Indexed by [`TypeId`]: whether the client fingerprint lists it.
+    client: Vec<bool>,
 }
 
 impl Wire {
@@ -71,6 +73,7 @@ impl Wire {
                 client: fnv1a(canonical(schema, Scope::Client).as_bytes()),
                 internal: fnv1a(canonical(schema, Scope::Internal).as_bytes()),
             },
+            client: client_listed(schema),
         })
     }
 
@@ -182,6 +185,13 @@ impl Wire {
     /// Hashes of what peers must agree on, names included.
     pub fn fingerprints(&self) -> Fingerprints {
         self.fingerprints
+    }
+
+    /// Whether the client fingerprint lists declaration `id`, so code for
+    /// clients holds it. A hub kind is listed by its key and name only,
+    /// and its fields are not.
+    pub fn client(&self, id: TypeId) -> bool {
+        self.client[id.0]
     }
 }
 
