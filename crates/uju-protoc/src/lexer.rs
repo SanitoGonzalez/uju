@@ -96,6 +96,9 @@ pub enum Token<'src> {
 
     /// `2026-11-07T12:00:00Z`, with an optional 3- or 6-digit fraction of a
     /// second: microseconds since the Unix epoch.
+    // Each `#[regex]` sets its own `priority`, which clippy takes for one
+    // attribute repeated.
+    #[allow(clippy::duplicated_attributes)]
     #[regex(
         r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{3}|\.[0-9]{6})?Z",
         timestamp,
