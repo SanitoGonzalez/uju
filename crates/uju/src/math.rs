@@ -20,7 +20,7 @@ pub struct Degrees(f32);
 
 impl From<Radians> for Degrees {
     fn from(radians: Radians) -> Self {
-        Self(radians.0 / 180.0 * PI)
+        Self(radians.0 * 180.0 / PI)
     }
 }
 
