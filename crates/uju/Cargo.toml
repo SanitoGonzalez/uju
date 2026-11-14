@@ -8,6 +8,7 @@ default = ["3d"]
 
 2d = ["dep:parry2d"]
 3d = ["dep:parry3d"]
+3d-yaw = ["3d"]
 
 [dependencies]
 uju-macros = { path = "../uju-macros" }

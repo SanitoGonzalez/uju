@@ -7,10 +7,11 @@ pub use parry2d::glamx::Vec2 as Vector;
 #[cfg(feature = "3d")]
 pub use parry3d::glamx::Vec3 as Vector;
 
-/// A rotation: an angle in 2D, a quaternion in 3D
-#[cfg(feature = "2d")]
+/// A rotation: an angle in 2D, a yaw around the Y axis with `3d-yaw`, a
+/// quaternion otherwise in 3D
+#[cfg(any(feature = "2d", feature = "3d-yaw"))]
 pub type Rotation = Radians;
-#[cfg(feature = "3d")]
+#[cfg(all(feature = "3d", not(feature = "3d-yaw")))]
 pub use parry3d::glamx::Quat as Rotation;
 
 /// A radian angle
