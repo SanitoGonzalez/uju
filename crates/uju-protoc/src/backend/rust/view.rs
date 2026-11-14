@@ -609,11 +609,16 @@ impl Generator<'_> {
         checked
     }
 
-    /// Reads bit `bit` of `b` as `ty`, a `bool` or a `type` over one.
+    /// Reads bit `bit` of `b` as `ty`, a `bool` or a `type` over one. A
+    /// mapped `type` inside another is converted to the foreign type the
+    /// outer one holds.
     pub(super) fn bit(&self, ty: &Type, bit: u32, module: &[String]) -> String {
         let mut read = format!("__w::bit(b, {bit})");
-        for path in self.newtypes(ty, module).iter().rev() {
-            read = format!("{path}({read})");
+        for (depth, id) in self.newtypes(ty).into_iter().enumerate().rev() {
+            read = format!("{}({read})", self.generated_path(id, module));
+            if depth > 0 && self.foreign(id).is_some() {
+                read = self.to_foreign(id, module, &read);
+            }
         }
         read
     }
@@ -687,9 +692,9 @@ impl Generator<'_> {
         for field in object.fields {
             let read = format!("{receiver}.{}()", accessor(&field.name));
             let owned = if field.optional {
-                optional(&read, &self.owned_from(&field.ty, "v"))
+                optional(&read, &self.owned_from(&field.ty, "v", object.module))
             } else {
-                self.owned_from(&field.ty, &read)
+                self.owned_from(&field.ty, &read, object.module)
             };
             lines.push(format!("{}: {owned},", ident(&field.name)));
         }
@@ -812,7 +817,7 @@ impl Generator<'_> {
                 VariantData::Unit => out.line(format!("Self::{variant_name} => {owned},")),
                 VariantData::Type(ty) => out.line(format!(
                     "Self::{variant_name}(v) => {owned}({}),",
-                    self.owned_from(ty, "v")
+                    self.owned_from(ty, "v", module)
                 )),
                 VariantData::Fields(fields) => {
                     let object = self.variant_object(id, index, fields, module);

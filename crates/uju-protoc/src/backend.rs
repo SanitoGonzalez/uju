@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::backend::ir::Ir;
 use crate::backend::rust::{Rust, RustDispatch};
+use crate::config::Config;
 use crate::ir::wire::Wire;
 use crate::ir::{Role, Schema};
 
@@ -24,6 +25,9 @@ pub struct Options {
     /// Generate only this role, which encodes the messages it sends and
     /// decodes the ones it receives. `None` generates every role.
     pub role: Option<Role>,
+    /// The options read from `ujuc.toml`. The `ir` backend ignores them:
+    /// none is part of the protocol.
+    pub config: Config,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +88,10 @@ pub(crate) fn wire(schema: &Schema) -> Result<Wire, Error> {
 pub fn protocol(name: &str, options: &Options) -> Option<Box<dyn Backend>> {
     match name {
         "ir" => Some(Box::new(Ir)),
-        "rust" => Some(Box::new(Rust { role: options.role })),
+        "rust" => Some(Box::new(Rust {
+            role: options.role,
+            map: options.config.rust.map.clone(),
+        })),
         _ => None,
     }
 }

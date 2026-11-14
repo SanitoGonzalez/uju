@@ -1,7 +1,7 @@
 # Schema
 
-> **Status.** Only attributes, naming, consts, types, unions, messages, hub
-> kinds, and components are written up here. Until
+> **Status.** Only attributes, naming, consts, types, unions, foreign types,
+> messages, hub kinds, and components are written up here. Until
 > the rest of the language is, `crates/uju-protoc/tests/data/example1.uju`
 > shows every declaration kind, type and constraint.
 
@@ -290,6 +290,69 @@ of fields variants go in a module named after the union, as
 `type` and `union` are keywords only where a declaration starts, as `true`
 and `false` are only literals where a value is expected. They stay usable
 as names, so `type: u8` is still a valid field.
+
+## Foreign types
+
+A backend can store a type of the user's in place of a declaration's owned
+type, such as `::glam::Vec3` in place of a struct `uju.math.Vec3`. The
+schema still fixes the wire layout: the foreign type converts to the
+generated one to encode, and from it after decoding.
+
+Mappings go in `ujuc.toml`, which holds `ujuc`'s options:
+
+```toml
+[rust.map]
+"uju.math.Vec3" = "::glam::Vec3"
+"demo.party.PartyId" = "crate::party::PartyId"
+```
+
+- `ujuc` reads `./ujuc.toml` when it exists. `--config <PATH>`, on both
+  `ujuc protocol` and `ujuc dispatch`, reads another file instead, which
+  must exist.
+- `[rust.map]` maps a declaration's qualified path to a Rust type path. A
+  nested declaration is named by its full path, as `demo.guild.Guild.Rank`.
+- Only a struct, an enum, a union or a `type` can be mapped. Mapping a
+  message, a hub kind, a component, a tag or an audience is an error, and so
+  is a path the schema doesn't declare.
+- An unknown section or key, an empty path or an empty type is an error.
+- Mappings are not part of the protocol. Ids, the
+  [fingerprints](wire-format.md#fingerprint) and the [IR JSON](ir.md) stay
+  the same, and each binary may map differently. Keeping them consistent is
+  the user's job.
+
+The Rust backend still emits the mapped declaration's owned type and view.
+Everything else that names the owned type stores the foreign one instead:
+fields, the items and keys of `option`, `vec`, `set`, `map` and `array`,
+union variants, `type` targets, and the `Key` of `HubKind` and `ToHub`.
+Views still read the generated types. The user writes `From` both ways:
+
+```rust
+// `Vec3` is the generated type of `uju.math.Vec3`.
+impl From<Vec3> for glam::Vec3 {
+    fn from(v: Vec3) -> Self {
+        glam::Vec3::new(v.x, v.y, v.z)
+    }
+}
+
+impl From<glam::Vec3> for Vec3 {
+    fn from(v: glam::Vec3) -> Self {
+        Vec3 { x: v.x, y: v.y, z: v.z }
+    }
+}
+```
+
+- The generated type is local to the user's crate, so orphan rules allow
+  both impls.
+- Decoding builds the generated type and converts it. Encoding clones the
+  foreign value and converts it every time, and a variable-size type
+  converts twice, once to measure and once to write. Mappings suit small
+  types, such as vectors and ids.
+- The types holding a foreign type derive what the generated one does, so
+  the foreign type implements those traits too: `Debug`, `Clone` and
+  `PartialEq`, then `Copy`, `Default`, `Eq` and `Hash` where the generated
+  type derives them, and `PartialOrd` and `Ord` when a `type` holds it. A
+  set item or a map key needs `Eq` and `Hash`. rustc reports what is
+  missing.
 
 ## Messages
 

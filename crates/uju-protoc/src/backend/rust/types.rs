@@ -43,18 +43,50 @@ impl Generator<'_> {
         }
     }
 
-    /// The `type`s `ty` names in turn before its scalar, outermost first, as
-    /// seen from `module`; empty when `ty` names none.
-    pub(super) fn newtypes(&self, ty: &Type, module: &[String]) -> Vec<String> {
-        let mut paths = Vec::new();
+    /// The `type`s `ty` names in turn before its scalar, outermost first;
+    /// empty when `ty` names none.
+    pub(super) fn newtypes(&self, ty: &Type) -> Vec<TypeId> {
+        let mut ids = Vec::new();
         let mut ty = ty;
         while let TypeKind::Named(id) = ty.kind
             && let DefKind::Type(item) = &self.schema.def(id).kind
         {
-            paths.push(self.path(id, module, &self.names[id.0]));
+            ids.push(id);
             ty = &item.target;
         }
-        paths
+        ids
+    }
+
+    /// The generated owned type of declaration `id`, as seen from `module`,
+    /// whether or not a foreign type is stored in its place.
+    pub(super) fn generated_path(&self, id: TypeId, module: &[String]) -> String {
+        self.path(id, module, &self.names[id.0])
+    }
+
+    /// The foreign type `ujuc.toml` maps in place of declaration `id`.
+    pub(super) fn foreign(&self, id: TypeId) -> Option<&str> {
+        self.foreign[id.0].as_deref()
+    }
+
+    /// `e`, a value of `id`'s generated type, as the foreign type stored in
+    /// its place, through the user's `From`.
+    pub(super) fn to_foreign(&self, id: TypeId, module: &[String], e: &str) -> String {
+        let foreign = self.foreign(id).expect("a mapped declaration");
+        format!(
+            "<{foreign} as ::core::convert::From<{}>>::from({e})",
+            self.generated_path(id, module)
+        )
+    }
+
+    /// `v`, a reference to the foreign type stored in place of `id`, as a
+    /// value of `id`'s generated type: cloned, then converted through the
+    /// user's `From`. Naming the `Clone` impl lets `v` be a `&&T` too.
+    pub(super) fn to_generated(&self, id: TypeId, module: &[String], v: &str) -> String {
+        let foreign = self.foreign(id).expect("a mapped declaration");
+        format!(
+            "<{} as ::core::convert::From<{foreign}>>::from(<{foreign} as ::core::clone::Clone>::clone({v}))",
+            self.generated_path(id, module)
+        )
     }
 
     pub(super) fn fixed_size(&self, ty: &Type) -> u32 {
@@ -97,7 +129,10 @@ impl Generator<'_> {
                 self.owned(key, module),
                 self.owned(value, module)
             ),
-            TypeKind::Named(id) => self.path(*id, module, &self.names[id.0]),
+            TypeKind::Named(id) => match self.foreign(*id) {
+                Some(foreign) => foreign.to_string(),
+                None => self.generated_path(*id, module),
+            },
             _ => unreachable!("integers are handled above"),
         }
     }
@@ -210,8 +245,9 @@ impl Generator<'_> {
         }
     }
 
-    /// Converts `e`, a value read in place as `ty`, to the owned type.
-    pub(super) fn owned_from(&self, ty: &Type, e: &str) -> String {
+    /// Converts `e`, a value read in place as `ty`, to the owned type, as
+    /// seen from `module`.
+    pub(super) fn owned_from(&self, ty: &Type, e: &str, module: &[String]) -> String {
         match &ty.kind {
             TypeKind::String => format!("{STRING}::from({e})"),
             TypeKind::Bytes => match ty.constraints.fixed_length() {
@@ -222,7 +258,7 @@ impl Generator<'_> {
                 if is_raw_byte(item) || IntInfo::of(item).is_some_and(|int| int.rust == "i8") {
                     format!("*{e}")
                 } else {
-                    let item = self.owned_from(item, "__w::Cell::get(c)");
+                    let item = self.owned_from(item, "__w::Cell::get(c)", module);
                     format!("{e}.each_ref().map(|c| {item})")
                 }
             }
@@ -233,24 +269,31 @@ impl Generator<'_> {
                 {
                     return format!("{e}.as_slice().to_vec()");
                 }
-                match self.owned_from(item, "v").as_str() {
+                match self.owned_from(item, "v", module).as_str() {
                     "v" => format!("{e}.iter().collect()"),
                     item => format!("{e}.iter().map(|v| {item}).collect()"),
                 }
             }
             TypeKind::Map(key, value) => {
-                let key = self.owned_from(key, "k");
-                let value = self.owned_from(value, "v");
+                let key = self.owned_from(key, "k", module);
+                let value = self.owned_from(value, "v", module);
                 if key == "k" && value == "v" {
                     format!("{e}.iter().collect()")
                 } else {
                     format!("{e}.iter().map(|(k, v)| ({key}, {value})).collect()")
                 }
             }
-            TypeKind::Named(id) => match self.schema.def(*id).kind {
-                DefKind::Enum(_) | DefKind::Type(_) => e.to_string(),
-                _ => format!("{e}.to_owned()"),
-            },
+            TypeKind::Named(id) => {
+                // Enums and `type`s are read by value.
+                let owned = match self.schema.def(*id).kind {
+                    DefKind::Enum(_) | DefKind::Type(_) => e.to_string(),
+                    _ => format!("{e}.to_owned()"),
+                };
+                match self.foreign(*id) {
+                    Some(_) => self.to_foreign(*id, module, &owned),
+                    None => owned,
+                }
+            }
             _ => e.to_string(),
         }
     }

@@ -1,0 +1,8 @@
+# The shared test config, for example1.uju and example2.uju: foreign types
+# the Rust backend stores in place of the schema's own.
+
+[rust.map]
+# A struct, replaced by a math library's vector of the same fields.
+"foo.bar.Position" = "::glam::Vec2"
+# A `type`, replaced by a newtype of the user's.
+"foo.bar.GuildId" = "crate::guild::GuildId"

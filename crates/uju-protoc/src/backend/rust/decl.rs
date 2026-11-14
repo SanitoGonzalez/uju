@@ -108,7 +108,10 @@ impl Generator<'_> {
             out.line(format!("type Cell = {};", self.cell(&item.target, module)));
             out.line("");
             out.line("fn from_cell(cell: &Self::Cell) -> Self {");
-            out.line(format!("{name}(__w::Cell::get(cell))"));
+            out.line(format!(
+                "{name}({})",
+                self.owned_from(&item.target, "__w::Cell::get(cell)", module)
+            ));
             out.line("}");
             out.line("}");
         }

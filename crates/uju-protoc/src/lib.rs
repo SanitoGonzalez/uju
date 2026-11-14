@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod case;
+pub mod config;
 pub mod diagnostic;
 pub mod ir;
 pub mod lexer;

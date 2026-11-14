@@ -12,6 +12,8 @@ anyhow.workspace = true
 chumsky = "0.13"
 clap.workspace = true
 logos = "0.16"
+serde.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

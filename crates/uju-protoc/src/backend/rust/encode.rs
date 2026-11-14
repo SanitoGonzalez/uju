@@ -21,7 +21,7 @@ impl Generator<'_> {
                     out.line("}");
                 }
                 Slot::Var { presence, .. } => {
-                    let size = self.size(&field.ty);
+                    let size = self.size(&field.ty, object.module);
                     // Counted items take only their count's bytes.
                     if presence.is_none() && !size.contains('v') {
                         out.line(format!("size += {size};"));
@@ -88,18 +88,34 @@ impl Generator<'_> {
         if layout.bitmap > 0 {
             out.line(format!("let mut bits = [0u8; {}];", layout.bitmap));
             for (i, (field, slot)) in object.fields.iter().zip(&layout.fields).enumerate() {
-                // A `type` over `bool` is a bit too, a `.0` away per layer.
-                let inner = ".0".repeat(self.newtypes(&field.ty, object.module).len());
+                // A `type` over `bool` is a bit too, a `.0` away per layer,
+                // unless a layer is mapped and needs converting first.
+                let newtypes = self.newtypes(&field.ty);
+                let mapped = newtypes.iter().any(|id| self.foreign(*id).is_some());
                 match *slot {
                     Slot::Bit(bit) => {
-                        out.line(format!("if {} {{", object.value(i, &inner)));
+                        let value = if mapped {
+                            self.unwrap_bool(&field.ty, &object.receiver(i), object.module)
+                        } else {
+                            object.value(i, &".0".repeat(newtypes.len()))
+                        };
+                        out.line(format!("if {value} {{"));
                         out.line(set_bit(bit));
                         out.line("}");
                     }
                     Slot::OptionalBit { presence, value } => {
-                        out.line(format!("if let Some(v) = {} {{", object.value(i, "")));
+                        // A foreign type need not be `Copy`, so it is borrowed.
+                        let option = if mapped {
+                            object.reference(i)
+                        } else {
+                            object.value(i, "")
+                        };
+                        out.line(format!("if let Some(v) = {option} {{"));
                         out.line(set_bit(presence));
-                        out.line(format!("if v{inner} {{"));
+                        out.line(format!(
+                            "if {} {{",
+                            self.unwrap_bool(&field.ty, "v", object.module)
+                        ));
                         out.line(set_bit(value));
                         out.line("}");
                         out.line("}");
@@ -124,7 +140,7 @@ impl Generator<'_> {
                 let label = object.field(field);
                 out.line("{");
                 out.line(format!("let v = {};", object.reference(i)));
-                self.write(out, &field.ty, "v", &label);
+                self.write(out, &field.ty, "v", &label, object.module);
                 out.line("}");
             }
         }
@@ -135,7 +151,7 @@ impl Generator<'_> {
             if let Slot::Optional { .. } = slot {
                 let label = object.field(field);
                 out.line(format!("if let Some(v) = {} {{", object.reference(i)));
-                self.write(out, &field.ty, "v", &label);
+                self.write(out, &field.ty, "v", &label, object.module);
                 out.line("}");
             }
         }
@@ -150,7 +166,7 @@ impl Generator<'_> {
                 out.line("{");
                 out.line(format!("let v = {};", object.reference(i)));
             }
-            self.write(out, &field.ty, "v", &label);
+            self.write(out, &field.ty, "v", &label, object.module);
             out.line("}");
             let slot = slot as usize;
             if slot + 1 < vars {
@@ -176,7 +192,7 @@ impl Generator<'_> {
                 VariantData::Type(ty) => match self.wire.size(ty) {
                     Size::Fixed(size) => out.line(format!("Self::{name}(_) => {},", tag + size)),
                     Size::Var { .. } => {
-                        let size = self.size(ty);
+                        let size = self.size(ty, module);
                         let v = if size.contains('v') { "v" } else { "_" };
                         out.line(format!("Self::{name}({v}) => {tag} + {size},"));
                     }
@@ -217,7 +233,7 @@ impl Generator<'_> {
                     VariantData::Type(ty) => {
                         out.line(format!("Self::{name}(v) => {{"));
                         out.line(tag);
-                        self.write(out, ty, "v", &format!("{label}.{}", variant.name));
+                        self.write(out, ty, "v", &format!("{label}.{}", variant.name), module);
                         out.line("}");
                     }
                     VariantData::Fields(fields) => {
@@ -233,8 +249,23 @@ impl Generator<'_> {
         });
     }
 
-    /// Writes `v`, a `&T` for the owned type of `ty`, through `w`.
-    pub(super) fn write(&self, out: &mut Out, ty: &Type, v: &str, raw: &str) {
+    /// `e`, the owned type of `ty`, a `bool` or a `type` over one, or a
+    /// reference to it, as a `bool`: a `.0` per layer, converting each
+    /// mapped layer to its generated type first.
+    fn unwrap_bool(&self, ty: &Type, e: &str, module: &[String]) -> String {
+        let mut value = e.to_string();
+        for id in self.newtypes(ty) {
+            if self.foreign(id).is_some() {
+                value = self.to_generated(id, module, &format!("&{value}"));
+            }
+            value.push_str(".0");
+        }
+        value
+    }
+
+    /// Writes `v`, a `&T` for the owned type of `ty` as seen from `module`,
+    /// through `w`.
+    pub(super) fn write(&self, out: &mut Out, ty: &Type, v: &str, raw: &str, module: &[String]) {
         let label = format!("{raw:?}");
         if let Some(int) = IntInfo::of(ty) {
             match int.repr {
@@ -300,7 +331,7 @@ impl Generator<'_> {
                     out.line(format!("w.put({v})?;"));
                 } else {
                     out.line(format!("for v in {v}.iter() {{"));
-                    self.write(out, item, "v", raw);
+                    self.write(out, item, "v", raw, module);
                     out.line("}");
                 }
             }
@@ -316,7 +347,7 @@ impl Generator<'_> {
                     }
                     Sequence::Packed { .. } => {
                         out.line(format!("for v in {v}.iter() {{"));
-                        self.write(out, item, "v", raw);
+                        self.write(out, item, "v", raw, module);
                         out.line("}");
                     }
                     Sequence::Counted { count } => {
@@ -328,7 +359,7 @@ impl Generator<'_> {
                             count.bytes(),
                             prefix.bytes()
                         ));
-                        self.write(out, item, "v", raw);
+                        self.write(out, item, "v", raw, module);
                         out.line("Ok(())");
                         out.line("})?;");
                     }
@@ -341,8 +372,8 @@ impl Generator<'_> {
                 match self.wire.sequence(ty).expect("a sequence") {
                     Sequence::Packed { .. } => {
                         out.line(format!("for (k, v) in {v}.iter() {{"));
-                        self.write(out, key, "k", raw);
-                        self.write(out, value, "v", raw);
+                        self.write(out, key, "k", raw, module);
+                        self.write(out, value, "v", raw, module);
                         out.line("}");
                     }
                     Sequence::Counted { count } => {
@@ -354,31 +385,46 @@ impl Generator<'_> {
                             count.bytes(),
                             prefix.bytes()
                         ));
-                        self.write(out, key, "k", raw);
-                        self.write(out, value, "v", raw);
+                        self.write(out, key, "k", raw, module);
+                        self.write(out, value, "v", raw, module);
                         out.line("Ok(())");
                         out.line("})?;");
                     }
                 }
             }
-            TypeKind::Named(id) => match &self.schema.def(*id).kind {
-                DefKind::Enum(_) => {
-                    out.line(format!("w.put(__w::Enum::to_bytes(*{v}).as_ref())?;"));
-                }
-                DefKind::Type(item) => {
+            TypeKind::Named(id) => {
+                // A foreign type is written as the generated one it converts to.
+                let mapped = self.foreign(*id).is_some();
+                let v = if mapped {
                     out.line("{");
-                    out.line(format!("let v = &{v}.0;"));
-                    self.write(out, &item.target, "v", raw);
+                    out.line(format!("let v = &{};", self.to_generated(*id, module, v)));
+                    "v"
+                } else {
+                    v
+                };
+                match &self.schema.def(*id).kind {
+                    DefKind::Enum(_) => {
+                        out.line(format!("w.put(__w::Enum::to_bytes(*{v}).as_ref())?;"));
+                    }
+                    DefKind::Type(item) => {
+                        out.line("{");
+                        out.line(format!("let v = &{v}.0;"));
+                        self.write(out, &item.target, "v", raw, module);
+                        out.line("}");
+                    }
+                    _ => out.line(format!("__w::Encode::write({v}, w)?;")),
+                }
+                if mapped {
                     out.line("}");
                 }
-                _ => out.line(format!("__w::Encode::write({v}, w)?;")),
-            },
+            }
             _ => unreachable!("integers are handled above"),
         }
     }
 
-    /// The encoded size of `v`, a `&T` for the owned type of `ty`.
-    pub(super) fn size(&self, ty: &Type) -> String {
+    /// The encoded size of `v`, a `&T` for the owned type of `ty` as seen
+    /// from `module`.
+    pub(super) fn size(&self, ty: &Type, module: &[String]) -> String {
         if let Size::Fixed(size) = self.wire.size(ty) {
             return size.to_string();
         }
@@ -393,7 +439,7 @@ impl Generator<'_> {
                         "__w::en::prefixed_size(v.iter(), {}, {}, |v| {})",
                         count.bytes(),
                         prefix.bytes(),
-                        self.size(item)
+                        self.size(item, module)
                     ),
                 }
             }
@@ -403,7 +449,7 @@ impl Generator<'_> {
                 Sequence::Counted { count } => count.bytes().to_string(),
                 Sequence::Prefixed { count, prefix } => {
                     let key = self.fixed_size(key);
-                    let value = self.size(value);
+                    let value = self.size(value, module);
                     let entry = if key == 0 {
                         value
                     } else {
@@ -416,7 +462,13 @@ impl Generator<'_> {
                     )
                 }
             },
-            TypeKind::Named(_) => "__w::Encode::encoded_size(v)".to_string(),
+            TypeKind::Named(id) => match self.foreign(*id) {
+                Some(_) => format!(
+                    "__w::Encode::encoded_size(&{})",
+                    self.to_generated(*id, module, "v")
+                ),
+                None => "__w::Encode::encoded_size(v)".to_string(),
+            },
             _ => unreachable!("only strings, bytes, collections, structs, and unions vary in size"),
         }
     }

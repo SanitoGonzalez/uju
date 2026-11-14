@@ -6,6 +6,8 @@ layout of every declaration. It is meant for generators written outside
 this output instead of parsing `.uju` files, and copy layouts from it instead
 of deriving them, so their code agrees with every built-in backend byte for
 byte. [Wire Format](wire-format.md) explains what each layout value means.
+[Foreign types](schema.md#foreign-types) mapped in `ujuc.toml` are not part
+of the protocol, so the JSON leaves them out.
 
 ```sh
 ujuc protocol ir -o gen/ir schemas/

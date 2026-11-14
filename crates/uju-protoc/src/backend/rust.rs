@@ -18,6 +18,11 @@
 //! the enum `U` and the view enum `UView`, whose variants with fields are
 //! read through views in the module `u`. Consts become
 //! `SCREAMING_SNAKE_CASE` constants beside the types of their scope.
+//!
+//! A declaration `ujuc.toml` maps to a foreign type keeps its own owned
+//! type, but everything else stores the foreign type in its place: decoding
+//! converts the owned type through the user's `From`, and encoding clones the
+//! foreign value and converts it back the same way.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -68,6 +73,7 @@ const VIEW_METHODS: &[&str] = &[
     "as_bytes",
 ];
 
+#[derive(Debug, Clone, Default)]
 pub struct Rust {
     /// The role to generate, as in [`Options::role`]. Types only one side
     /// needs get only that side: a sim decodes what clients send it and
@@ -75,12 +81,18 @@ pub struct Rust {
     ///
     /// [`Options::role`]: crate::backend::Options::role
     pub role: Option<Role>,
+    /// Foreign types, as in [`RustConfig::map`]: each schema declaration's
+    /// qualified path to the Rust type stored in its place.
+    ///
+    /// [`RustConfig::map`]: crate::config::RustConfig::map
+    pub map: BTreeMap<String, String>,
 }
 
 impl Backend for Rust {
     fn generate(&self, schema: &Schema) -> Result<Vec<GeneratedFile>, Error> {
         let wire = backend::wire(schema)?;
-        let generator = Generator::new(schema, &wire, self.role)?;
+        let foreign = foreign(schema, &self.map)?;
+        let generator = Generator::new(schema, &wire, self.role, foreign)?;
         Ok(generator.files())
     }
 }
@@ -141,6 +153,9 @@ struct Generator<'a> {
     const_names: Vec<String>,
     const_modules: Vec<Vec<String>>,
     traits: Vec<Traits>,
+    /// The foreign type stored in place of each declaration's owned type,
+    /// from [`Rust::map`], indexed by [`TypeId`].
+    foreign: Vec<Option<String>>,
     /// Whether each declaration is encoded, or decoded, by this role. A
     /// declaration doing neither is left out.
     encode: Vec<bool>,
@@ -154,7 +169,12 @@ struct Generator<'a> {
 }
 
 impl<'a> Generator<'a> {
-    fn new(schema: &'a Schema, wire: &'a Wire, role: Option<Role>) -> Result<Generator<'a>, Error> {
+    fn new(
+        schema: &'a Schema,
+        wire: &'a Wire,
+        role: Option<Role>,
+        foreign: Vec<Option<String>>,
+    ) -> Result<Generator<'a>, Error> {
         unsupported(schema)?;
         let len = schema.defs.len();
         let names = schema.defs.iter().map(|def| ident(&def.name)).collect();
@@ -177,6 +197,7 @@ impl<'a> Generator<'a> {
             const_names,
             const_modules,
             traits: traits(schema),
+            foreign,
             encode,
             decode,
             checked: RefCell::new(vec![None; len]),
@@ -610,6 +631,47 @@ fn unsupported(schema: &Schema) -> Result<(), Error> {
         return Err(Error::new(errors.join("\n")));
     }
     Ok(())
+}
+
+/// The foreign type mapped in place of each declaration, indexed by
+/// [`TypeId`]. Only what other declarations store can be mapped: a struct,
+/// an enum, a union, or a `type`.
+fn foreign(schema: &Schema, map: &BTreeMap<String, String>) -> Result<Vec<Option<String>>, Error> {
+    let mut foreign = vec![None; schema.defs.len()];
+    if map.is_empty() {
+        return Ok(foreign);
+    }
+    let ids: BTreeMap<String, TypeId> = (0..schema.defs.len())
+        .map(|index| (schema.qualified(TypeId(index)), TypeId(index)))
+        .collect();
+    let mut errors = Vec::new();
+    for (path, ty) in map {
+        let Some(&id) = ids.get(path) else {
+            errors.push(format!(
+                "`ujuc.toml` maps `{path}`, which the schema doesn't declare"
+            ));
+            continue;
+        };
+        let kind = match schema.def(id).kind {
+            DefKind::Struct(_) | DefKind::Enum(_) | DefKind::Union(_) | DefKind::Type(_) => {
+                foreign[id.0] = Some(ty.clone());
+                continue;
+            }
+            DefKind::Message(_) => "a message",
+            DefKind::Hub(_) => "a hub kind",
+            DefKind::Component(_) => "a component",
+            DefKind::Tag(_) => "a tag",
+            DefKind::Audience(_) => "an audience",
+        };
+        errors.push(format!(
+            "`ujuc.toml` maps `{path}`, {kind}, which no declaration stores; \
+             only a struct, enum, union or `type` can be mapped"
+        ));
+    }
+    if !errors.is_empty() {
+        return Err(Error::new(errors.join("\n")));
+    }
+    Ok(foreign)
 }
 
 /// Whether any variant of `item` has fields, and so a view in the union's

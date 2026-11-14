@@ -3,17 +3,22 @@ use std::path::Path;
 use super::*;
 use crate::backend::MARKER;
 use crate::compile;
+use crate::config::Config;
 
 const EXAMPLE1: &str = include_str!("../../../tests/data/example1.uju");
 const EXAMPLE2: &str = include_str!("../../../tests/data/example2.uju");
+const CONFIG: &str = include_str!("../../../tests/data/ujuc.toml");
 
 fn files(sources: &[&str], role: Option<Role>) -> Vec<GeneratedFile> {
     let schema = compile(sources)
         .unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"))
         .schema;
-    Rust { role }
-        .generate(&schema)
-        .unwrap_or_else(|error| panic!("{error}"))
+    Rust {
+        role,
+        ..Rust::default()
+    }
+    .generate(&schema)
+    .unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn file<'a>(files: &'a [GeneratedFile], path: &str) -> &'a str {
@@ -208,7 +213,7 @@ fn colliding_names_are_reported() {
     let schema = compile(&["namespace a\nstruct B {}\nstruct BView {}\n"])
         .unwrap()
         .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(error.message, "`a.B` and `a.BView` both generate `BView`");
 }
 
@@ -249,7 +254,7 @@ fn colliding_variants_are_reported() {
     ])
     .unwrap()
     .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`a.bC.M` and `aB.c.M` both generate `ClientToSimMessage::ABCM`"
@@ -257,6 +262,7 @@ fn colliding_variants_are_reported() {
     // A role that never decodes them has no dispatch enum to collide in.
     let generated = Rust {
         role: Some(Role::Client),
+        ..Rust::default()
     }
     .generate(&schema);
     assert!(generated.is_ok());
@@ -269,7 +275,7 @@ fn unsupported_types_are_reported() {
     ])
     .unwrap()
     .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`a.M.id`: the Rust backend does not support `uuid` yet\n\
@@ -286,7 +292,7 @@ fn nested_modules_collide_with_namespaces() {
     ])
     .unwrap()
     .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`namespace a.foo` and `declarations nested in a.Foo` both generate `foo`"
@@ -299,7 +305,7 @@ fn nested_modules_collide_with_namespaces() {
     ])
     .unwrap()
     .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`namespace a.foo` and `declarations nested in a.Foo` both generate `foo`"
@@ -375,7 +381,7 @@ fn colliding_consts_are_reported() {
     let schema = compile(&["namespace a\nconst MaxHp: u8 = 1\nconst MAXHp: u8 = 2\n"])
         .unwrap()
         .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`a.MaxHp` and `a.MAXHp` both generate `MAX_HP`"
@@ -387,12 +393,12 @@ fn colliding_consts_are_reported() {
     let schema = compile(&["namespace a\nconst _: u8 = 1\nconst _1: u8 = 2\n"])
         .unwrap()
         .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(error.message, "`a._` has no words to name a Rust constant");
     let schema = compile(&["namespace a\nconst _1: u8 = 2\n"])
         .unwrap()
         .schema;
-    let files = Rust { role: None }.generate(&schema).unwrap();
+    let files = Rust::default().generate(&schema).unwrap();
     assert!(file(&files, "a/mod.rs").contains("pub const _1: u8 = 2;"));
 }
 
@@ -572,7 +578,7 @@ fn unsupported_types_behind_a_type_or_in_a_union_are_reported() {
          union U { A, B(uuid), C { at: uentity } }\nstruct S { owner: Owner }\n"])
     .unwrap()
     .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`a.Owner`: the Rust backend does not support `uentity` yet\n\
@@ -807,7 +813,7 @@ fn variant_modules_collide_with_namespaces() {
     ])
     .unwrap()
     .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`namespace a.foo` and `the variant views of a.Foo` both generate `foo`"
@@ -824,7 +830,7 @@ fn variant_modules_collide_with_namespaces() {
     let schema = compile(&["namespace a\nunion U { A }\nstruct UView {}\n"])
         .unwrap()
         .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(error.message, "`a.U` and `a.UView` both generate `UView`");
 }
 
@@ -898,7 +904,7 @@ fn hub_kinds_claim_their_names() {
     let schema = compile(&["namespace a\nhub(u8) B {}\nstruct BView {}\n"])
         .unwrap()
         .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(error.message, "`a.B` and `a.BView` both generate `BView`");
 
     let schema = compile(&[
@@ -907,7 +913,7 @@ fn hub_kinds_claim_their_names() {
     ])
     .unwrap()
     .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`namespace a.foo` and `declarations nested in a.Foo` both generate `foo`"
@@ -919,7 +925,7 @@ fn unsupported_hub_keys_are_reported() {
     let schema = compile(&["namespace a\nhub(uuid) H { u: uuid }\n"])
         .unwrap()
         .schema;
-    let error = Rust { role: None }.generate(&schema).unwrap_err();
+    let error = Rust::default().generate(&schema).unwrap_err();
     assert_eq!(
         error.message,
         "`a.H`: the Rust backend does not support `uuid` yet\n\
@@ -1038,6 +1044,7 @@ fn relay_tables_claim_their_names() {
     .schema;
     let error = Rust {
         role: Some(Role::Edge),
+        ..Rust::default()
     }
     .generate(&schema)
     .unwrap_err();
@@ -1045,4 +1052,237 @@ fn relay_tables_claim_their_names() {
         error.message,
         "`namespace CLIENT_TO_SIM_RELAYS` and `the generated `CLIENT_TO_SIM_RELAYS`` both generate `CLIENT_TO_SIM_RELAYS`"
     );
+}
+
+/// What `sources` generate for `role` with foreign types `map`, every file
+/// concatenated.
+fn mapped(sources: &[&str], role: Option<Role>, map: &[(&str, &str)]) -> Result<String, Error> {
+    let schema = compile(sources)
+        .unwrap_or_else(|errors| panic!("unexpected errors: {errors:#?}"))
+        .schema;
+    let map = map
+        .iter()
+        .map(|(path, ty)| (path.to_string(), ty.to_string()))
+        .collect();
+    let files = Rust { role, map }.generate(&schema)?;
+    Ok(files.into_iter().map(|file| file.contents).collect())
+}
+
+#[test]
+fn foreign_types_replace_owned_types() {
+    let schema = compile(&[EXAMPLE1, EXAMPLE2]).unwrap().schema;
+    let config = Config::parse(CONFIG).unwrap();
+    let files = Rust {
+        map: config.rust.map,
+        ..Rust::default()
+    }
+    .generate(&schema)
+    .unwrap();
+    let bar = file(&files, "foo/bar/mod.rs");
+    // The mapped declarations keep their own types, to convert through.
+    assert!(bar.contains("pub struct Position {\n    pub x: f32,\n    pub y: f32,\n}"));
+    assert!(bar.contains("pub struct GuildId(pub u64);"));
+    // Unindented, to match lines across blocks.
+    let trimmed: String = bar
+        .lines()
+        .map(|line| format!("{}\n", line.trim()))
+        .collect();
+    for line in [
+        "pub position: ::glam::Vec2,",
+        "pub points: ::std::vec::Vec<::glam::Vec2>,",
+        "pub grid: ::std::collections::HashMap<u16, ::glam::Vec2>,",
+        "pub id: crate::guild::GuildId,",
+        // Decoded as the generated type, then converted.
+        "position: <::glam::Vec2 as ::core::convert::From<Position>>::from(self.position().to_owned()),",
+        "points: self.points().iter().map(|v| <::glam::Vec2 as ::core::convert::From<Position>>::from(v.to_owned())).collect(),",
+        "grid: self.grid().iter().map(|(k, v)| (k, <::glam::Vec2 as ::core::convert::From<Position>>::from(v.to_owned()))).collect(),",
+        "id: <crate::guild::GuildId as ::core::convert::From<GuildId>>::from(self.id()),",
+        // Converted to the generated type, then encoded.
+        "let v = &<Position as ::core::convert::From<::glam::Vec2>>::from(<::glam::Vec2 as ::core::clone::Clone>::clone(v));\n\
+         __w::Encode::write(v, w)?;",
+        "let v = &<GuildId as ::core::convert::From<crate::guild::GuildId>>::from(<crate::guild::GuildId as ::core::clone::Clone>::clone(v));\n\
+         {\n\
+         let v = &v.0;\n\
+         w.put(&v.to_le_bytes())?;\n\
+         }",
+    ] {
+        assert!(trimmed.contains(line), "no `{line}` in\n{bar}");
+    }
+    let hello = file(&files, "hello/mod.rs");
+    assert!(hello.contains("pub position: ::glam::Vec2,"));
+    assert!(hello.contains(
+        "position: <::glam::Vec2 as ::core::convert::From<super::foo::bar::Position>>::from(self.position().to_owned()),"
+    ));
+    // Hub keys are the foreign type too.
+    let root = file(&files, "mod.rs");
+    assert!(root.contains(
+        "impl __w::HubKind for self::foo::bar::Guild {\n    type Key = crate::guild::GuildId;"
+    ));
+    assert!(bar.contains("impl __w::ToHub for Deposit {\n    type Key = crate::guild::GuildId;"));
+}
+
+#[test]
+fn foreign_types_fill_every_container() {
+    let code = mapped(
+        &[concat!(
+            "namespace a\n",
+            "enum Color: u8 { Red, Blue }\n",
+            "struct Named { name: string }\n",
+            "union Op { Rename { to: Named }, Paint(Color) }\n",
+            "struct S {\n",
+            "    maybe: option<Color>,\n",
+            "    names: vec<Named>,\n",
+            "    colors: set<Color>,\n",
+            "    by_color: map<Color, Named>,\n",
+            "    fixed: array<Color, 2>,\n",
+            "    ops: vec<Op>,\n",
+            "}\n",
+        )],
+        None,
+        &[
+            ("a.Color", "crate::Rgb"),
+            ("a.Named", "crate::Name"),
+            ("a.Op", "crate::Edit"),
+        ],
+    )
+    .unwrap();
+    for line in [
+        "pub maybe: ::core::option::Option<crate::Rgb>,",
+        "pub names: ::std::vec::Vec<crate::Name>,",
+        "pub colors: ::std::collections::HashSet<crate::Rgb>,",
+        "pub by_color: ::std::collections::HashMap<crate::Rgb, crate::Name>,",
+        "pub fixed: [crate::Rgb; 2],",
+        "pub ops: ::std::vec::Vec<crate::Edit>,",
+        // Union variants hold the foreign types too.
+        "Rename {\n        to: crate::Name,\n    },\n    Paint(crate::Rgb),",
+        // Enums are read by value, the rest through `to_owned`.
+        "maybe: self.maybe().map(|v| <crate::Rgb as ::core::convert::From<Color>>::from(v)),",
+        "by_color: self.by_color().iter().map(|(k, v)| (<crate::Rgb as ::core::convert::From<Color>>::from(k), <crate::Name as ::core::convert::From<Named>>::from(v.to_owned()))).collect(),",
+        "fixed: self.fixed().each_ref().map(|c| <crate::Rgb as ::core::convert::From<Color>>::from(__w::Cell::get(c))),",
+        "Self::Paint(v) => Op::Paint(<crate::Rgb as ::core::convert::From<Color>>::from(v)),",
+        "to: <crate::Name as ::core::convert::From<Named>>::from(v.to().to_owned()),",
+        // A variable size converts to measure, then again to write.
+        "__w::en::prefixed_size(v.iter(), 2, 2, |v| __w::Encode::encoded_size(&<Named as ::core::convert::From<crate::Name>>::from(<crate::Name as ::core::clone::Clone>::clone(v))))",
+        "let v = &<Color as ::core::convert::From<crate::Rgb>>::from(<crate::Rgb as ::core::clone::Clone>::clone(v));",
+        "w.put(__w::Enum::to_bytes(*v).as_ref())?;",
+    ] {
+        assert!(code.contains(line), "no `{line}` in\n{code}");
+    }
+}
+
+#[test]
+fn foreign_bools_convert_before_their_bits() {
+    let code = mapped(
+        &[concat!(
+            "namespace a\n",
+            "type Ready = bool\n",
+            "type Outer = Ready\n",
+            "struct S { a: Ready, b: option<Ready>, c: Outer, name: string }\n",
+        )],
+        None,
+        &[("a.Ready", "crate::Flag")],
+    )
+    .unwrap();
+    for line in [
+        // A `type` over a mapped one holds the foreign type, and reads it
+        // from a cell or a bit through the generated one.
+        "pub struct Outer(pub crate::Flag);",
+        "Outer(<crate::Flag as ::core::convert::From<Ready>>::from(__w::Cell::get(cell)))",
+        "Outer(<crate::Flag as ::core::convert::From<Ready>>::from(Ready(__w::bit(b, 3))))",
+        "a: <crate::Flag as ::core::convert::From<Ready>>::from(self.a()),",
+        // Bits are set from the generated `bool`, the option borrowed.
+        "if <Ready as ::core::convert::From<crate::Flag>>::from(<crate::Flag as ::core::clone::Clone>::clone(&self.a)).0 {",
+        "if let Some(v) = &self.b {",
+        "if <Ready as ::core::convert::From<crate::Flag>>::from(<crate::Flag as ::core::clone::Clone>::clone(&v)).0 {",
+        "if <Ready as ::core::convert::From<crate::Flag>>::from(<crate::Flag as ::core::clone::Clone>::clone(&self.c.0)).0 {",
+    ] {
+        assert!(code.contains(line), "no `{line}` in\n{code}");
+    }
+}
+
+#[test]
+fn only_stored_declarations_are_mapped() {
+    let source = concat!(
+        "namespace a\n",
+        "struct P {}\n",
+        "message(client -> sim) M {}\n",
+        "hub(u8) H {}\n",
+        "component C { hp: u32 }\n",
+        "tag T\n",
+        "audience A: u8\n",
+    );
+    let error = mapped(
+        &[source],
+        None,
+        &[
+            ("a.Missing", "crate::X"),
+            ("a.M", "crate::X"),
+            ("a.H", "crate::X"),
+            ("a.C", "crate::X"),
+            ("a.T", "crate::X"),
+            ("a.A", "crate::X"),
+            ("a.P", "crate::X"),
+            ("P", "crate::X"),
+        ],
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.message,
+        [
+            "`ujuc.toml` maps `P`, which the schema doesn't declare",
+            "`ujuc.toml` maps `a.A`, an audience, which no declaration stores; only a struct, enum, union or `type` can be mapped",
+            "`ujuc.toml` maps `a.C`, a component, which no declaration stores; only a struct, enum, union or `type` can be mapped",
+            "`ujuc.toml` maps `a.H`, a hub kind, which no declaration stores; only a struct, enum, union or `type` can be mapped",
+            "`ujuc.toml` maps `a.M`, a message, which no declaration stores; only a struct, enum, union or `type` can be mapped",
+            "`ujuc.toml` maps `a.Missing`, which the schema doesn't declare",
+            "`ujuc.toml` maps `a.T`, a tag, which no declaration stores; only a struct, enum, union or `type` can be mapped",
+        ]
+        .join("\n")
+    );
+}
+
+#[test]
+fn nested_declarations_map_by_their_full_path() {
+    let code = mapped(
+        &["namespace a\nstruct P {\n    enum R { X }\n    r: R\n}\n"],
+        None,
+        &[("a.P.R", "crate::X")],
+    )
+    .unwrap();
+    assert!(code.contains("pub r: crate::X,"), "{code}");
+    assert!(code.contains("<crate::X as ::core::convert::From<self::p::R>>::from(self.r())"));
+}
+
+/// A client has no `M`, so nothing it generates stores `Inner`.
+#[test]
+fn mappings_outside_the_role_are_ignored() {
+    let source = concat!(
+        "namespace a\n",
+        "struct Inner {}\n",
+        "message(sim -> sim) M { inner: Inner }\n",
+        "message(client -> sim) N {}\n",
+    );
+    let code = mapped(&[source], Some(Role::Client), &[("a.Inner", "crate::X")]).unwrap();
+    assert!(!code.contains("crate::X"), "{code}");
+}
+
+#[test]
+fn mappings_leave_the_protocol_alone() {
+    let fingerprints = |code: String| -> Vec<String> {
+        code.lines()
+            .filter(|line| line.contains("FINGERPRINT: u64"))
+            .map(str::to_string)
+            .collect()
+    };
+    let config = Config::parse(CONFIG).unwrap();
+    let map: Vec<(&str, &str)> = config
+        .rust
+        .map
+        .iter()
+        .map(|(path, ty)| (path.as_str(), ty.as_str()))
+        .collect();
+    let with = fingerprints(mapped(&[EXAMPLE1, EXAMPLE2], None, &map).unwrap());
+    let without = fingerprints(mapped(&[EXAMPLE1, EXAMPLE2], None, &[]).unwrap());
+    assert_eq!(with.len(), 2);
+    assert_eq!(with, without);
 }

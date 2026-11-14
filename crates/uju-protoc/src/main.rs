@@ -10,11 +10,15 @@ use clap::builder::PossibleValuesParser;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use uju_protoc::backend::{self, Backend, DISPATCHERS, GeneratedFile, MARKER, Options, PROTOCOLS};
 use uju_protoc::compile;
+use uju_protoc::config::Config;
 use uju_protoc::diagnostic::Diagnostic;
 use uju_protoc::ir;
 
 /// The extension directories are searched for.
 const EXTENSION: &str = "uju";
+/// The options file read from the current directory, when it exists and
+/// `--config` is not given.
+const CONFIG: &str = "ujuc.toml";
 
 #[derive(Parser, Debug)]
 #[command(name = "ujuc", version, about = "Compile uju schemas")]
@@ -72,6 +76,10 @@ struct Common {
     #[arg(long)]
     dry_run: bool,
 
+    /// Options file to read instead of `./ujuc.toml`
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
     /// Schema files, or directories searched recursively for `*.uju`
     #[arg(value_name = "PATH", required = true)]
     paths: Vec<PathBuf>,
@@ -118,6 +126,7 @@ fn run(command: &Command) -> Result<()> {
         } => {
             let options = Options {
                 role: role.map(ir::Role::from),
+                config: config(common.config.as_deref())?,
             };
             let generator = backend::protocol(backend, &options).with_context(|| {
                 format!(
@@ -132,6 +141,9 @@ fn run(command: &Command) -> Result<()> {
             role,
             common,
         } => {
+            // Read only to report its errors: no dispatch backend takes
+            // options yet.
+            config(common.config.as_deref())?;
             let generator = backend::dispatch(backend, (*role).into()).with_context(|| {
                 format!(
                     "no dispatch backend named `{backend}`; known: {}",
@@ -141,6 +153,31 @@ fn run(command: &Command) -> Result<()> {
             generate(&format!("dispatch {backend}"), generator.as_ref(), common)
         }
     }
+}
+
+/// Reads the options file at `path`, or `./ujuc.toml` when `path` is
+/// `None`. Only the default may be missing, giving the default options.
+fn config(path: Option<&Path>) -> Result<Config> {
+    let (path, text) = match path {
+        Some(path) => {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("reading `{}`", path.display()))?;
+            (path, text)
+        }
+        None => {
+            let path = Path::new(CONFIG);
+            match fs::read_to_string(path) {
+                Ok(text) => (path, text),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Config::default());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading `{}`", path.display()));
+                }
+            }
+        }
+    };
+    Config::parse(&text).with_context(|| format!("reading `{}`", path.display()))
 }
 
 /// Compiles the schemas in `args` and writes what `generator` emits from
