@@ -2,7 +2,7 @@
 //! and where each field of an object or variant sits.
 
 use super::*;
-use crate::ir::{DefKind, Field, Number, TypeKind, VariantData};
+use crate::ir::{DefKind, Field, Number, Replicate, TypeKind, VariantData};
 
 /// Byte width of an integer on the wire, little-endian.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -185,7 +185,56 @@ pub enum Slot {
     Var { slot: u32, presence: Option<u32> },
 }
 
-/// The size of every declaration, and the layout of each object and union.
+/// Layout of a `@replicate(patch)` component's patch: an object whose every
+/// field is optional, opened by one dirty bit per field so the sim's dirty
+/// mask is copied in as is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchLayout {
+    /// Always [`Size::Var`].
+    pub size: Size,
+    /// Bytes of the bitmap opening the head: the dirty bits, then the extra
+    /// bits.
+    pub bitmap: u32,
+    /// Offset of the first boundary, right after the bitmap.
+    pub boundaries: u32,
+    /// Width of each boundary.
+    pub boundary: Width,
+    /// Bytes of the head: the bitmap and `vars - 1` boundaries.
+    pub head: u32,
+    /// Number of slots in the var section.
+    pub vars: u32,
+    /// Where each field sits, in declaration order.
+    pub fields: Vec<PatchSlot>,
+}
+
+/// Where a field sits in a patch. Bits count from the least significant bit
+/// of the bitmap's first byte, and are zero when unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchSlot {
+    /// Set when the field is sent: its declaration index.
+    pub dirty: u32,
+    /// For an `option` field, set when it is sent as `Some`.
+    pub some: Option<u32>,
+    /// Where its value sits when sent.
+    pub value: PatchValue,
+}
+
+/// Where a sent field's value sits in a patch. A clean field, or one sent
+/// as `None`, has no value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchValue {
+    /// A `bool`, stored as this bit.
+    Bit(u32),
+    /// A fixed-size value. Values are packed back to back after the head,
+    /// in declaration order.
+    Packed,
+    /// A variable-size value in this slot of the var section, which is
+    /// empty when there is no value.
+    Var(u32),
+}
+
+/// The size of every declaration, and the layout of each object, union and
+/// patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Layouts {
     /// Indexed by [`TypeId`].
@@ -195,6 +244,8 @@ pub(super) struct Layouts {
     pub(super) layouts: Vec<Option<Layout>>,
     /// Indexed by [`TypeId`]; `Some` for unions.
     pub(super) unions: Vec<Option<UnionLayout>>,
+    /// Indexed by [`TypeId`]; `Some` for `@replicate(patch)` components.
+    pub(super) patches: Vec<Option<PatchLayout>>,
 }
 
 impl Layouts {
@@ -205,6 +256,7 @@ impl Layouts {
             states: vec![State::Todo; len],
             layouts: vec![None; len],
             unions: vec![None; len],
+            patches: vec![None; len],
             errors: Vec::new(),
         };
         let sizes = (0..len).map(|index| builder.def(TypeId(index))).collect();
@@ -213,6 +265,7 @@ impl Layouts {
             sizes,
             layouts: builder.layouts,
             unions: builder.unions,
+            patches: builder.patches,
         }
     }
 }
@@ -231,6 +284,7 @@ struct Builder<'a> {
     states: Vec<State>,
     layouts: Vec<Option<Layout>>,
     unions: Vec<Option<UnionLayout>>,
+    patches: Vec<Option<PatchLayout>>,
     errors: Vec<Error>,
 }
 
@@ -262,7 +316,15 @@ impl Builder<'_> {
                 }
                 self.object(id, &item.fields)
             }
-            DefKind::Component(item) => self.object(id, &item.fields),
+            DefKind::Component(item) => {
+                let errors = self.errors.len();
+                let size = self.object(id, &item.fields);
+                if item.replicate == Replicate::Patch {
+                    let reported = self.errors[errors..].iter().any(|error| error.def == id);
+                    self.patches[id.0] = Some(self.patch(id, &item.fields, reported));
+                }
+                size
+            }
             DefKind::Audience(item) => {
                 // The key travels in frames, so it must fit as a value.
                 if let Some(size) = self.oversized(&item.key) {
@@ -408,11 +470,7 @@ impl Builder<'_> {
             }
         }
         let boundaries = offset;
-        let count = vars.saturating_sub(1) as u64;
-        // Narrow boundaries when the whole object, laid out with them, fits.
-        let narrow = var.map(|var| boundaries + count + optional + var);
-        let boundary = Width::length(narrow.and_then(bound));
-        let head = boundaries + count * boundary.bytes() as u64;
+        let (boundary, head) = head(boundaries, vars, var.map(|var| optional + var));
 
         if head > MAX_SIZE as u64 && !oversized {
             let mut name = self.schema.qualified(id);
@@ -449,6 +507,69 @@ impl Builder<'_> {
         }
     }
 
+    /// Lays out the patch of a `@replicate(patch)` component. `reported`
+    /// tells whether the component already reported itself too large, in
+    /// which case its patch does not again.
+    fn patch(&mut self, id: TypeId, fields: &[Field], reported: bool) -> PatchLayout {
+        // The dirty bits come first, one per field.
+        let mut bits = fields.len() as u32;
+        let mut bit = || {
+            bits += 1;
+            bits - 1
+        };
+        let mut slots = Vec::with_capacity(fields.len());
+        let mut vars = 0;
+        let mut packed = 0u64;
+        let mut var: Option<u64> = Some(0);
+        for (index, field) in fields.iter().enumerate() {
+            let size = self.size(&field.ty);
+            let some = field.optional.then(&mut bit);
+            // A `type` over `bool` is a bit too.
+            let value = match (&self.schema.resolved(&field.ty).kind, size) {
+                (TypeKind::Bool, _) => PatchValue::Bit(bit()),
+                (_, Size::Fixed(size)) => {
+                    packed += size as u64;
+                    PatchValue::Packed
+                }
+                (_, Size::Var { max }) => {
+                    var = var.zip(max).map(|(sum, max)| sum + max as u64);
+                    vars += 1;
+                    PatchValue::Var(vars - 1)
+                }
+            };
+            slots.push(PatchSlot {
+                dirty: index as u32,
+                some,
+                value,
+            });
+        }
+
+        let bitmap = bits.div_ceil(8);
+        let (boundary, head) = head(bitmap as u64, vars, var.map(|var| packed + var));
+        if head > MAX_SIZE as u64 && !reported {
+            self.errors.push(Error {
+                def: id,
+                variant: None,
+                field: None,
+                message: format!(
+                    "the patch of `{}` takes at least {head} bytes; a message holds at most {MAX_SIZE}",
+                    self.schema.qualified(id)
+                ),
+            });
+        }
+        PatchLayout {
+            size: Size::Var {
+                max: var.and_then(|var| bound(head + packed + var)),
+            },
+            bitmap,
+            boundaries: bitmap,
+            boundary,
+            head: head.min(u32::MAX as u64) as u32,
+            vars,
+            fields: slots,
+        }
+    }
+
     /// The size of a fixed-size part of `ty` too large for any message.
     /// Named types are skipped, as they report themselves.
     fn oversized(&mut self, ty: &Type) -> Option<u32> {
@@ -459,6 +580,17 @@ impl Builder<'_> {
             _ => self.size(ty).fixed().filter(|size| *size > MAX_SIZE),
         }
     }
+}
+
+/// The width of an object's `vars - 1` boundaries, which start at
+/// `boundaries`, and the size of the head they end. `rest` is the most the
+/// optional and var sections take, `None` when unbounded. Boundaries are
+/// narrow when the whole object, laid out with them, fits.
+fn head(boundaries: u64, vars: u32, rest: Option<u64>) -> (Width, u64) {
+    let count = vars.saturating_sub(1) as u64;
+    let narrow = rest.map(|rest| boundaries + count + rest);
+    let boundary = Width::length(narrow.and_then(bound));
+    (boundary, boundaries + count * boundary.bytes() as u64)
 }
 
 /// `size` as a bound on a value inside a message: `None` when the message
@@ -1003,6 +1135,178 @@ mod tests {
             "component C { a: bool, x: u16, name: string[max_length=8], hp: option<u32> }\n",
         )]);
         assert_eq!(wire.layout(id(&schema, "C")), wire.layout(id(&schema, "S")));
+    }
+
+    /// The patch of the only component, `C`, after a `namespace a` header.
+    fn patch(body: &str) -> PatchLayout {
+        let (schema, wire) = compiled(&[&format!("namespace a\n{body}\n")]);
+        wire.patch(id(&schema, "C")).expect("a patch").clone()
+    }
+
+    fn slot(dirty: u32, some: Option<u32>, value: PatchValue) -> PatchSlot {
+        PatchSlot { dirty, some, value }
+    }
+
+    #[test]
+    fn patches_put_dirty_bits_first() {
+        let layout = patch(concat!(
+            "type Flag = bool\n",
+            "struct P { x: f32 }\n",
+            "@replicate(patch) component C { a: bool, hp: u16, o: option<bool>, p: option<P>, ",
+            "s: option<string>, f: Flag, name: string[max_length=8], ",
+            "buffs: vec<u16>[max_length=4], pos: P, n: option<Flag> }",
+        ));
+        assert_eq!(
+            layout.fields,
+            [
+                slot(0, None, PatchValue::Bit(10)),
+                slot(1, None, PatchValue::Packed),
+                slot(2, Some(11), PatchValue::Bit(12)),
+                slot(3, Some(13), PatchValue::Packed),
+                slot(4, Some(14), PatchValue::Var(0)),
+                slot(5, None, PatchValue::Bit(15)),
+                slot(6, None, PatchValue::Var(1)),
+                slot(7, None, PatchValue::Var(2)),
+                slot(8, None, PatchValue::Packed),
+                slot(9, Some(16), PatchValue::Bit(17)),
+            ]
+        );
+        assert_eq!(layout.bitmap, 3, "18 bits");
+        assert_eq!(layout.boundaries, 3, "no fixed fields in the head");
+        assert_eq!(layout.vars, 3);
+        assert_eq!(layout.boundary, Width::U16, "`s` is unbounded");
+        assert_eq!(layout.head, 7, "the bitmap and two boundaries");
+        assert_eq!(layout.size, Size::Var { max: None });
+    }
+
+    #[test]
+    fn patches_of_fixed_components_vary_in_size() {
+        let layout =
+            patch("@replicate(patch) component C { hp: u32, alive: bool, pos: array<f32, 3> }");
+        assert_eq!(
+            layout.fields,
+            [
+                slot(0, None, PatchValue::Packed),
+                slot(1, None, PatchValue::Bit(3)),
+                slot(2, None, PatchValue::Packed),
+            ]
+        );
+        assert_eq!(layout.head, 1, "the bitmap alone");
+        assert_eq!(layout.vars, 0);
+        // 1 (bitmap) + 4 (hp) + 12 (pos)
+        assert_eq!(layout.size, Size::Var { max: Some(17) });
+    }
+
+    #[test]
+    fn a_patch_with_one_slot_has_no_boundaries() {
+        let layout = patch("@replicate(patch) component C { hp: u32, name: string }");
+        assert_eq!(layout.fields[1], slot(1, None, PatchValue::Var(0)));
+        assert_eq!(layout.vars, 1);
+        assert_eq!(layout.head, 1, "the bitmap alone");
+        assert_eq!(layout.size, Size::Var { max: None });
+    }
+
+    #[test]
+    fn patch_boundaries_narrow_when_the_patch_fits() {
+        let layout = |a: u32| {
+            let layout = patch(&format!(
+                "@replicate(patch) component C {{ hp: u32, a: string[max_length={a}], \
+                 b: option<string[max_length=60]> }}"
+            ));
+            (layout.boundary, layout.head, layout.size)
+        };
+        // 1 (bitmap) + 1 (boundary) + 4 (hp) + 189 + 60
+        assert_eq!(layout(189), (Width::U8, 2, Size::Var { max: Some(255) }));
+        assert_eq!(layout(190), (Width::U16, 3, Size::Var { max: Some(257) }));
+    }
+
+    #[test]
+    fn only_patch_components_have_patches() {
+        let (schema, wire) = compiled(&[concat!(
+            "namespace a\n",
+            "struct P { hp: u32 }\n",
+            "union U { A, B }\n",
+            "component R { hp: u32 }\n",
+            "@replicate(ops(U)) component O { hp: u32 }\n",
+            "@replicate(patch) component C { hp: u32 }\n",
+        )]);
+        for name in ["P", "U", "R", "O"] {
+            assert_eq!(wire.patch(id(&schema, name)), None, "{name}");
+        }
+        assert!(wire.patch(id(&schema, "C")).is_some());
+    }
+
+    #[test]
+    fn the_documented_patch_lays_out_as_documented() {
+        let layout = patch(concat!(
+            "@replicate(patch) component C { alive: bool, hp: u16, level: option<u8>, ",
+            "title: option<string[max_length=16]>, name: string[max_length=12] }",
+        ));
+        assert_eq!(
+            layout,
+            PatchLayout {
+                // 1 (bitmap) + 1 (boundary) + 2 (hp) + 1 (level) + 16 + 12
+                size: Size::Var { max: Some(33) },
+                bitmap: 1,
+                boundaries: 1,
+                boundary: Width::U8,
+                head: 2,
+                vars: 2,
+                fields: vec![
+                    slot(0, None, PatchValue::Bit(5)),
+                    slot(1, None, PatchValue::Packed),
+                    slot(2, Some(6), PatchValue::Packed),
+                    slot(3, Some(7), PatchValue::Var(0)),
+                    slot(4, None, PatchValue::Var(1)),
+                ],
+            }
+        );
+    }
+
+    /// The errors laying out `a.C`, a `@replicate(patch)` component with
+    /// `count` fields of `ty`. Built by hand, as the source would be large.
+    fn patch_errors(ty: TypeKind, count: usize) -> Vec<String> {
+        use crate::ir::{Component, Def, Namespace, NamespaceId, Visibility};
+        let field = Field {
+            name: "f".into(),
+            ty: ty.into(),
+            optional: false,
+        };
+        let schema = Schema {
+            namespaces: vec![Namespace {
+                name: vec!["a".into()],
+            }],
+            defs: vec![Def {
+                namespace: NamespaceId(0),
+                parent: None,
+                name: "C".into(),
+                kind: DefKind::Component(Component {
+                    fields: vec![field; count],
+                    replicate: Replicate::Patch,
+                    visibility: Visibility::Public,
+                    halo: true,
+                }),
+            }],
+            consts: Vec::new(),
+        };
+        let mut errors = Vec::new();
+        Layouts::new(&schema, &mut errors);
+        errors.into_iter().map(|error| error.message).collect()
+    }
+
+    #[test]
+    fn oversized_patch_heads_are_reported() {
+        // A bool takes one bit in the component and two in its patch.
+        assert_eq!(patch_errors(TypeKind::Bool, 262_140), [] as [String; 0]);
+        assert_eq!(
+            patch_errors(TypeKind::Bool, 262_144),
+            ["the patch of `a.C` takes at least 65536 bytes; a message holds at most 65535"]
+        );
+        // The component reports itself, so its patch does not.
+        assert_eq!(
+            patch_errors(TypeKind::String, 33_000),
+            ["`a.C` takes at least 65998 bytes; a message holds at most 65535"]
+        );
     }
 
     #[test]

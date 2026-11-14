@@ -12,7 +12,9 @@ use crate::ir::{Role, Schema, Type, TypeId};
 use fingerprint::{Scope, canonical, fnv1a};
 use ids::Ids;
 pub use ids::Space;
-pub use layout::{Int, Layout, Sequence, Size, Slot, UnionLayout, Width};
+pub use layout::{
+    Int, Layout, PatchLayout, PatchSlot, PatchValue, Sequence, Size, Slot, UnionLayout, Width,
+};
 use layout::{Layouts, sequence, type_size};
 
 /// The largest encoded message, in bytes. Every length, count, and offset
@@ -99,6 +101,12 @@ impl Wire {
     /// When `id` is not a union.
     pub fn union(&self, id: TypeId) -> &UnionLayout {
         self.layouts.unions[id.0].as_ref().expect("not a union")
+    }
+
+    /// The layout of component `id`'s patch, `None` for anything but a
+    /// `@replicate(patch)` component.
+    pub fn patch(&self, id: TypeId) -> Option<&PatchLayout> {
+        self.layouts.patches[id.0].as_ref()
     }
 
     /// Message `id`'s id on each of its links, in the order of

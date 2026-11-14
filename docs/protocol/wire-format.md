@@ -192,24 +192,68 @@ bytes:
 62 63          "bc", the last item, runs to the end
 ```
 
-### Example: a patch
+## Patches
 
-Optional fields make sparse updates cheap. An absent field costs only a bit.
+A `@replicate(patch)` component has a second layout, its **patch**, which a
+delta sends to change some of its fields (see
+[Replication modes](schema.md#replication-modes)). Its full encoding stays
+its object layout. A patch is an object whose every field is optional:
 
 ```
-struct StatsPatch {
-    hp: option<u16>,       // presence bit 0
-    mp: option<u16>,       // presence bit 1
-    alive: option<bool>,   // presence bit 2, value bit 3
-    strength: option<u8>,  // presence bit 4
+patch := head | optional section | var section
+head  := bitmap | boundaries
+```
+
+**Bitmap.** Bits `0` to `N - 1` are one **dirty bit** per field, in
+declaration order, set when the field is sent. They are the sim's dirty mask,
+copied in as is. The bits a field needs beyond them follow, in declaration
+order:
+
+| Field | Bits |
+|---|---|
+| `bool` | its value |
+| `option<bool>` | `Some`, then value |
+| any other `option<T>` | `Some` |
+
+A field that is not sent, or sent as `None`, leaves these bits zero. An
+`option` field thus patches as unchanged, `None`, or `Some(v)`.
+
+**Optional section.** The value of each sent fixed-size field other than a
+`bool`, and of each `option<T>` sent as `Some` when `T` is fixed-size,
+packed in declaration order. Other fields take no bytes.
+
+**Boundaries and var section.** Every variable-size field, and every
+`option<T>` whose `T` is variable-size, takes a slot, as in an
+[object](#objects). Its slot is empty when the field is not sent, or sent as
+`None`. A patch thus always pays `slots - 1` boundaries, whose width follows
+the object rule, applied to the patch's largest encoding.
+
+A patch is variable-size, even when the component is fixed-size. Its largest
+encoding is the head, every fixed-size value, and every slot's largest
+value. A collection or a nested struct is sent whole, as a value of its type.
+
+### Example
+
+```
+@replicate(patch)
+component Stats {
+    alive: bool,                            // dirty bit 0, value bit 5
+    hp: u16,                                // dirty bit 1
+    level: option<u8>,                      // dirty bit 2, Some bit 6
+    title: option<string[max_length=16]>,   // dirty bit 3, Some bit 7, slot 0
+    name: string[max_length=12],            // dirty bit 4, slot 1
 }
 ```
 
-`StatsPatch { hp: Some(500), alive: Some(true), .. }` encodes to 3 bytes:
+The largest patch is 33 bytes, so the boundary is 1 byte wide. A patch
+setting `alive` to `true`, `level` to `Some(7)`, `title` to `None` and
+`name` to `"bob"`, leaving `hp` as it is, encodes to 6 bytes:
 
 ```
-0D             bitmap: hp, alive present; alive is true
-F4 01          hp: 500
+7D             bitmap: alive, level, title, name sent; alive is true; level is Some
+03             title ends at 3: empty, as it is None
+07             level: 7
+62 6F 62       name: "bob", the last slot, runs to the end
 ```
 
 ## Collections
@@ -314,6 +358,8 @@ fail. A decoder must reject a message unless:
   and counted and prefixed collections consume their range exactly;
 - unused bitmap bits, the value bit of an absent `option<bool>`, and the slots
   of absent optional values are empty or zero;
+- in a [patch](#patches), the bits and slot of a field not sent, or sent as
+  `None`, are zero or empty;
 - `bool` bytes are `0` or `1`, enums hold a declared variant, and `entity`
   generations are non-zero;
 - union tags name a declared variant, never `0` or past the last one, a
@@ -490,9 +536,6 @@ fixed, and for a hub receiver the kind's id and the key's encoded size (see
 - Time narrowing: a `resolution` constraint on `timestamp` and `duration`
   (such as `duration[resolution=1ms, max=1h]`) that, together with `max`,
   narrows them as [integers](#integers) are.
-- Patch types for `@replicate(patch)` components: a layout of their own,
-  whose presence bits are the component's field dirty mask, so the sim
-  encodes a patch with no `diff`. See [Components](schema.md#replication-modes).
 - Rust backend: mark the generated code `#[rustfmt::skip]`, so `cargo fmt`
   leaves it alone and regenerating it changes nothing. Today the output is
   not formatted as rustfmt would, and users have to exclude its directory
