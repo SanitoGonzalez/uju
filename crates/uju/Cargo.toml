@@ -6,8 +6,8 @@ edition.workspace = true
 [features]
 default = ["3d"]
 
-2d = []
-3d = []
+2d = ["dep:parry2d"]
+3d = ["dep:parry3d"]
 
 [dependencies]
 uju-macros = { path = "../uju-macros" }
@@ -18,8 +18,8 @@ compio.workspace = true
 crossfire.workspace = true
 derive_more.workspace = true
 futures-util.workspace = true
-parry2d.workspace = true
-parry3d.workspace = true
+parry2d = { workspace = true, optional = true }
+parry3d = { workspace = true, optional = true }
 libc.workspace = true
 linkme = "0.3"
 nix = { version = "0.31", features = ["sched"] }

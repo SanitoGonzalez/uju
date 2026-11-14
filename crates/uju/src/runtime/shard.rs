@@ -14,6 +14,7 @@ use crate::net::{self, transport::tcp};
 use crate::runtime::error::Result;
 use crate::runtime::node::Node;
 use crate::runtime::shard::message::Frame;
+use crate::time::Time;
 use crate::topology::ShardId;
 use crate::util::stop::{StopSource, StopToken};
 
@@ -193,13 +194,15 @@ impl Builder {
             .build()?;
 
         let (stop, token) = StopSource::new();
+        let world = World::new(Node::current().id(), id);
+        world.insert_unique(Time::new());
         let shard = Rc::new(Shard {
             id,
             cpu,
             tx,
             stop,
             token,
-            world: World::new(Node::current().id(), id),
+            world,
         });
         CURRENT.with(|cell| unsafe { *cell.get() = Some(shard.clone()) });
 

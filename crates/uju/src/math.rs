@@ -2,6 +2,17 @@ use std::f32::consts::PI;
 
 use derive_more::From;
 
+#[cfg(feature = "2d")]
+pub use parry2d::glamx::Vec2 as Vector;
+#[cfg(feature = "3d")]
+pub use parry3d::glamx::Vec3 as Vector;
+
+/// A rotation: an angle in 2D, a quaternion in 3D
+#[cfg(feature = "2d")]
+pub type Rotation = Radians;
+#[cfg(feature = "3d")]
+pub use parry3d::glamx::Quat as Rotation;
+
 /// A radian angle
 #[derive(Clone, Copy, Debug, From, PartialEq, PartialOrd)]
 #[repr(transparent)]

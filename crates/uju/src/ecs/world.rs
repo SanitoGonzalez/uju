@@ -8,7 +8,7 @@ use crate::ecs::{
         table::Table,
         view::{View, ViewMut},
     },
-    unique::{self, Unique, time::Time},
+    unique::{self, Unique},
 };
 use crate::topology::{NodeId, ShardId};
 
@@ -23,17 +23,14 @@ impl World {
     pub fn new(node: NodeId, shard: ShardId) -> Self {
         // todo: resume from the persisted serial high-water mark instead of 0
         let universal = UniversalAllocator::new(node, shard, 0);
-        let world = Self {
+        Self {
             entities: RefCell::new(Registry::new(universal)),
             tables: component::registrations()
                 .into_iter()
                 .map(|registration| RefCell::new((registration.new_table)()))
                 .collect(),
             uniques: (0..unique::count()).map(|_| RefCell::new(None)).collect(),
-        };
-        world.insert_unique(Time::new());
-
-        world
+        }
     }
 
     pub fn entities(&self) -> Ref<'_, Registry> {
