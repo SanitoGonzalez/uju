@@ -442,8 +442,7 @@ and a client sends `Resync`. A frame is invalid when:
   `internal`;
 - an entity appears twice in a section, or a section names a uid the
   sub-frame does not bind, from the same cell;
-- a value, patch or op fails [validation](wire-format.md#validation);
-- an `ops` component's `apply` fails.
+- a value, patch or op fails [validation](wire-format.md#validation).
 
 ## Open questions
 

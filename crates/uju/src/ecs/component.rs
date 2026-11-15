@@ -109,16 +109,16 @@ pub trait Patch: Valued {
 /// The table hands out no `&mut Self`. Its wrapper applies an op with
 /// [`apply`](Ops::apply) and records it, and the tick's delta sends the
 /// recorded ops, which each receiver applies with the same method.
+///
+/// An op is a fact the sim has decided, not a request: whatever could
+/// refuse it is checked before the op is built.
 pub trait Ops: Valued {
     /// The op type, a schema union.
     type Op: Encode + for<'a> Decode<'a> + 'static;
 
-    /// Why an op could not be applied.
-    type Error;
-
-    /// Applies `op`. An op that fails is not recorded, so it must leave the
-    /// value as it was.
-    fn apply(&mut self, op: &Self::Op) -> Result<(), Self::Error>;
+    /// Applies `op`. It must be total and deterministic, so that every
+    /// receiver reaches the sim's value.
+    fn apply(&mut self, op: &Self::Op);
 }
 
 /// What the runtime needs to route a replicated table's sections, read

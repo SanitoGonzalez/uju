@@ -120,13 +120,15 @@ holds unit structs, which take no memory, so it stores only membership.
 An `OpsTable` holds a component that changes only through ops, so that
 every change reaches replicas. It hands out no `&mut C`.
 
+- **Ops are facts.** An op is what the sim has decided, not a request, so
+  whatever could refuse it is checked before the op is built. `Ops::apply`
+  must be total and deterministic, so every receiver reaches the sim's
+  value.
 - **Applying.** Mutable access yields an `OpsMut<C>`, which derefs to `&C`
-  and has `apply(op)`. It calls `Ops::apply` on the value and returns its
-  `Result`. An op that succeeds is recorded and marks the entry dirty.
-- **Failing.** An op that fails is not recorded, since replicas would fail
-  it too. `Ops::apply` must leave the value as it was when it fails.
+  and has `apply(op)`. It calls `Ops::apply` on the value, records the op
+  and marks the entry dirty.
 - **One entity.** `world.apply_op::<C>(entity, op)` applies one op. It
-  returns `None` when the entity holds no `C` or is a replica, and panics
+  returns `false` when the entity holds no `C` or is a replica, and panics
   like any conflicting borrow while a query holds the table.
 
 ```rust
@@ -134,11 +136,11 @@ let mut q = Query::<(Mut<Inventory>, Pickup)>::new(&world);
 for (_, (mut inv, pickup)) in q.iter() {
     if inv.has_room() {
         let slot = inv.free_slot();
-        inv.apply(InventoryOp::Add { item: pickup.0, slot })?;
+        inv.apply(InventoryOp::Add { item: pickup.0, slot });
     }
 }
 
-world.apply_op::<Inventory>(entity, InventoryOp::Clear); // Option<Result<..>>
+world.apply_op::<Inventory>(entity, InventoryOp::Clear);
 ```
 
 | Method | Does |
@@ -243,9 +245,8 @@ pub trait Patch: Valued {
 
 pub trait Ops: Valued {
     type Op: Encode + for<'a> Decode<'a> + 'static;
-    type Error;
 
-    fn apply(&mut self, op: &Self::Op) -> Result<(), Self::Error>;
+    fn apply(&mut self, op: &Self::Op);
 }
 ```
 
@@ -264,8 +265,7 @@ pub trait Ops: Valued {
 | `patch_size`, `encode_patch` | The patch of the fields set in `mask`, from the current value. The mask is the patch's dirty bits, as is |
 | `Patch::apply` | Overwrites the fields the patch holds |
 | `Op` | The op type, a schema [union](../protocol/wire-format.md#unions) |
-| `Error` | Why an op could not be applied |
-| `Ops::apply` | Applies an op, leaving the value as it was when it fails |
+| `Ops::apply` | Applies an op. Total and deterministic |
 
 ### Writing a Patch
 
@@ -320,27 +320,24 @@ receiver. The op type is a plain enum with its encoding:
 ```rust
 impl Ops for Inventory {
     type Op = InventoryOp;
-    type Error = InventoryError;
 
-    fn apply(&mut self, op: &InventoryOp) -> Result<(), InventoryError> {
+    fn apply(&mut self, op: &InventoryOp) {
         match *op {
             InventoryOp::Add { item, slot } => {
-                if self.items.contains_key(&slot) {
-                    return Err(InventoryError::Occupied(slot));
-                }
                 self.items.insert(slot, item);
             }
             InventoryOp::Remove(slot) => {
-                self.items.remove(&slot).ok_or(InventoryError::Empty(slot))?;
+                self.items.remove(&slot);
             }
             InventoryOp::Clear => self.items.clear(),
         }
-        Ok(())
     }
 }
 ```
 
-The checks come before the writes, so a failing op changes nothing.
+Every op has a result, even one that does not fit the value, such as
+removing from an empty slot. A system that must not add to a full slot
+checks before it builds the `Add`.
 
 ## The Table interface
 
@@ -355,7 +352,7 @@ apply one.
 | `changed(&mut out)` | Appends the entities added or marked dirty this tick |
 | `removed()` | The remove log |
 | `encode_section(full, changed, removed, &mut out)` | Appends one section, and returns whether it wrote one |
-| `apply_section(buf, resolve, &mut failed)` | Applies one section, and returns its length |
+| `apply_section(buf, resolve)` | Applies one section, and returns its length |
 | `end_tick()` | Clears the bits and the log |
 | `despawn_batch(entities)` | Drops despawned entities' values without logging them |
 
@@ -407,12 +404,6 @@ A patch or ops to an entity that holds no value are skipped. A part the
 table does not write, a truncated part, an invalid value, patch or op, or a
 zero incarnation is an error.
 
-An `Ops::apply` that fails is not an error of the section, and nothing
-panics. The entity's uid is appended to `failed`, its later ops in the
-section are skipped, and the rest of the section applies. The entity's
-value is then stale until a full value replaces it, so the caller asks the
-sender for one.
-
 ```rust
 // on the sim, at the end of the tick, with `table: &dyn Table`
 let mut changed = Vec::new();
@@ -421,6 +412,5 @@ table.changed(&mut changed);
 table.encode_section(&entered, &bucket, &removed, &mut frame)?;
 
 // on the receiver, with `table: &mut dyn Table`
-let mut failed = Vec::new();
-let read = table.apply_section(&section[2..], &mut |uid| world.resolve(uid), &mut failed)?;
+let read = table.apply_section(&section[2..], &mut |uid| world.resolve(uid))?;
 ```

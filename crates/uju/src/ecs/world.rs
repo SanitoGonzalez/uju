@@ -191,17 +191,16 @@ impl World {
 
     /// Applies `op` to `entity`'s `C` and records it, as
     /// [`OpsMut::apply`](crate::ecs::storage::ops::OpsMut::apply) does.
-    /// `None` when `entity` holds no `C` or is a replica.
+    /// Returns `false` when `entity` holds no `C` or is a replica.
     ///
     /// Panics if `C`'s table is borrowed at the time, such as by a query.
-    pub fn apply_op<C: Ops<Storage = OpsTable<C>>>(
-        &self,
-        entity: Entity,
-        op: C::Op,
-    ) -> Option<Result<(), C::Error>> {
+    pub fn apply_op<C: Ops<Storage = OpsTable<C>>>(&self, entity: Entity, op: C::Op) -> bool {
         let mut table = self.view_mut::<C>();
-        let mut value = table.get_mut(entity)?;
-        Some(value.apply(op))
+        let Some(mut value) = table.get_mut(entity) else {
+            return false;
+        };
+        value.apply(op);
+        true
     }
 
     /// Sends `entity`'s full `C` in the next delta, dropping its ops of this

@@ -324,7 +324,6 @@ impl<T: Ops> OpsTable<T> {
         &mut self,
         buf: &[u8],
         resolve: &mut dyn FnMut(Uid) -> Option<Entity>,
-        failed: &mut Vec<Uid>,
     ) -> Result<usize, DecodeError> {
         section::decode::<T>(
             buf,
@@ -336,23 +335,16 @@ impl<T: Ops> OpsTable<T> {
                     }
                 }),
                 CHANGES => section::read_sized::<T>(items, at, None, LEN, |uid, bytes| {
-                    // ops to a value the receiver does not hold are skipped,
-                    // and so are those after one that fails
+                    // ops to a value the receiver does not hold are skipped
                     let mut value = resolve(uid).and_then(|e| self.tracked.get_mut_untracked(e));
-                    let mut failing = false;
                     let prefix = section::prefix_width(T::Op::MAX_ENCODED_SIZE);
                     de::prefixed(bytes, COUNT, prefix, 0, type_name::<T::Op>(), |op, _| {
                         let op = T::Op::decode(op)?;
-                        if let Some(value) = value.as_deref_mut()
-                            && !failing
-                        {
-                            failing = value.apply(&op).is_err();
+                        if let Some(value) = value.as_deref_mut() {
+                            value.apply(&op);
                         }
                         Ok(())
                     })?;
-                    if failing {
-                        failed.push(uid);
-                    }
                     Ok(())
                 }),
                 _ => section::read_uids::<T>(items, at, |uid| {
@@ -384,13 +376,13 @@ pub struct OpsMut<'a, T: Ops> {
 
 impl<T: Ops> OpsMut<'_, T> {
     /// Applies `op` to the value with [`Ops::apply`], and records it for the
-    /// tick's delta. An op that fails is not recorded.
-    pub fn apply(&mut self, op: T::Op) -> Result<(), T::Error> {
-        self.value.apply(&op)?;
+    /// tick's delta.
+    pub fn apply(&mut self, op: T::Op) {
+        self.value.apply(&op);
         self.dirty.set(self.position);
         let mut span = self.span.get();
         if span == Span::FULL {
-            return Ok(());
+            return;
         }
         // the wrappers alive at once share the arena, so it is taken out
         // of its cell to push
@@ -407,7 +399,6 @@ impl<T: Ops> OpsMut<'_, T> {
         arena.push((op, NONE));
         self.arena.set(arena);
         self.span.set(span);
-        Ok(())
     }
 }
 
@@ -526,9 +517,8 @@ impl<T: Ops> Table for OpsTable<T> {
         &mut self,
         buf: &[u8],
         resolve: &mut dyn FnMut(Uid) -> Option<Entity>,
-        failed: &mut Vec<Uid>,
     ) -> Result<usize, DecodeError> {
-        self.apply(buf, resolve, failed)
+        self.apply(buf, resolve)
     }
 }
 
@@ -734,32 +724,21 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq)]
-    enum InventoryError {
-        Occupied(u8),
-        Empty(u8),
-    }
-
+    // total: an add replaces what the slot held, and removing an empty
+    // slot leaves it empty
     impl Ops for Inventory {
         type Op = InventoryOp;
-        type Error = InventoryError;
 
-        fn apply(&mut self, op: &InventoryOp) -> Result<(), InventoryError> {
+        fn apply(&mut self, op: &InventoryOp) {
             match *op {
                 InventoryOp::Add { item, slot } => {
-                    if self.items.contains_key(&slot) {
-                        return Err(InventoryError::Occupied(slot));
-                    }
                     self.items.insert(slot, item);
                 }
                 InventoryOp::Remove(slot) => {
-                    self.items
-                        .remove(&slot)
-                        .ok_or(InventoryError::Empty(slot))?;
+                    self.items.remove(&slot);
                 }
                 InventoryOp::Clear => self.items.clear(),
             }
-            Ok(())
         }
     }
 
@@ -789,19 +768,8 @@ mod tests {
             .insert(entity, inventory(&[(3, 9)]));
         world.end_tick();
 
-        assert_eq!(
-            world.apply_op::<Inventory>(entity, Add { item: 7, slot: 2 }),
-            Some(Ok(()))
-        );
-        // an op that fails is not recorded
-        assert_eq!(
-            world.apply_op::<Inventory>(entity, Remove(5)),
-            Some(Err(InventoryError::Empty(5)))
-        );
-        world
-            .apply_op::<Inventory>(entity, Remove(3))
-            .unwrap()
-            .unwrap();
+        assert!(world.apply_op::<Inventory>(entity, Add { item: 7, slot: 2 }));
+        assert!(world.apply_op::<Inventory>(entity, Remove(3)));
         assert_eq!(ops(&world, entity), [Add { item: 7, slot: 2 }, Remove(3)]);
         assert!(world.view::<Inventory>().is_changed(entity));
 
@@ -862,7 +830,7 @@ mod tests {
                 item: slot as u32,
                 slot,
             };
-            world.apply_op::<Inventory>(entity, op).unwrap().unwrap();
+            assert!(world.apply_op::<Inventory>(entity, op));
         }
         let adds = |slots: &[u8]| {
             slots
@@ -883,7 +851,7 @@ mod tests {
         world
             .view_mut::<Inventory>()
             .insert(d, inventory(&[(1, 1)]));
-        world.apply_op::<Inventory>(d, Clear).unwrap().unwrap();
+        assert!(world.apply_op::<Inventory>(d, Clear));
         world.view_mut::<Inventory>().remove(b);
         let inventories = world.view::<Inventory>();
         assert_eq!(inventories.entities(), [a, d, c]);
@@ -902,22 +870,22 @@ mod tests {
         world
             .view_mut::<Inventory>()
             .insert(c, Inventory::default());
-        world.apply_op::<Inventory>(c, Clear).unwrap().unwrap();
+        assert!(world.apply_op::<Inventory>(c, Clear));
         assert!(ops(&world, c).is_empty());
         assert!(world.view::<Inventory>().is_added(c));
 
         // a resync drops the tick's ops, and records none after it
         assert!(world.resync::<Inventory>(a));
         assert!(ops(&world, a).is_empty());
-        world.apply_op::<Inventory>(a, Remove(0)).unwrap().unwrap();
+        assert!(world.apply_op::<Inventory>(a, Remove(0)));
         assert!(ops(&world, a).is_empty());
         assert!(!world.resync::<Inventory>(b));
 
         world.end_tick();
         assert!(world.view::<Inventory>().arena.is_empty());
         assert_eq!(world.view::<Inventory>().changed().count(), 0);
-        world.apply_op::<Inventory>(a, Remove(1)).unwrap().unwrap();
-        world.apply_op::<Inventory>(c, Clear).unwrap().unwrap();
+        assert!(world.apply_op::<Inventory>(a, Remove(1)));
+        assert!(world.apply_op::<Inventory>(c, Clear));
         assert_eq!(ops(&world, a), [Remove(1)]);
         assert_eq!(ops(&world, c), [Clear]);
     }
@@ -951,7 +919,7 @@ mod tests {
                     item: pickup.0,
                     slot,
                 };
-                inventory.apply(op).unwrap();
+                inventory.apply(op);
             }
         }
         drop(query);
@@ -982,10 +950,10 @@ mod tests {
             let mut items = join((&mut inventories, &pickups)).collect::<Vec<_>>();
             assert_eq!(items.len(), 5);
             for (_, (inventory, _)) in &mut items {
-                inventory.apply(Clear).unwrap();
+                inventory.apply(Clear);
             }
             for (_, (inventory, _)) in items.iter_mut().rev() {
-                inventory.apply(Add { item: 1, slot: 9 }).unwrap();
+                inventory.apply(Add { item: 1, slot: 9 });
             }
         }
         assert_eq!(
@@ -995,11 +963,11 @@ mod tests {
         assert_eq!(ops(&world, entities[0]), [Clear, Add { item: 1, slot: 9 }]);
 
         // replicas reject the shorthands
-        assert_eq!(world.apply_op::<Inventory>(entities[5], Clear), None);
+        assert!(!world.apply_op::<Inventory>(entities[5], Clear));
         assert!(!world.resync::<Inventory>(entities[5]));
         assert!(!world.view::<Inventory>().is_changed(entities[5]));
         let missing = world.spawn();
-        assert_eq!(world.apply_op::<Inventory>(missing, Clear), None);
+        assert!(!world.apply_op::<Inventory>(missing, Clear));
     }
 
     #[test]
@@ -1036,11 +1004,11 @@ mod tests {
         // the first tick sends every added value
         let section = encode_changes::<Inventory>(&sim, &[]);
         assert_eq!(section[2], 0b001);
-        assert!(apply::<Inventory>(&edge, &section).is_empty());
+        apply::<Inventory>(&edge, &section);
         assert_eq!(values::<Inventory>(&edge), values::<Inventory>(&sim));
         sim.end_tick();
 
-        let apply_op = |entity: Entity, op| sim.apply_op::<Inventory>(entity, op).unwrap().unwrap();
+        let apply_op = |entity: Entity, op| assert!(sim.apply_op::<Inventory>(entity, op));
         apply_op(entities[0], Add { item: 5, slot: 1 });
         apply_op(entities[0], Remove(0));
         apply_op(entities[1], Clear);
@@ -1065,7 +1033,7 @@ mod tests {
         // values part
         let section = encode_changes::<Inventory>(&sim, &[]);
         assert_eq!(section[2], 0b111);
-        assert!(apply::<Inventory>(&edge, &section).is_empty());
+        apply::<Inventory>(&edge, &section);
         let mut expected = values::<Inventory>(&sim);
         // a despawn is the frame's `gone`, not a removal
         expected.push((uids[5], inventory(&[(0, 5)])));
@@ -1106,76 +1074,24 @@ mod tests {
                 0 => Add { item: 1, slot: 0 },
                 _ => Remove(0),
             };
-            sim.apply_op::<Inventory>(a, op).unwrap().unwrap();
+            assert!(sim.apply_op::<Inventory>(a, op));
         }
         let section = encode_changes::<Inventory>(&sim, &[]);
         assert_eq!(section[2], 0b010);
         assert_eq!(&section[15..17], &65528u16.to_le_bytes());
         // 65531 bytes, then 65538
         for op in [Remove(0), Add { item: 2, slot: 1 }] {
-            sim.apply_op::<Inventory>(a, op).unwrap().unwrap();
+            assert!(sim.apply_op::<Inventory>(a, op));
         }
-        sim.apply_op::<Inventory>(b, Add { item: 3, slot: 0 })
-            .unwrap()
-            .unwrap();
+        assert!(sim.apply_op::<Inventory>(b, Add { item: 3, slot: 0 }));
 
         // a's ops overflow, so its value is sent; b's ops still fit
         let section = encode_changes::<Inventory>(&sim, &[]);
         assert_eq!(section[2], 0b011);
         assert_eq!(&section[3..7], &(8 + 2 + 5u32).to_le_bytes());
-        assert!(apply::<Inventory>(&edge, &section).is_empty());
+        apply::<Inventory>(&edge, &section);
         assert_eq!(values::<Inventory>(&edge), values::<Inventory>(&sim));
         assert_eq!(sim.view::<Inventory>().get(a), Some(&inventory(&[(1, 2)])));
-    }
-
-    #[test]
-    fn ops_apply_failure() {
-        crate::ecs::init();
-        let mut sim = sim();
-        let edge = World::new();
-        let entities = (0..3).map(|_| sim.spawn()).collect::<Vec<_>>();
-        for &entity in &entities {
-            sim.promote(entity);
-            sim.view_mut::<Inventory>()
-                .insert(entity, inventory(&[(1, 1)]));
-        }
-        apply::<Inventory>(&edge, &encode_changes::<Inventory>(&sim, &[]));
-        sim.end_tick();
-        let uids = entities
-            .iter()
-            .map(|&e| sim.uid(e).unwrap())
-            .collect::<Vec<_>>();
-
-        // the edge's value diverged, so the sim's ops fail there
-        let diverged = edge.resolve(uids[0]).unwrap();
-        edge.view_mut::<Inventory>()
-            .get_mut_untracked(diverged)
-            .unwrap()
-            .items
-            .insert(2, 9);
-        for &entity in &entities {
-            for op in [Add { item: 2, slot: 2 }, Remove(1)] {
-                sim.apply_op::<Inventory>(entity, op).unwrap().unwrap();
-            }
-        }
-
-        // the failing entity's later ops are skipped, the others apply
-        let section = encode_changes::<Inventory>(&sim, &[]);
-        assert_eq!(apply::<Inventory>(&edge, &section), [uids[0]]);
-        let edges = edge.view::<Inventory>();
-        assert_eq!(edges.get(diverged), Some(&inventory(&[(1, 1), (2, 9)])));
-        for &uid in &uids[1..] {
-            let entity = edge.resolve(uid).unwrap();
-            assert_eq!(edges.get(entity), Some(&inventory(&[(2, 2)])));
-        }
-        drop(edges);
-
-        // a resync brings it back
-        sim.end_tick();
-        sim.resync::<Inventory>(entities[0]);
-        let section = encode_changes::<Inventory>(&sim, &[]);
-        assert!(apply::<Inventory>(&edge, &section).is_empty());
-        assert_eq!(values::<Inventory>(&edge), values::<Inventory>(&sim));
     }
 
     #[test]
@@ -1189,16 +1105,13 @@ mod tests {
         world.end_tick();
         let mut table = world.tables[Inventory::id() as usize].borrow_mut();
         let mut resolve = |uid| (uid == self::uid(1)).then_some(entity);
-        let mut failed = Vec::new();
         let mut apply = |ops: &[u8]| {
             let mut buf = vec![0b010];
             buf.extend_from_slice(&(8 + 2 + ops.len() as u32).to_le_bytes());
             buf.extend_from_slice(&uid(1).to_bits().to_le_bytes());
             buf.extend_from_slice(&(ops.len() as u16).to_le_bytes());
             buf.extend_from_slice(ops);
-            table
-                .apply_section(&buf, &mut resolve, &mut failed)
-                .map(|_| ())
+            table.apply_section(&buf, &mut resolve).map(|_| ())
         };
 
         let kind = |result: Result<(), DecodeError>| result.unwrap_err().kind;
@@ -1210,7 +1123,6 @@ mod tests {
         assert_eq!(apply(&[2, 0, 1, 3, 1, 7, 0, 0, 0, 7]), Ok(()));
         assert_eq!(apply(&[0, 0]), Ok(()));
         drop(apply);
-        assert!(failed.is_empty());
         drop(table);
         assert_eq!(
             world.view::<Inventory>().get(entity),

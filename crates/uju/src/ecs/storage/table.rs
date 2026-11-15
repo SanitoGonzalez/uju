@@ -75,16 +75,10 @@ pub trait Table {
     ///
     /// Received state is not a change of this world: it marks no bit and
     /// logs nothing.
-    ///
-    /// An `ops` component whose `apply` fails on an entity has the entity's
-    /// uid appended to `failed`, and its later ops in the section skipped.
-    /// The rest of the section applies, and the entity's value needs a
-    /// resync.
     fn apply_section(
         &mut self,
         _buf: &[u8],
         _resolve: &mut dyn FnMut(Uid) -> Option<Entity>,
-        _failed: &mut Vec<Uid>,
     ) -> Result<usize, DecodeError> {
         panic!("this component is not replicated")
     }
