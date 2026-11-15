@@ -3,8 +3,9 @@
 How a table records what changed during a tick, and how a replicated table
 turns that into the sections of a [cell frame](../protocol/frames.md#sections)
 and applies the sections it receives. Storages in general are in
-[Components](components.md#storage), and the `Changed` filter in
-[Queries](queries.md#terms).
+[Components](components.md#storage), the `Changed` filter in
+[Queries](queries.md#terms), and the tracking of audience keys in
+[Audiences](audiences.md#tracking).
 
 ## Tracked tables
 
@@ -251,7 +252,7 @@ pub trait Ops: Valued {
 | Item | Meaning |
 |---|---|
 | `WIRE_ID` | The [component id](../protocol/wire-format.md#component-ids) |
-| `VISIBILITY` | `Public`, `Owner`, `None`, or `Audience(id)` with the audience's [wire id](../protocol/wire-format.md#audience-ids) |
+| `VISIBILITY` | `Public`, `Owner`, `None`, or `Audience(id)` with the [audience](audiences.md)'s [wire id](../protocol/wire-format.md#audience-ids) |
 | `HALO` | Whether neighbor shards receive it. `true` unless `VISIBILITY` is `None` |
 | `SIZE` | The size of every full encoding when they all have one, `None` otherwise |
 | `Encode`, `Decode` | The full encoding. `Decode` yields the owned value |

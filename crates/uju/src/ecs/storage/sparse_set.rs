@@ -9,13 +9,13 @@ use crate::ecs::storage::{
     table::Table,
 };
 
-pub struct SparseSet<T: Component> {
+pub struct SparseSet<T> {
     sparse: SparseArray<1024>,
     dense: Vec<Entity>,
     data: Vec<T>,
 }
 
-impl<T: Component> SparseSet<T> {
+impl<T> SparseSet<T> {
     pub fn new() -> Self {
         Self {
             sparse: SparseArray::new(),
@@ -167,7 +167,7 @@ impl<T: Component> SparseSet<T> {
     }
 }
 
-impl<T: Component> Default for SparseSet<T> {
+impl<T> Default for SparseSet<T> {
     #[inline]
     fn default() -> Self {
         Self::new()

@@ -1,3 +1,4 @@
+pub mod audience;
 mod bits;
 pub mod join;
 pub mod ops;

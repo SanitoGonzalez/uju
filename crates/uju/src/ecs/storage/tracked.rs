@@ -21,14 +21,14 @@ use crate::ecs::storage::{
 ///
 /// Removing a value added this tick logs nothing, so an add then a remove
 /// cancel out. A despawn is not logged either.
-pub struct Tracked<T: Component> {
+pub struct Tracked<T> {
     set: SparseSet<T>,
     dirty: Bits,
     added: Bits,
     removed: Vec<Entity>,
 }
 
-impl<T: Component> Tracked<T> {
+impl<T> Tracked<T> {
     pub fn new() -> Self {
         Self {
             set: SparseSet::new(),
@@ -207,7 +207,7 @@ impl<T: Component> Tracked<T> {
     }
 }
 
-impl<T: Component> Default for Tracked<T> {
+impl<T> Default for Tracked<T> {
     #[inline]
     fn default() -> Self {
         Self::new()

@@ -2,11 +2,13 @@ use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
 
 use crate::ecs::{
+    audience::{self, Audience},
     cell::Cell,
     commands::Commands,
     component::{self, Component, Ops},
     entity::{Despawned, Entity, Registry, Uid, UidAllocator},
     storage::{
+        audience::{AudienceTable, KeyTable},
         ops::OpsTable,
         table::Table,
         view::{View, ViewMut},
@@ -14,12 +16,13 @@ use crate::ecs::{
     unique::{self, Unique},
 };
 
-/// A shard's entities, component tables and uniques.
+/// A shard's entities, component tables, audience tables and uniques.
 ///
 /// A world is built on its shard's thread and never leaves it.
 pub struct World {
     pub(crate) entities: Registry,
     pub(crate) tables: Vec<RefCell<Box<dyn Table>>>,
+    pub(crate) audiences: Vec<RefCell<Box<dyn KeyTable>>>,
     pub(crate) uniques: Vec<RefCell<Option<Box<dyn Any>>>>,
     commands: RefCell<Commands>,
     despawns: RefCell<Vec<Despawned>>,
@@ -32,6 +35,10 @@ impl World {
         Self {
             entities: Registry::new(),
             tables: component::registrations()
+                .into_iter()
+                .map(|registration| RefCell::new((registration.new_table)()))
+                .collect(),
+            audiences: audience::registrations()
                 .into_iter()
                 .map(|registration| RefCell::new((registration.new_table)()))
                 .collect(),
@@ -49,7 +56,8 @@ impl World {
         self.entities.spawn()
     }
 
-    /// Frees `entity` and drops its components from every table.
+    /// Frees `entity` and drops its components, audience keys and observer
+    /// sets.
     ///
     /// Panics if any view or query is borrowed at the time.
     pub fn despawn(&self, entity: Entity) -> bool {
@@ -75,6 +83,9 @@ impl World {
             if !table.is_empty() {
                 table.despawn_batch(entities);
             }
+        }
+        for table in &self.audiences {
+            table.borrow_mut().despawn_batch(entities);
         }
         despawned
     }
@@ -164,12 +175,16 @@ impl World {
     }
 
     /// Ends the tick: rolls each entity's cell into its cell at the start of
-    /// the tick, and clears the despawn log and every table's changes.
+    /// the tick, and clears the despawn log and every table's changes,
+    /// audience tables included.
     #[cfg_attr(not(test), expect(dead_code, reason = "called by the runtime's tick"))]
     pub(crate) fn end_tick(&mut self) {
         self.entities.end_tick();
         self.despawns.get_mut().clear();
         for table in &mut self.tables {
+            table.get_mut().end_tick();
+        }
+        for table in &mut self.audiences {
             table.get_mut().end_tick();
         }
     }
@@ -197,6 +212,79 @@ impl World {
     pub fn resync<C: Ops<Storage = OpsTable<C>>>(&self, entity: Entity) -> bool {
         let mut table = self.view_mut::<C>();
         !self.is_replica(entity) && table.resync(entity)
+    }
+
+    /// `entity`'s key for audience `A`, owned or a replica's.
+    ///
+    /// Panics if `A`'s table is borrowed mutably at the time.
+    pub fn audience_key<A: Audience>(&self, entity: Entity) -> Option<A::Key> {
+        self.audience::<A>().key(entity)
+    }
+
+    /// Sets `entity`'s key for audience `A`, or clears it with `None`, and
+    /// returns the previous one. Does nothing when the key is unchanged or
+    /// `entity` is dead.
+    ///
+    /// Panics if `A`'s table is borrowed at the time.
+    pub fn set_audience_key<A: Audience>(
+        &self,
+        entity: Entity,
+        key: Option<A::Key>,
+    ) -> Option<A::Key> {
+        if !self.is_alive(entity) {
+            return None;
+        }
+        self.audience_mut::<A>().set(entity, key)
+    }
+
+    /// Makes `observer` see the entities holding any of `keys` for audience
+    /// `A`. Does nothing when `observer` is dead.
+    ///
+    /// Panics if `A`'s table is borrowed at the time.
+    pub fn set_observer_keys<A: Audience>(
+        &self,
+        observer: Entity,
+        keys: impl IntoIterator<Item = A::Key>,
+    ) {
+        if self.is_alive(observer) {
+            let keys = keys.into_iter().collect();
+            self.audience_mut::<A>().set_observer_keys(observer, keys);
+        }
+    }
+
+    /// Makes `observer` see every key of audience `A`. Does nothing when
+    /// `observer` is dead.
+    ///
+    /// Panics if `A`'s table is borrowed at the time.
+    pub fn observe_all<A: Audience>(&self, observer: Entity) {
+        if self.is_alive(observer) {
+            self.audience_mut::<A>().observe_all(observer);
+        }
+    }
+
+    /// Returns `observer` to the default set of audience `A`: its own key,
+    /// which stores nothing. Does nothing when `observer` is dead.
+    ///
+    /// Panics if `A`'s table is borrowed at the time.
+    pub fn observe_own_key<A: Audience>(&self, observer: Entity) {
+        if self.is_alive(observer) {
+            self.audience_mut::<A>().observe_own_key(observer);
+        }
+    }
+
+    /// Shared access to audience `A`'s table: its keys and observer sets.
+    ///
+    /// Panics if `A`'s table is borrowed mutably at the time.
+    pub fn audience<A: Audience>(&self) -> Ref<'_, AudienceTable<A>> {
+        Ref::map(self.audiences[A::id() as usize].borrow(), |table| {
+            table.as_any().downcast_ref().unwrap()
+        })
+    }
+
+    fn audience_mut<A: Audience>(&self) -> RefMut<'_, AudienceTable<A>> {
+        RefMut::map(self.audiences[A::id() as usize].borrow_mut(), |table| {
+            table.as_any_mut().downcast_mut().unwrap()
+        })
     }
 
     pub fn insert_unique<U: Unique>(&self, unique: U) -> Option<U> {

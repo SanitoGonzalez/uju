@@ -1,8 +1,9 @@
 # Components
 
 How a type becomes a component or a unique of a `World`, and how its values
-are stored. Entities are in [Entities](entities.md), and iterating several
-components together in [Queries](queries.md).
+are stored. Entities are in [Entities](entities.md), iterating several
+components together in [Queries](queries.md), and audience keys, which are
+not components, in [Audiences](audiences.md).
 
 ## Component and Unique
 

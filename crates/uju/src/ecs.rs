@@ -1,3 +1,4 @@
+pub mod audience;
 pub mod cell;
 pub mod commands;
 pub mod component;
@@ -20,6 +21,7 @@ pub mod prelude {
 }
 
 pub(crate) fn init() {
+    audience::init();
     component::init();
     unique::init();
 }

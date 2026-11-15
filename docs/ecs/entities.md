@@ -41,7 +41,8 @@ assert!(!world.is_alive(e));
 - **Spawning is always immediate.** The entity allocator is a borrow of
   its own, so a query's loop can spawn and hold the new entity at once.
 - **Despawning touches everything.** `despawn` and `despawn_batch` drop the
-  entity from every table, its cell and the replica flags, so they panic
+  entity from every table, [audience tables](audiences.md) included, its
+  cell and the replica flags, so they panic
   while any view or query is alive. Inside a query's loop,
   [`commands().despawn`](commands.md) defers it.
 - **Despawns are logged.** The `World` notes each despawn of an owned
