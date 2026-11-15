@@ -31,9 +31,10 @@ for (entity, (position, velocity)) in query.iter() {
 | Term | Matches entities | Yields | Borrows `C`'s table |
 |---|---|---|---|
 | `C` | Holding `C` | `&C` | Shared |
-| `Mut<C>` | Holding `C` | `C::Storage`'s [`Mut`](components.md#storage) item, `&mut C` for a `SparseSet` | Mutably |
+| `Mut<C>` | Holding `C`, owned when `C`'s storage is replicated | `C::Storage`'s [`Mut`](components.md#storage) item, `&mut C` for a `SparseSet` | Mutably |
 | `With<C>` | Holding `C` | Nothing | Shared |
 | `Without<C>` | Not holding `C` | Nothing | Shared |
+| `Changed<C>` | Whose `C` was added or [marked dirty](change-tracking.md#dirty-and-added-bits) this tick | Nothing | Shared |
 | `Owned` | Owned by this `World` | Nothing | None. Borrows the replica flags shared |
 | `Replica` | [Replicas](entities.md#replicas) | Nothing | None. Borrows the replica flags shared |
 | `(T0, T1, ...)` | Matching every term | The terms' items | As its terms do |
@@ -48,6 +49,11 @@ for (entity, (position, velocity)) in query.iter() {
   accepts one, since the cell drives.
 - **`Owned` and `Replica` leave spawning free.** The replica flags are a
   borrow of their own, so a loop over such a query can still spawn.
+- **Writes skip replicas.** A query with a `Mut<C>` term over a replicated
+  storage, such as a `ReplaceTable`, is filtered as by `Owned`. The flag is
+  read once per entity, however many such terms the query has.
+- **`Changed<C>` needs a tracked storage.** Over a `SparseSet`, the query
+  does not compile.
 
 ## Driving
 
@@ -56,8 +62,8 @@ every other term for each of them. The driver is the term with the fewest
 entities, so a query over a large table and a small one costs the small
 one's size.
 
-- `C`, `Mut<C>` and `With<C>` count their table's entities. So a `With<C>`
-  over a small table drives a query over large ones.
+- `C`, `Mut<C>`, `With<C>` and `Changed<C>` count their table's entities.
+  So a `With<C>` over a small table drives a query over large ones.
 - `Without<C>` lists the entities it excludes, so it never drives.
   `Owned` and `Replica` list none, so they never drive either.
 - A tuple drives with its smallest term.
@@ -96,7 +102,7 @@ for cell in cells {
 | Term | Yields |
 |---|---|
 | `&view`, `&view_mut` | `&C` |
-| `&mut view_mut` | The storage's `Mut` item |
+| `&mut view_mut` | The storage's `Mut` item. Skips replicas when the storage is replicated |
 | `&storage`, `&mut storage` | The same, over a storage held directly |
 | `(T0, T1, ...)` | A tuple of the terms' items, up to 12 |
 

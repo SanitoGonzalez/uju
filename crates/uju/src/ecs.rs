@@ -15,7 +15,7 @@ pub mod prelude {
 
     pub use super::cell::Cell;
     pub use super::entity::{Entity, Uid};
-    pub use super::query::{Mut, Owned, Query, Replica, With, Without};
+    pub use super::query::{Changed, Mut, Owned, Query, Replica, With, Without};
     pub use super::world::World;
 }
 

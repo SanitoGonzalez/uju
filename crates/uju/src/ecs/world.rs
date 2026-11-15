@@ -72,7 +72,7 @@ impl World {
         for table in &self.tables {
             let mut table = table.borrow_mut();
             if !table.is_empty() {
-                table.remove_batch(entities);
+                table.despawn_batch(entities);
             }
         }
         despawned
@@ -163,11 +163,14 @@ impl World {
     }
 
     /// Ends the tick: rolls each entity's cell into its cell at the start of
-    /// the tick, and clears the despawn log.
+    /// the tick, and clears the despawn log and every table's changes.
     #[cfg_attr(not(test), expect(dead_code, reason = "called by the runtime's tick"))]
     pub(crate) fn end_tick(&mut self) {
         self.entities.end_tick();
         self.despawns.get_mut().clear();
+        for table in &mut self.tables {
+            table.get_mut().end_tick();
+        }
     }
 
     pub fn insert_unique<U: Unique>(&self, unique: U) -> Option<U> {
@@ -215,10 +218,12 @@ impl World {
 
     /// Mutable access to `C`'s [`Storage`](Component::Storage).
     pub fn view_mut<C: Component>(&self) -> ViewMut<'_, C> {
-        ViewMut(RefMut::map(
-            self.tables[C::id() as usize].borrow_mut(),
-            |table| table.as_any_mut().downcast_mut::<C::Storage>().unwrap(),
-        ))
+        ViewMut {
+            storage: RefMut::map(self.tables[C::id() as usize].borrow_mut(), |table| {
+                table.as_any_mut().downcast_mut::<C::Storage>().unwrap()
+            }),
+            registry: &self.entities,
+        }
     }
 }
 

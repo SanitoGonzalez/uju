@@ -168,6 +168,10 @@ of entities other shards own. An edge's `World` holds replicas only.
   keep or skip replicas.
 - **Reads see both.** Queries without a filter yield owned entities and
   replicas alike, so gameplay can target and collide across a border.
+- **Writes skip them.** Mutable access to a replicated component, through a
+  `Mut<C>` term or a view's `get_mut`, skips replicas, since the owner's
+  next delta would overwrite the write. Components outside the schema stay
+  writable on replicas. See [Change tracking](change-tracking.md#replicas).
 
 ```rust
 let mut q = Query::<(Mut<Hp>, Owned)>::new(&world);

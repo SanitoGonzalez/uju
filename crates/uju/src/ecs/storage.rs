@@ -1,8 +1,11 @@
+mod bits;
 pub mod join;
+pub mod replace;
 pub mod sparse_array;
 pub mod sparse_bitset;
 pub mod sparse_set;
 pub mod table;
+pub mod tracked;
 pub mod view;
 
 use crate::ecs::component::Component;
@@ -19,6 +22,11 @@ use crate::ecs::storage::table::Table;
 /// what a view offers, and query terms go through this trait.
 pub trait Storage: Table + Default + 'static {
     type Component: Component;
+
+    /// Whether the component travels, so that a write to a replica would be
+    /// lost. Mutable access through a [`Mut`](crate::ecs::query::Mut) term or
+    /// a [`ViewMut`](view::ViewMut) then skips replicas.
+    const REPLICATED: bool = false;
 
     /// One entity's value, borrowed mutably.
     type Mut<'a>
@@ -44,6 +52,20 @@ pub trait Storage: Table + Default + 'static {
     fn remove(&mut self, entity: Entity) -> Option<Self::Component>;
 
     fn join_mut(&mut self) -> Self::JoinMut<'_>;
+}
+
+/// A storage that tracks the tick's changes to its entries, which the
+/// [`Changed`](crate::ecs::query::Changed) filter reads.
+pub trait Tracking: Storage {
+    /// Whether `entity`'s value was added or marked dirty this tick.
+    fn is_changed(&self, entity: Entity) -> bool;
+
+    /// Whether `entity` gained its value this tick.
+    fn is_added(&self, entity: Entity) -> bool;
+
+    /// The entities that lost their value this tick, in removal order, as
+    /// [`Table::removed`].
+    fn removed(&self) -> &[Entity];
 }
 
 #[cfg(test)]

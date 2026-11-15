@@ -85,10 +85,17 @@ impl<T: Component> SparseSet<T> {
             .and_then(|index| self.data.get_mut(index))
     }
 
+    /// `entity`'s dense position, if it holds a value.
     #[inline]
-    fn index_of(&self, entity: Entity) -> Option<usize> {
+    pub(crate) fn index_of(&self, entity: Entity) -> Option<usize> {
         let index = self.sparse.get(entity.index_sparse())?;
         (self.dense[index] == entity).then_some(index)
+    }
+
+    /// The value at dense position `index`, which must be in bounds.
+    #[inline]
+    pub(crate) fn value_mut_at(&mut self, index: usize) -> &mut T {
+        &mut self.data[index]
     }
 
     #[inline]
@@ -135,8 +142,22 @@ impl<T: Component> SparseSet<T> {
     /// that would alias two `&mut` to one component.
     #[inline]
     pub(crate) unsafe fn get_mut_unbound<'a>(&mut self, entity: Entity) -> Option<&'a mut T> {
+        unsafe { self.get_mut_indexed_unbound(entity) }.map(|(_, value)| value)
+    }
+
+    /// [`get_mut_unbound`](Self::get_mut_unbound), with the value's dense
+    /// position.
+    ///
+    /// # Safety
+    ///
+    /// As for `get_mut_unbound`.
+    #[inline]
+    pub(crate) unsafe fn get_mut_indexed_unbound<'a>(
+        &mut self,
+        entity: Entity,
+    ) -> Option<(usize, &'a mut T)> {
         let index = self.index_of(entity)?;
-        unsafe { Some(&mut *self.data.as_mut_ptr().add(index)) }
+        unsafe { Some((index, &mut *self.data.as_mut_ptr().add(index))) }
     }
 }
 

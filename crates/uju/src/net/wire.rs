@@ -56,7 +56,9 @@ pub trait Encode {
     fn write(&self, w: &mut en::Writer<'_>) -> Result<(), EncodeError>;
 }
 
-/// A view validated out of exactly the bytes of one encoding.
+/// A value validated out of exactly the bytes of one encoding: a view, or
+/// an owned value copied out, as a
+/// [`Replace`](crate::ecs::component::Replace) component decodes.
 pub trait Decode<'a>: Sized {
     fn decode(buf: &'a [u8]) -> Result<Self, DecodeError>;
 }

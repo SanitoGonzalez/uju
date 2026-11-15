@@ -4,15 +4,73 @@ use std::sync::Once;
 use linkme::distributed_slice;
 
 use crate::ecs::storage::{Storage, table::Table};
+use crate::net::wire::{Decode, Encode};
 
 pub type Id = u16;
 
 pub trait Component: 'static {
     /// The table that holds this component. `#[derive(Component)]` picks
-    /// [`SparseSet`](crate::ecs::storage::sparse_set::SparseSet).
+    /// [`SparseSet`](crate::ecs::storage::sparse_set::SparseSet), unless
+    /// told otherwise with `#[component(storage = Tracked<Self>)]`.
     type Storage: Storage<Component = Self>;
 
     fn id() -> Id;
+}
+
+/// Who receives a replicated component's changes, besides the halo stream.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Visibility {
+    /// Every client whose view covers the entity's cell.
+    Public,
+    /// The entity's own client, through its owner frames.
+    Owner,
+    /// No client.
+    None,
+    /// The clients whose observer set holds the entity's key for the
+    /// audience with this wire id.
+    Audience(u16),
+}
+
+/// A component declared in the schema, which travels with its entity: what
+/// every component and tag has.
+pub trait Replicated: Component {
+    /// The id in the component id space, which names it on the wire.
+    const WIRE_ID: u16;
+
+    const VISIBILITY: Visibility;
+
+    /// Whether neighbor shards replicating the entity's cell receive it.
+    const HALO: bool = !matches!(Self::VISIBILITY, Visibility::None);
+}
+
+/// A [`Replicated`] component whose changes travel as its whole value,
+/// stored in a [`ReplaceTable`](crate::ecs::storage::replace::ReplaceTable).
+///
+/// Decoding yields the owned value, so the type implements `Decode` for
+/// every lifetime.
+pub trait Replace: Replicated + Encode + for<'a> Decode<'a> {
+    /// The size of every encoding, when they all have one. A section packs
+    /// the values of such a component with no length prefix.
+    const SIZE: Option<usize>;
+}
+
+/// What the runtime needs to route a replicated table's sections, read
+/// through [`Table::replication`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Replication {
+    pub wire_id: u16,
+    pub visibility: Visibility,
+    pub halo: bool,
+}
+
+impl Replication {
+    pub const fn of<C: Replicated>() -> Self {
+        Self {
+            wire_id: C::WIRE_ID,
+            visibility: C::VISIBILITY,
+            halo: C::HALO,
+        }
+    }
 }
 
 pub struct Registration {

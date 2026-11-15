@@ -1,7 +1,15 @@
 use std::any::Any;
 
-use crate::ecs::entity::Entity;
+use crate::ecs::component::Replication;
+use crate::ecs::entity::{Entity, Uid};
+use crate::net::wire::{DecodeError, EncodeError};
 
+/// A component's table without its type, as the `World` and the runtime
+/// drive it.
+///
+/// The replication methods mean something only for a table whose
+/// [`replication`](Table::replication) is `Some`. The others write nothing,
+/// report no change, and panic when asked to apply a section.
 pub trait Table {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -17,6 +25,61 @@ pub trait Table {
         }
     }
 
+    /// Drops the values of despawned entities. Unlike a removal, a despawn
+    /// is not logged, since the frame's `gone` covers it.
+    fn despawn_batch(&mut self, entities: &[Entity]) {
+        self.remove_batch(entities);
+    }
+
     fn contains(&self, entity: Entity) -> bool;
     fn clear(&mut self);
+
+    /// Clears the tick's changes: dirty and added bits, and the remove log.
+    fn end_tick(&mut self) {}
+
+    /// How the component travels, `None` for one that does not.
+    fn replication(&self) -> Option<Replication> {
+        None
+    }
+
+    /// Appends the entities whose value was added or changed this tick, in
+    /// dense order.
+    fn changed(&self, _out: &mut Vec<Entity>) {}
+
+    /// The entities that lost the component this tick, in removal order.
+    /// Some may be dead, or hold the component again.
+    fn removed(&self) -> &[Entity] {
+        &[]
+    }
+
+    /// Appends one section of a cell's sub-frame: the full values of the
+    /// `full` entities, such as those that entered the cell, the changes of
+    /// the `changed` ones, and the `removed` uids.
+    ///
+    /// Entities that hold no value are skipped, and an entity must not be in
+    /// both lists. A snapshot is a section with only `full`. Returns whether
+    /// it wrote a section, which it does not when nothing remains to write.
+    fn encode_section(
+        &self,
+        _full: &[(Uid, Entity)],
+        _changed: &[(Uid, Entity)],
+        _removed: &[Uid],
+        _out: &mut Vec<u8>,
+    ) -> Result<bool, EncodeError> {
+        Ok(false)
+    }
+
+    /// Applies the section at the start of `buf`, which begins after the
+    /// component id, and returns its length. `resolve` maps each uid to the
+    /// entity it lands on, or to `None` to skip the item.
+    ///
+    /// Received state is not a change of this world: it marks no bit and
+    /// logs nothing.
+    fn apply_section(
+        &mut self,
+        _buf: &[u8],
+        _resolve: &mut dyn FnMut(Uid) -> Option<Entity>,
+    ) -> Result<usize, DecodeError> {
+        panic!("this component is not replicated")
+    }
 }

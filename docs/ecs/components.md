@@ -48,12 +48,19 @@ A component's table is its **storage**, the associated type
 `Component::Storage`. It decides how values are laid out and what mutable
 access hands out.
 
-- **Derived.** `#[derive(Component)]` picks `SparseSet<C>`.
+- **Derived.** `#[derive(Component)]` picks `SparseSet<C>`, unless the
+  type names another with `#[component(storage = Tracked<Self>)]`.
 - **Shared access** yields `&C`, whatever the storage.
 - **Mutable access** yields the storage's `Mut<'a>` item. For a `SparseSet`
   it is `&'a mut C`. A storage that must see every write, such as one that
   tracks changes, makes it a wrapper instead, and [`Mut<C>`](queries.md#terms)
   query terms and [`join`](queries.md#join) yield that wrapper.
+
+| Storage | Mutable item | Tracks changes | Replicated |
+|---|---|---|---|
+| `SparseSet<C>` | `&mut C` | No | No |
+| [`Tracked<C>`](change-tracking.md#tracked-tables) | `TrackedMut<C>` | Yes | No |
+| [`ReplaceTable<C>`](change-tracking.md#tracked-tables) | `TrackedMut<C>` | Yes | Yes, as whole values |
 
 ### SparseSet
 
@@ -71,12 +78,14 @@ paged sparse array.
 ### The Storage trait
 
 A storage implements `Storage`, plus `Table`, the untyped interface the
-`World` uses to drop a despawned entity's values, and `Default`, which
-builds the empty table.
+`World` and the runtime use to drop a despawned entity's values, end the
+tick and [replicate](change-tracking.md#the-table-interface), and
+`Default`, which builds the empty table.
 
 | Item | Meaning |
 |---|---|
 | `type Component` | The component it stores |
+| `const REPLICATED` | Whether the component travels, so mutable access skips replicas. `false` by default |
 | `type Mut<'a>` | One value borrowed mutably |
 | `type JoinMut<'a>` | The mutable join term, built once per join or query from `&'a mut self` |
 | `entities()` | The entities holding a value, in dense order |
@@ -137,7 +146,9 @@ hps.get_mut(e).unwrap().0 -= 3;
 assert_eq!(hps.get(e), Some(&Hp(7)));
 ```
 
-A `SparseSet` offers:
+A `SparseSet` offers the following. Tracked storages offer the same but
+`iter_mut` and `components_mut`, plus their
+[changes](change-tracking.md#tracked-tables).
 
 | Method | Does |
 |---|---|
@@ -158,4 +169,7 @@ A `SparseSet` offers:
   [`join`](queries.md#join).
 - **Deferred changes.** Inside a query's loop, a view of a table the query
   holds panics. [Commands](commands.md) insert and remove there instead.
+- **Replicas.** When the storage is replicated, `view_mut.get_mut(entity)`
+  returns `None` for a [replica](entities.md#replicas), and the
+  `&mut view_mut` join term skips replicas. `insert` and `remove` do not.
 

@@ -2,7 +2,11 @@ use std::cell::{Ref, RefMut};
 use std::ops::{Deref, DerefMut};
 
 use crate::ecs::component::Component;
-use crate::ecs::storage::{Storage, join::IntoJoinable};
+use crate::ecs::entity::{Entity, Registry, Replicas};
+use crate::ecs::storage::{
+    Storage,
+    join::{Entities, IntoJoinable, Joinable},
+};
 
 /// Shared borrow of one component's storage, checked out of the [`World`].
 ///
@@ -19,12 +23,32 @@ pub struct View<'w, C: Component>(pub(crate) Ref<'w, C::Storage>);
 /// Exclusive borrow of one component's storage, checked out of the [`World`].
 ///
 /// Derefs to [`C::Storage`](Component::Storage) including mutation
-/// (`insert`, `remove`, `get_mut`), and both `&view` (shared) and
-/// `&mut view` (mutable) are join terms:
-/// `join((&mut velocities, &transforms))`.
+/// (`insert`, `remove`), and both `&view` (shared) and `&mut view` (mutable)
+/// are join terms: `join((&mut velocities, &transforms))`.
+///
+/// When the storage is [replicated](Storage::REPLICATED), its own
+/// [`get_mut`](Self::get_mut) and the `&mut view` term skip replicas.
 ///
 /// [`World`]: crate::ecs::world::World
-pub struct ViewMut<'w, C: Component>(pub(crate) RefMut<'w, C::Storage>);
+pub struct ViewMut<'w, C: Component> {
+    pub(crate) storage: RefMut<'w, C::Storage>,
+    pub(crate) registry: &'w Registry,
+}
+
+impl<C: Component> ViewMut<'_, C> {
+    /// `entity`'s value borrowed mutably, or `None` when it holds none or,
+    /// for a replicated storage, is a replica.
+    ///
+    /// Panics if the replica flags are borrowed mutably, which only the
+    /// runtime does, between systems.
+    #[inline]
+    pub fn get_mut(&mut self, entity: Entity) -> Option<<C::Storage as Storage>::Mut<'_>> {
+        if <C::Storage as Storage>::REPLICATED && self.registry.replicas().contains(entity) {
+            return None;
+        }
+        self.storage.get_mut(entity)
+    }
+}
 
 impl<C: Component> Deref for View<'_, C> {
     type Target = C::Storage;
@@ -40,14 +64,14 @@ impl<C: Component> Deref for ViewMut<'_, C> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.storage
     }
 }
 
 impl<C: Component> DerefMut for ViewMut<'_, C> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.storage
     }
 }
 
@@ -65,16 +89,53 @@ impl<'a, C: Component> IntoJoinable<'a> for &'a ViewMut<'_, C> {
 
     #[inline]
     fn into_joinable(self) -> Self::Joinable {
-        &self.0
+        &self.storage
     }
 }
 
 impl<'a, C: Component> IntoJoinable<'a> for &'a mut ViewMut<'_, C> {
-    type Joinable = <C::Storage as Storage>::JoinMut<'a>;
+    type Joinable = SkipReplicas<'a, <C::Storage as Storage>::JoinMut<'a>>;
 
     #[inline]
     fn into_joinable(self) -> Self::Joinable {
-        self.0.join_mut()
+        SkipReplicas {
+            replicas: <C::Storage as Storage>::REPLICATED.then(|| self.registry.replicas()),
+            join: self.storage.join_mut(),
+        }
+    }
+}
+
+/// A mutable join term over a [`ViewMut`], which skips replicas when the
+/// storage is replicated.
+pub struct SkipReplicas<'a, J> {
+    join: J,
+    replicas: Option<Ref<'a, Replicas>>,
+}
+
+// SAFETY: delegates to `J`, and only skips some of its probes.
+unsafe impl<'a, J: Joinable<'a>> Joinable<'a> for SkipReplicas<'a, J> {
+    type Item = J::Item;
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.join.len()
+    }
+
+    #[inline]
+    fn entities(&self) -> Entities<'a> {
+        self.join.entities()
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        if self
+            .replicas
+            .as_ref()
+            .is_some_and(|replicas| replicas.contains(entity))
+        {
+            return None;
+        }
+        unsafe { self.join.get(entity) }
     }
 }
 

@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{DeriveInput, Error, Result};
+use syn::{DeriveInput, Error, Result, Type};
 
 pub fn expand(ast: DeriveInput) -> Result<TokenStream> {
     if !ast.generics.params.is_empty() {
@@ -11,6 +11,26 @@ pub fn expand(ast: DeriveInput) -> Result<TokenStream> {
     }
 
     let ident = &ast.ident;
+
+    // `#[component(storage = Tracked<Self>)]` picks the table
+    let mut storage: Option<Type> = None;
+    for attr in &ast.attrs {
+        if !attr.path().is_ident("component") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("storage") {
+                storage = Some(meta.value()?.parse()?);
+                Ok(())
+            } else {
+                Err(meta.error("expected `storage = Type`"))
+            }
+        })?;
+    }
+    let storage = match storage {
+        Some(storage) => quote!(#storage),
+        None => quote!(::uju::ecs::storage::sparse_set::SparseSet<#ident>),
+    };
 
     Ok(quote! {
         const _: () = {
@@ -24,7 +44,7 @@ pub fn expand(ast: DeriveInput) -> Result<TokenStream> {
                 };
 
             impl ::uju::ecs::component::Component for #ident {
-                type Storage = ::uju::ecs::storage::sparse_set::SparseSet<#ident>;
+                type Storage = #storage;
 
                 #[inline(always)]
                 fn id() -> ::uju::ecs::component::Id {

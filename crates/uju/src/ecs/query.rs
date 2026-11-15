@@ -6,7 +6,7 @@ use crate::ecs::{
     component::Component,
     entity::{Entity, Replicas},
     storage::{
-        Storage,
+        Storage, Tracking,
         join::{Entities, Join, Joinable},
         table::Table,
         view::{View, ViewMut},
@@ -36,6 +36,24 @@ pub struct With<C: Component>(PhantomData<C>);
 /// term.
 pub struct Without<C: Component>(PhantomData<C>);
 
+/// Filters a query to entities whose `C` was added or marked dirty since the
+/// tick began, contributing nothing to the yielded item.
+///
+/// `C`'s storage must track changes, such as a
+/// [`Tracked`](crate::ecs::storage::tracked::Tracked) one:
+///
+/// ```compile_fail,E0277
+/// # use uju::prelude::*;
+/// #[derive(Component)]
+/// struct Hp(u32);
+///
+/// let world = World::new();
+/// let _ = Query::<(Hp, Changed<Hp>)>::new(&world); // a `SparseSet`
+/// ```
+///
+/// Holds a shared borrow of `C`'s table, and drives like [`With<C>`].
+pub struct Changed<C: Component>(PhantomData<C>);
+
 /// Filters a query to the entities this world owns, skipping replicas.
 ///
 /// Holds a shared borrow of the [`Replicas`] flags. It never drives
@@ -49,8 +67,9 @@ pub struct Owned;
 pub struct Replica;
 
 /// A term of a [`Query`]: a bare component type reads (`&C`), [`Mut<C>`]
-/// writes (the storage's [`Storage::Mut`]), [`With<C>`]/[`Without<C>`] and
-/// [`Owned`]/[`Replica`] filter, and a tuple of terms composes. Filters are stripped from the yielded item, and tuples flatten:
+/// writes (the storage's [`Storage::Mut`]), [`With<C>`]/[`Without<C>`],
+/// [`Changed<C>`] and [`Owned`]/[`Replica`] filter, and a tuple of terms
+/// composes. Filters are stripped from the yielded item, and tuples flatten:
 /// `(A, B, (With<Foo>, Without<Bar>))` yields `(&A, &B)`, and a lone data
 /// term yields its item bare - `(Mut<A>, With<Foo>)` yields `&mut A`.
 pub trait Term {
@@ -62,6 +81,10 @@ pub trait Term {
     /// [`Cons`] of the component borrow for data terms, `Rest` unchanged for
     /// filters.
     type Item<'q, 'w: 'q, Rest>;
+
+    /// Whether the term writes a [replicated](Storage::REPLICATED) storage,
+    /// so the query skips replicas.
+    const SKIPS_REPLICAS: bool = false;
 
     fn fetch(world: &World) -> Self::View<'_>;
     fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w>;
@@ -95,6 +118,8 @@ impl<C: Component> Term for Mut<C> {
     type View<'w> = ViewMut<'w, C>;
     type Join<'q, 'w: 'q> = <C::Storage as Storage>::JoinMut<'q>;
     type Item<'q, 'w: 'q, Rest> = Cons<<C::Storage as Storage>::Mut<'q>, Rest>;
+
+    const SKIPS_REPLICAS: bool = <C::Storage as Storage>::REPLICATED;
 
     fn fetch(world: &World) -> Self::View<'_> {
         world.view_mut()
@@ -149,6 +174,49 @@ impl<C: Component> Term for Without<C> {
     #[inline]
     fn item<'q, 'w: 'q, Rest>((): (), rest: Rest) -> Self::Item<'q, 'w, Rest> {
         rest
+    }
+}
+
+impl<C: Component<Storage: Tracking>> Term for Changed<C> {
+    type View<'w> = View<'w, C>;
+    type Join<'q, 'w: 'q> = ChangedJoin<'q, C::Storage>;
+    type Item<'q, 'w: 'q, Rest> = Rest;
+
+    fn fetch(world: &World) -> Self::View<'_> {
+        world.view()
+    }
+
+    fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w> {
+        ChangedJoin(view)
+    }
+
+    #[inline]
+    fn item<'q, 'w: 'q, Rest>((): (), rest: Rest) -> Self::Item<'q, 'w, Rest> {
+        rest
+    }
+}
+
+/// [`Changed`] as a join term.
+pub struct ChangedJoin<'q, S: Tracking>(&'q S);
+
+// SAFETY: `entities` delegates to the shared storage term's guarantees;
+// `get` hands out no references.
+unsafe impl<'q, S: Tracking> Joinable<'q> for ChangedJoin<'q, S> {
+    type Item = ();
+
+    #[inline]
+    fn len(&self) -> usize {
+        Table::len(self.0)
+    }
+
+    #[inline]
+    fn entities(&self) -> Entities<'q> {
+        Joinable::entities(&self.0)
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        self.0.is_changed(entity).then_some(())
     }
 }
 
@@ -259,6 +327,34 @@ unsafe impl<'q> Joinable<'q> for OwnedJoin<'q> {
     #[inline]
     unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
         (!self.0.contains(entity)).then_some(())
+    }
+}
+
+/// The [`Owned`] filter a query adds once when a term
+/// [skips replicas](Term::SKIPS_REPLICAS), so the flag is read once per
+/// entity whatever the number of such terms.
+struct OwnedIf<'q>(Option<&'q Replicas>);
+
+// SAFETY: `entities` is unreachable (`len` keeps this term from ever being
+// the shortest); `get` hands out no references.
+unsafe impl<'q> Joinable<'q> for OwnedIf<'q> {
+    type Item = ();
+
+    #[inline]
+    fn len(&self) -> usize {
+        usize::MAX
+    }
+
+    fn entities(&self) -> Entities<'q> {
+        unreachable!("a query's replica filter never drives")
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        match self.0 {
+            Some(replicas) => (!replicas.contains(entity)).then_some(()),
+            None => Some(()),
+        }
     }
 }
 
@@ -375,6 +471,8 @@ macro_rules! impl_term {
             type Join<'q, 'w: 'q> = ($($T::Join<'q, 'w>,)+);
             type Item<'q, 'w: 'q, Rest> = fold_item_ty!(Rest; 'q, 'w; $($T),+);
 
+            const SKIPS_REPLICAS: bool = $($T::SKIPS_REPLICAS)||+;
+
             fn fetch(world: &World) -> Self::View<'_> {
                 ($($T::fetch(world),)+)
             }
@@ -417,9 +515,13 @@ impl_term!(
 /// of the same component (another query, a view) panics at
 /// [`Query::new`]. [`iter_in`](Self::iter_in) also borrows the cell index,
 /// from its first call until the query is dropped.
+///
+/// A query with a [`Mut`] term over a replicated storage skips replicas, as
+/// if filtered by [`Owned`], and borrows the replica flags shared.
 pub struct Query<'w, Q: Term> {
     world: &'w World,
     views: Q::View<'w>,
+    replicas: Option<Ref<'w, Replicas>>,
     cells: Option<Ref<'w, CellIndex>>,
 }
 
@@ -428,6 +530,7 @@ impl<'w, Q: Term> Query<'w, Q> {
         Self {
             world,
             views: Q::fetch(world),
+            replicas: Q::SKIPS_REPLICAS.then(|| world.entities().replicas()),
             cells: None,
         }
     }
@@ -441,8 +544,9 @@ impl<'w, Q: Term> Query<'w, Q> {
     where
         Q::Item<'q, 'w, Nil>: Flatten,
     {
-        Join::new(Q::join(&mut self.views))
-            .map(|(entity, item)| (entity, Q::item(item, Nil).flatten()))
+        let replicas = OwnedIf(self.replicas.as_deref());
+        Join::new((Q::join(&mut self.views), replicas))
+            .map(|(entity, (item, ()))| (entity, Q::item(item, Nil).flatten()))
     }
 
     /// Like [`iter`](Self::iter), over the entities in `cell` only. The
@@ -462,8 +566,9 @@ impl<'w, Q: Term> Query<'w, Q> {
         let cells = self
             .cells
             .get_or_insert_with(|| world.entities().cell_index());
-        Join::new((Q::join(&mut self.views), cells.join(cell)))
-            .map(|(entity, (item, ()))| (entity, Q::item(item, Nil).flatten()))
+        let replicas = OwnedIf(self.replicas.as_deref());
+        Join::new((Q::join(&mut self.views), cells.join(cell), replicas))
+            .map(|(entity, (item, (), ()))| (entity, Q::item(item, Nil).flatten()))
     }
 }
 
