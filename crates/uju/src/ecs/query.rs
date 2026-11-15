@@ -4,15 +4,18 @@ use crate::ecs::{
     component::Component,
     entity::Entity,
     storage::{
-        join::{Entities, Joinable, join},
-        sparse_set::SparseSet,
+        Storage,
+        join::{Entities, Join, Joinable},
+        table::Table,
         view::{View, ViewMut},
     },
     world::World,
 };
 
 /// Marks a query term as mutable: `Query::<(Mut<Position>, Velocity)>`
-/// yields `&mut Position` alongside `&Velocity`.
+/// yields `Position`'s [`Storage::Mut`] item alongside `&Velocity`. That is
+/// `&mut Position` when `Position` is stored in a
+/// [`SparseSet`](crate::ecs::storage::sparse_set::SparseSet).
 pub struct Mut<C: Component>(PhantomData<C>);
 
 /// Filters a query to entities carrying `C`, contributing nothing to the
@@ -32,7 +35,7 @@ pub struct With<C: Component>(PhantomData<C>);
 pub struct Without<C: Component>(PhantomData<C>);
 
 /// A term of a [`Query`]: a bare component type reads (`&C`), [`Mut<C>`]
-/// writes (`&mut C`), [`With<C>`]/[`Without<C>`] filter, and a tuple of terms
+/// writes (the storage's [`Storage::Mut`]), [`With<C>`]/[`Without<C>`] filter, and a tuple of terms
 /// composes. Filters are stripped from the yielded item, and tuples flatten:
 /// `(A, B, (With<Foo>, Without<Bar>))` yields `(&A, &B)`, and a lone data
 /// term yields its item bare - `(Mut<A>, With<Foo>)` yields `&mut A`.
@@ -56,13 +59,14 @@ pub trait Term {
 
 impl<C: Component> Term for C {
     type View<'w> = View<'w, C>;
-    type Join<'q, 'w: 'q> = &'q View<'w, C>;
+    type Join<'q, 'w: 'q> = &'q C::Storage;
     type Item<'q, 'w: 'q, Rest> = Cons<&'q C, Rest>;
 
     fn fetch(world: &World) -> Self::View<'_> {
         world.view()
     }
 
+    #[inline]
     fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w> {
         view
     }
@@ -75,26 +79,30 @@ impl<C: Component> Term for C {
 
 impl<C: Component> Term for Mut<C> {
     type View<'w> = ViewMut<'w, C>;
-    type Join<'q, 'w: 'q> = &'q mut ViewMut<'w, C>;
-    type Item<'q, 'w: 'q, Rest> = Cons<&'q mut C, Rest>;
+    type Join<'q, 'w: 'q> = <C::Storage as Storage>::JoinMut<'q>;
+    type Item<'q, 'w: 'q, Rest> = Cons<<C::Storage as Storage>::Mut<'q>, Rest>;
 
     fn fetch(world: &World) -> Self::View<'_> {
         world.view_mut()
     }
 
+    #[inline]
     fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w> {
-        view
+        view.join_mut()
     }
 
     #[inline]
-    fn item<'q, 'w: 'q, Rest>(item: &'q mut C, rest: Rest) -> Self::Item<'q, 'w, Rest> {
+    fn item<'q, 'w: 'q, Rest>(
+        item: <C::Storage as Storage>::Mut<'q>,
+        rest: Rest,
+    ) -> Self::Item<'q, 'w, Rest> {
         Cons(item, rest)
     }
 }
 
 impl<C: Component> Term for With<C> {
     type View<'w> = View<'w, C>;
-    type Join<'q, 'w: 'q> = WithJoin<'q, C>;
+    type Join<'q, 'w: 'q> = WithJoin<'q, C::Storage>;
     type Item<'q, 'w: 'q, Rest> = Rest;
 
     fn fetch(world: &World) -> Self::View<'_> {
@@ -113,7 +121,7 @@ impl<C: Component> Term for With<C> {
 
 impl<C: Component> Term for Without<C> {
     type View<'w> = View<'w, C>;
-    type Join<'q, 'w: 'q> = WithoutJoin<'q, C>;
+    type Join<'q, 'w: 'q> = WithoutJoin<'q, C::Storage>;
     type Item<'q, 'w: 'q, Rest> = Rest;
 
     fn fetch(world: &World) -> Self::View<'_> {
@@ -131,16 +139,16 @@ impl<C: Component> Term for Without<C> {
 }
 
 /// [`With`] as a join term.
-pub struct WithJoin<'q, C: Component>(&'q SparseSet<C>);
+pub struct WithJoin<'q, S: Storage>(&'q S);
 
-// SAFETY: `entities` delegates to the shared `SparseSet` term's guarantees;
+// SAFETY: `entities` delegates to the shared storage term's guarantees;
 // `get` hands out no references, so at-most-once is trivially upheld.
-unsafe impl<'q, C: Component> Joinable<'q> for WithJoin<'q, C> {
+unsafe impl<'q, S: Storage> Joinable<'q> for WithJoin<'q, S> {
     type Item = ();
 
     #[inline]
     fn len(&self) -> usize {
-        self.0.len()
+        Table::len(self.0)
     }
 
     #[inline]
@@ -150,16 +158,16 @@ unsafe impl<'q, C: Component> Joinable<'q> for WithJoin<'q, C> {
 
     #[inline]
     unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
-        self.0.contains(entity).then_some(())
+        Table::contains(self.0, entity).then_some(())
     }
 }
 
 /// [`Without`] as a join term.
-pub struct WithoutJoin<'q, C: Component>(&'q SparseSet<C>);
+pub struct WithoutJoin<'q, S: Storage>(&'q S);
 
 // SAFETY: `entities` is unreachable (`len` keeps this term from ever being
 // the shortest); `get` hands out no references.
-unsafe impl<'q, C: Component> Joinable<'q> for WithoutJoin<'q, C> {
+unsafe impl<'q, S: Storage> Joinable<'q> for WithoutJoin<'q, S> {
     type Item = ();
 
     #[inline]
@@ -175,7 +183,7 @@ unsafe impl<'q, C: Component> Joinable<'q> for WithoutJoin<'q, C> {
 
     #[inline]
     unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
-        (!self.0.contains(entity)).then_some(())
+        (!Table::contains(self.0, entity)).then_some(())
     }
 }
 
@@ -330,7 +338,8 @@ impl<'w, Q: Term> Query<'w, Q> {
     where
         Q::Item<'q, 'w, Nil>: Flatten,
     {
-        join(Q::join(&mut self.views)).map(|(entity, item)| (entity, Q::item(item, Nil).flatten()))
+        Join::new(Q::join(&mut self.views))
+            .map(|(entity, item)| (entity, Q::item(item, Nil).flatten()))
     }
 }
 
@@ -359,7 +368,7 @@ mod tests {
     #[test]
     fn query_terms() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
 
         for index in 0..3 {
             world
@@ -390,7 +399,7 @@ mod tests {
     #[test]
     fn query_filters() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
 
         for index in 0..4 {
             world
@@ -424,7 +433,7 @@ mod tests {
     #[test]
     fn query_with_drives() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
 
         for index in 0..3 {
             world
@@ -470,7 +479,7 @@ mod tests {
     #[test]
     fn query_max_arity() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
 
         let target = entity(0);
         world.view_mut::<C0>().insert(target, C0(0));
@@ -521,7 +530,7 @@ mod tests {
     #[should_panic(expected = "cannot drive iteration")]
     fn query_without_alone_panics() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
 
         let _ = Query::<Without<Frozen>>::new(&world).iter();
     }

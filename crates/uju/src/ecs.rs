@@ -1,5 +1,7 @@
+pub mod commands;
 pub mod component;
 pub mod entity;
+mod hash;
 pub mod query;
 pub mod storage;
 pub mod unique;
@@ -10,7 +12,7 @@ pub use uju_macros::*;
 pub mod prelude {
     pub use uju_macros::{Component, Unique};
 
-    pub use super::entity::Entity;
+    pub use super::entity::{Entity, Uid};
     pub use super::query::{Mut, Query, With, Without};
     pub use super::world::World;
 }

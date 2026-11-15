@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
-use crate::topology::{NodeId, ShardId};
+use crate::ecs::hash::FoldBuildHasher;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]
@@ -224,110 +224,149 @@ impl Default for Allocator {
     }
 }
 
-/// Cluster-wide identity of an entity, stable across migrations. `node` and `shard`
-/// name the creator, not the current owner - they only keep serials from colliding.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct UniversalId {
-    serial: u64,
-    node: NodeId,
-    shard: ShardId,
-}
+/// Cluster-wide identity of an entity, stable across migrations: `incarnation << 32 | serial`.
+///
+/// The incarnation names the shard instance that minted it, not its current owner. It is
+/// never zero, so `Option<Uid>` stays 8 bytes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct Uid(NonZeroU64);
 
-impl UniversalId {
-    pub const BYTES: usize = 12;
-
+impl Uid {
     #[inline]
-    pub const fn new(node: NodeId, shard: ShardId, serial: u64) -> Self {
-        Self {
-            serial,
-            node,
-            shard,
+    pub const fn new(incarnation: NonZeroU32, serial: u32) -> Self {
+        Self::from_bits((incarnation.get() as u64) << 32 | serial as u64)
+    }
+
+    #[inline(always)]
+    pub const fn to_bits(self) -> u64 {
+        self.0.get()
+    }
+
+    #[inline(always)]
+    pub const fn from_bits(bits: u64) -> Self {
+        match NonZeroU64::new(bits) {
+            Some(bits) if bits.get() >> 32 != 0 => Self(bits),
+            _ => panic!("uid incarnation must be non-zero"),
         }
     }
 
     #[inline(always)]
-    pub const fn serial(&self) -> u64 {
-        self.serial
+    pub const fn incarnation(self) -> NonZeroU32 {
+        match NonZeroU32::new((self.0.get() >> 32) as u32) {
+            Some(incarnation) => incarnation,
+            None => unreachable!(),
+        }
     }
 
     #[inline(always)]
-    pub const fn node(&self) -> NodeId {
-        self.node
-    }
-
-    #[inline(always)]
-    pub const fn shard(&self) -> ShardId {
-        self.shard
+    pub const fn serial(self) -> u32 {
+        self.0.get() as u32
     }
 }
 
-impl fmt::Debug for UniversalId {
+impl fmt::Debug for Uid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
     }
 }
 
-impl fmt::Display for UniversalId {
+impl fmt::Display for Uid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}:{}", self.node, self.shard, self.serial)
+        write!(f, "{}:{}", self.incarnation(), self.serial())
     }
 }
 
-/// Mints [`UniversalId`]s for one shard. Counters are never reused.
-pub struct UniversalAllocator {
-    node: NodeId,
-    shard: ShardId,
+/// Mints [`Uid`]s for a shard from two incarnations: the current one, counting serials
+/// from `0`, and a spare it switches to when the current one runs out.
+///
+/// It never asks for incarnations itself. Whoever installed it reads the incarnations it
+/// switched away from with [`take_retired`](Self::take_retired), and hands it the next
+/// spare with [`set_spare`](Self::set_spare).
+pub struct UidAllocator {
+    current: NonZeroU32,
     next: u64,
+    spare: Option<NonZeroU32>,
+    retired: Vec<NonZeroU32>,
 }
 
-impl UniversalAllocator {
-    /// Creates an allocator minting from `start`.
-    ///
-    /// Migrated entities can outlive their creator, so after a restart `start` must
-    /// exceed every serial minted before - otherwise ids may alias live entities.
-    /// Persist [`next_serial`](Self::next_serial) and pass it back here.
-    pub fn new(node: NodeId, shard: ShardId, start: u64) -> Self {
+impl UidAllocator {
+    /// Serials one incarnation can mint.
+    pub const SERIALS: u64 = 1 << 32;
+
+    pub const fn new(current: NonZeroU32, spare: NonZeroU32) -> Self {
         Self {
-            node,
-            shard,
-            next: start,
+            current,
+            next: 0,
+            spare: Some(spare),
+            retired: Vec::new(),
         }
     }
 
-    /// The serial the next id will carry - the high-water mark to persist.
-    pub fn next_serial(&self) -> u64 {
-        self.next
+    /// The incarnation it mints from.
+    pub const fn incarnation(&self) -> NonZeroU32 {
+        self.current
     }
 
-    pub fn alloc(&mut self) -> UniversalId {
-        self.try_alloc().expect("universal id serial exhausted")
+    /// The incarnation it switches to when the current one runs out, if any.
+    pub const fn spare(&self) -> Option<NonZeroU32> {
+        self.spare
     }
 
-    pub fn try_alloc(&mut self) -> Option<UniversalId> {
-        let serial = self.next;
-        self.next = serial.checked_add(1)?;
-        Some(UniversalId::new(self.node, self.shard, serial))
+    /// Sets the spare, returning the previous one, if any.
+    pub fn set_spare(&mut self, incarnation: NonZeroU32) -> Option<NonZeroU32> {
+        self.spare.replace(incarnation)
+    }
+
+    /// Serials left in the current incarnation.
+    pub const fn remaining(&self) -> u64 {
+        Self::SERIALS - self.next
+    }
+
+    /// The incarnations it switched away from since the last call, oldest first.
+    pub fn take_retired(&mut self) -> Vec<NonZeroU32> {
+        std::mem::take(&mut self.retired)
+    }
+
+    /// Panics if the current incarnation has run out and there is no spare.
+    pub fn alloc(&mut self) -> Uid {
+        self.try_alloc()
+            .expect("uid serials exhausted and no spare incarnation")
+    }
+
+    /// `None` if the current incarnation has run out and there is no spare.
+    pub fn try_alloc(&mut self) -> Option<Uid> {
+        if self.next == Self::SERIALS {
+            let spare = self.spare.take()?;
+            self.retired
+                .push(std::mem::replace(&mut self.current, spare));
+            self.next = 0;
+        }
+        let serial = self.next as u32;
+        self.next += 1;
+        Some(Uid::new(self.current, serial))
     }
 }
 
-/// Owns the shard's local entities and their mapping to [`UniversalId`]s.
+/// Owns a world's local entities and their mapping to [`Uid`]s.
 ///
-/// A local [`Entity`] never leaves the shard; a [`UniversalId`] is minted lazily, only
-/// once the entity has to be addressed from outside (see [`promote`](Self::promote)).
+/// A local [`Entity`] never leaves its world. A [`Uid`] is minted lazily, only once the
+/// entity has to be named from outside (see [`promote`](Self::promote)), or adopted
+/// from another world (see [`adopt`](Self::adopt)).
 pub struct Registry {
     local: Allocator,
-    universal: UniversalAllocator,
-    to_universal: Vec<Option<UniversalId>>,
-    to_local: HashMap<UniversalId, Entity>,
+    allocator: Option<UidAllocator>,
+    uids: Vec<Option<Uid>>,
+    entities: HashMap<Uid, Entity, FoldBuildHasher>,
 }
 
 impl Registry {
-    pub fn new(universal: UniversalAllocator) -> Self {
+    pub fn new() -> Self {
         Self {
             local: Allocator::new(),
-            universal,
-            to_universal: Vec::new(),
-            to_local: HashMap::new(),
+            allocator: None,
+            uids: Vec::new(),
+            entities: HashMap::default(),
         }
     }
 
@@ -339,21 +378,32 @@ impl Registry {
         self.local.is_empty()
     }
 
-    /// The serial high-water mark to persist - see [`UniversalAllocator::new`].
-    pub fn next_serial(&self) -> u64 {
-        self.universal.next_serial()
+    /// The allocator [`promote`](Self::promote) mints from, if one is installed.
+    pub fn uid_allocator(&self) -> Option<&UidAllocator> {
+        self.allocator.as_ref()
+    }
+
+    /// The allocator [`promote`](Self::promote) mints from, if one is installed.
+    pub fn uid_allocator_mut(&mut self) -> Option<&mut UidAllocator> {
+        self.allocator.as_mut()
+    }
+
+    /// Installs the allocator [`promote`](Self::promote) mints from, returning the
+    /// previous one.
+    pub fn install_uid_allocator(&mut self, allocator: UidAllocator) -> Option<UidAllocator> {
+        self.allocator.replace(allocator)
     }
 
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.local.is_alive(entity)
     }
 
-    /// Allocates a local entity. It has no [`UniversalId`] until promoted.
+    /// Allocates a local entity. It has no [`Uid`] until promoted.
     pub fn spawn(&mut self) -> Entity {
         self.local.alloc()
     }
 
-    /// Frees `entity` and forgets its [`UniversalId`], if any.
+    /// Frees `entity` and forgets its [`Uid`], if any.
     pub fn despawn(&mut self, entity: Entity) -> bool {
         if !self.local.dealloc(entity) {
             return false;
@@ -361,69 +411,73 @@ impl Registry {
 
         // the slot will be recycled, so its mapping must not outlive the entity
         if let Some(uid) = self
-            .to_universal
+            .uids
             .get_mut(entity.index_sparse())
             .and_then(Option::take)
         {
-            self.to_local.remove(&uid);
+            self.entities.remove(&uid);
         }
         true
     }
 
-    /// The [`UniversalId`] of `entity`, if it is alive and has been promoted.
-    pub fn universal(&self, entity: Entity) -> Option<UniversalId> {
+    /// The [`Uid`] of `entity`, if it is alive and has one.
+    pub fn uid(&self, entity: Entity) -> Option<Uid> {
         if !self.is_alive(entity) {
             return None;
         }
-        self.to_universal
-            .get(entity.index_sparse())
-            .copied()
-            .flatten()
+        self.uids.get(entity.index_sparse()).copied().flatten()
     }
 
-    /// The [`UniversalId`] of `entity`, minting one on first use. `None` if dead.
-    pub fn promote(&mut self, entity: Entity) -> Option<UniversalId> {
+    /// The [`Uid`] of `entity`, minting one on first use. `None` if `entity` is dead, or
+    /// if it has no uid and no allocator is installed.
+    ///
+    /// Panics if the installed allocator's current incarnation has run out and it has no
+    /// spare (see [`UidAllocator::alloc`]).
+    pub fn promote(&mut self, entity: Entity) -> Option<Uid> {
         if !self.is_alive(entity) {
             return None;
         }
 
         let index = entity.index_sparse();
-        if index >= self.to_universal.len() {
-            self.to_universal.resize(index + 1, None);
-        }
-
-        let slot = &mut self.to_universal[index];
-        if let Some(uid) = *slot {
+        if let Some(uid) = self.uids.get(index).copied().flatten() {
             return Some(uid);
         }
 
-        let uid = self.universal.alloc();
-        *slot = Some(uid);
-        self.to_local.insert(uid, entity);
+        let uid = self.allocator.as_mut()?.alloc();
+        self.bind(entity, uid);
         Some(uid)
     }
 
-    /// The local entity carrying `uid`, if it lives on this shard.
-    pub fn resolve(&self, uid: UniversalId) -> Option<Entity> {
-        self.to_local.get(&uid).copied()
+    /// The local entity carrying `uid`, if this world holds it.
+    pub fn resolve(&self, uid: Uid) -> Option<Entity> {
+        self.entities.get(&uid).copied()
     }
 
-    /// Spawns a local entity for an existing `uid`, e.g. one migrating in.
-    /// `None` if `uid` already has a local entity here.
-    pub fn adopt(&mut self, uid: UniversalId) -> Option<Entity> {
-        if self.to_local.contains_key(&uid) {
+    /// Spawns a local entity for an existing `uid`, e.g. one migrating in or replicated
+    /// from another world. `None` if `uid` already has a local entity here.
+    pub fn adopt(&mut self, uid: Uid) -> Option<Entity> {
+        if self.entities.contains_key(&uid) {
             return None;
         }
 
         let entity = self.local.alloc();
-        let index = entity.index_sparse();
-        if index >= self.to_universal.len() {
-            self.to_universal.resize(index + 1, None);
-        }
-
-        self.to_universal[index] = Some(uid);
-        self.to_local.insert(uid, entity);
+        self.bind(entity, uid);
         Some(entity)
+    }
+
+    fn bind(&mut self, entity: Entity, uid: Uid) {
+        let index = entity.index_sparse();
+        if index >= self.uids.len() {
+            self.uids.resize(index + 1, None);
+        }
+        self.uids[index] = Some(uid);
+        self.entities.insert(uid, entity);
+    }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -559,56 +613,119 @@ mod tests {
         assert_eq!(allocator.alloc().index(), EntityIndex::from_bits(1));
     }
 
-    #[test]
-    fn universal_allocator_alloc() {
-        let mut allocator = UniversalAllocator::new(3, 7, 0);
-        let u0 = allocator.alloc();
-        let u1 = allocator.alloc();
+    fn incarnation(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).unwrap()
+    }
 
-        assert_eq!(u0, UniversalId::new(3, 7, 0));
-        assert_eq!(u1, UniversalId::new(3, 7, 1));
-        assert_eq!(allocator.next_serial(), 2);
+    fn uid(inc: u32, serial: u32) -> Uid {
+        Uid::new(incarnation(inc), serial)
     }
 
     #[test]
-    fn universal_allocator_resume() {
-        let mut before = UniversalAllocator::new(3, 7, 0);
-        let minted = [before.alloc(), before.alloc()];
-
-        // a restart resuming from the persisted high-water mark never re-mints
-        let mut after = UniversalAllocator::new(3, 7, before.next_serial());
-        let resumed = after.alloc();
-        assert!(!minted.contains(&resumed));
-        assert_eq!(resumed.serial(), 2);
+    fn uid_layout() {
+        let u = uid(3, 7);
+        assert_eq!(u.to_bits(), 3 << 32 | 7);
+        assert_eq!(u.incarnation(), incarnation(3));
+        assert_eq!(u.serial(), 7);
+        assert_eq!(Uid::from_bits(u.to_bits()), u);
+        assert_eq!(size_of::<Uid>(), 8);
+        assert_eq!(size_of::<Option<Uid>>(), 8);
     }
 
     #[test]
-    fn universal_allocator_distinct_creators() {
-        // creators count independently, so equal serials are the normal case
-        let a = UniversalAllocator::new(3, 7, 0).alloc();
-        let b = UniversalAllocator::new(3, 8, 0).alloc();
-        let c = UniversalAllocator::new(4, 7, 0).alloc();
+    #[should_panic(expected = "uid incarnation must be non-zero")]
+    fn uid_incarnation_zero() {
+        _ = Uid::from_bits(7);
+    }
+
+    fn allocator() -> UidAllocator {
+        UidAllocator::new(incarnation(3), incarnation(4))
+    }
+
+    #[test]
+    fn uid_allocator_alloc() {
+        let mut allocator = allocator();
+        assert_eq!(allocator.incarnation(), incarnation(3));
+        assert_eq!(allocator.spare(), Some(incarnation(4)));
+        assert_eq!(allocator.remaining(), UidAllocator::SERIALS);
+
+        assert_eq!(allocator.alloc(), uid(3, 0));
+        assert_eq!(allocator.alloc(), uid(3, 1));
+        assert_eq!(allocator.remaining(), UidAllocator::SERIALS - 2);
+        assert!(allocator.take_retired().is_empty());
+    }
+
+    #[test]
+    fn uid_allocator_switch() {
+        let mut allocator = allocator();
+        allocator.next = UidAllocator::SERIALS - 1;
+
+        assert_eq!(allocator.alloc(), uid(3, u32::MAX));
+        assert_eq!(allocator.remaining(), 0);
+        assert!(allocator.take_retired().is_empty()); // switches on demand only
+
+        assert_eq!(allocator.alloc(), uid(4, 0));
+        assert_eq!(allocator.incarnation(), incarnation(4));
+        assert_eq!(allocator.spare(), None);
+        assert_eq!(allocator.remaining(), UidAllocator::SERIALS - 1);
+        assert_eq!(allocator.take_retired(), [incarnation(3)]);
+        assert!(allocator.take_retired().is_empty());
+    }
+
+    #[test]
+    fn uid_allocator_set_spare() {
+        let mut allocator = allocator();
+        allocator.next = UidAllocator::SERIALS;
+        allocator.alloc();
+
+        assert_eq!(allocator.set_spare(incarnation(5)), None);
+        allocator.next = UidAllocator::SERIALS;
+        assert_eq!(allocator.alloc(), uid(5, 0));
+        // retired until taken, oldest first
+        assert_eq!(allocator.take_retired(), [incarnation(3), incarnation(4)]);
+
+        // a spare not yet used is replaced
+        assert_eq!(allocator.set_spare(incarnation(6)), None);
+        assert_eq!(allocator.set_spare(incarnation(7)), Some(incarnation(6)));
+    }
+
+    #[test]
+    fn uid_allocator_exhausted() {
+        let mut allocator = allocator();
+        allocator.next = UidAllocator::SERIALS;
+        assert_eq!(allocator.try_alloc(), Some(uid(4, 0)));
+
+        allocator.next = UidAllocator::SERIALS;
+        assert_eq!(allocator.try_alloc(), None);
+        assert_eq!(allocator.try_alloc(), None);
+        assert_eq!(allocator.incarnation(), incarnation(4));
+        assert_eq!(allocator.take_retired(), [incarnation(3)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "uid serials exhausted and no spare incarnation")]
+    fn uid_allocator_exhausted_panics() {
+        let mut allocator = allocator();
+        allocator.next = UidAllocator::SERIALS;
+        allocator.alloc();
+        allocator.next = UidAllocator::SERIALS;
+        allocator.alloc();
+    }
+
+    #[test]
+    fn uid_allocator_distinct_incarnations() {
+        // incarnations count independently, so equal serials are the normal case
+        let a = UidAllocator::new(incarnation(3), incarnation(4)).alloc();
+        let b = UidAllocator::new(incarnation(5), incarnation(6)).alloc();
 
         assert_eq!(a.serial(), b.serial());
         assert_ne!(a, b);
-        assert_ne!(a, c);
-        assert_ne!(b, c);
-    }
-
-    #[test]
-    fn universal_allocator_exhausted() {
-        let mut allocator = UniversalAllocator::new(3, 7, u64::MAX - 1);
-
-        assert_eq!(
-            allocator.try_alloc(),
-            Some(UniversalId::new(3, 7, u64::MAX - 1))
-        );
-        assert_eq!(allocator.try_alloc(), None);
-        assert_eq!(allocator.try_alloc(), None);
     }
 
     fn registry() -> Registry {
-        Registry::new(UniversalAllocator::new(3, 7, 0))
+        let mut registry = Registry::new();
+        registry.install_uid_allocator(allocator());
+        registry
     }
 
     #[test]
@@ -618,8 +735,12 @@ mod tests {
 
         assert!(registry.is_alive(e0));
         assert_eq!(registry.len(), 1);
-        assert_eq!(registry.universal(e0), None);
-        assert_eq!(registry.next_serial(), 0); // nothing minted yet
+        assert_eq!(registry.uid(e0), None);
+        // nothing minted yet
+        assert_eq!(
+            registry.uid_allocator().unwrap().remaining(),
+            UidAllocator::SERIALS
+        );
     }
 
     #[test]
@@ -629,13 +750,16 @@ mod tests {
         let e1 = registry.spawn();
 
         let u1 = registry.promote(e1).unwrap();
-        assert_eq!(u1, UniversalId::new(3, 7, 0));
+        assert_eq!(u1, uid(3, 0));
         assert_eq!(registry.promote(e1), Some(u1)); // idempotent, no re-mint
-        assert_eq!(registry.next_serial(), 1);
+        assert_eq!(
+            registry.uid_allocator().unwrap().remaining(),
+            UidAllocator::SERIALS - 1
+        );
 
-        assert_eq!(registry.universal(e1), Some(u1));
+        assert_eq!(registry.uid(e1), Some(u1));
         assert_eq!(registry.resolve(u1), Some(e1));
-        assert_eq!(registry.universal(e0), None);
+        assert_eq!(registry.uid(e0), None);
     }
 
     #[test]
@@ -645,7 +769,51 @@ mod tests {
         assert!(registry.despawn(e0));
 
         assert_eq!(registry.promote(e0), None);
-        assert_eq!(registry.next_serial(), 0);
+        assert_eq!(
+            registry.uid_allocator().unwrap().remaining(),
+            UidAllocator::SERIALS
+        );
+    }
+
+    #[test]
+    fn registry_promote_without_allocator() {
+        let mut registry = Registry::new();
+        let e0 = registry.spawn();
+        assert_eq!(registry.promote(e0), None);
+        assert_eq!(registry.uid(e0), None);
+
+        // an adopted uid is still reported
+        let e1 = registry.adopt(uid(9, 42)).unwrap();
+        assert_eq!(registry.promote(e1), Some(uid(9, 42)));
+    }
+
+    #[test]
+    fn registry_promote_switches() {
+        let mut registry = registry();
+        let e0 = registry.spawn();
+        let u0 = registry.promote(e0).unwrap();
+
+        registry.uid_allocator_mut().unwrap().next = UidAllocator::SERIALS;
+        let e1 = registry.spawn();
+        assert_eq!(registry.promote(e1), Some(uid(4, 0)));
+        assert_eq!(registry.promote(e0), Some(u0)); // minted ids stay
+
+        let allocator = registry.uid_allocator_mut().unwrap();
+        assert_eq!(allocator.take_retired(), [incarnation(3)]);
+        assert_eq!(allocator.set_spare(incarnation(5)), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "uid serials exhausted and no spare incarnation")]
+    fn registry_promote_exhausted() {
+        let mut registry = registry();
+        let allocator = registry.uid_allocator_mut().unwrap();
+        allocator.next = UidAllocator::SERIALS;
+        allocator.alloc();
+        allocator.next = UidAllocator::SERIALS;
+
+        let e0 = registry.spawn();
+        registry.promote(e0);
     }
 
     #[test]
@@ -656,13 +824,13 @@ mod tests {
 
         assert!(registry.despawn(e0));
         assert!(!registry.despawn(e0));
-        assert_eq!(registry.universal(e0), None);
+        assert_eq!(registry.uid(e0), None);
         assert_eq!(registry.resolve(u0), None);
 
         // the recycled slot must not inherit the old id
         let recycled = registry.spawn();
         assert_eq!(recycled.index(), e0.index());
-        assert_eq!(registry.universal(recycled), None);
+        assert_eq!(registry.uid(recycled), None);
 
         let u1 = registry.promote(recycled).unwrap();
         assert_ne!(u1, u0); // serials are never reused
@@ -678,7 +846,7 @@ mod tests {
         let u = registry.promote(recycled).unwrap();
 
         // same index, old generation: must not see the new entity's id
-        assert_eq!(registry.universal(e0), None);
+        assert_eq!(registry.uid(e0), None);
         assert_eq!(registry.promote(e0), None);
         assert!(!registry.despawn(e0));
         assert_eq!(registry.resolve(u), Some(recycled));
@@ -687,14 +855,18 @@ mod tests {
     #[test]
     fn registry_adopt() {
         let mut registry = registry();
-        let foreign = UniversalId::new(9, 1, 42);
+        let foreign = uid(9, 42);
 
         let e0 = registry.adopt(foreign).unwrap();
         assert!(registry.is_alive(e0));
-        assert_eq!(registry.universal(e0), Some(foreign));
+        assert_eq!(registry.uid(e0), Some(foreign));
         assert_eq!(registry.promote(e0), Some(foreign)); // keeps the adopted id
         assert_eq!(registry.resolve(foreign), Some(e0));
-        assert_eq!(registry.next_serial(), 0); // adopting never mints
+        // adopting never mints
+        assert_eq!(
+            registry.uid_allocator().unwrap().remaining(),
+            UidAllocator::SERIALS
+        );
 
         assert_eq!(registry.adopt(foreign), None); // already lives here
         assert_eq!(registry.len(), 1);
@@ -703,7 +875,8 @@ mod tests {
     #[test]
     fn registry_migrate_round_trip() {
         let mut source = registry();
-        let mut target = Registry::new(UniversalAllocator::new(3, 8, 0));
+        let mut target = Registry::new();
+        target.install_uid_allocator(UidAllocator::new(incarnation(5), incarnation(6)));
 
         let e = source.spawn();
         let uid = source.promote(e).unwrap();
@@ -717,6 +890,6 @@ mod tests {
         assert!(target.despawn(moved));
         let back = source.adopt(uid).unwrap();
         assert_ne!(back, e);
-        assert_eq!(source.universal(back), Some(uid));
+        assert_eq!(source.uid(back), Some(uid));
     }
 }

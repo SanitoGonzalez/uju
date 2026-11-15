@@ -7,9 +7,9 @@ cannot hold: a cell's delta easily outgrows a message's 65535 bytes, so
 frames use `u32` lengths, and only the items inside them, such as a
 component's encoding, stay schema objects.
 
-> **Status.** Nothing here is implemented yet. `UniversalId` is still the
-> 12-byte `uentity`. This document assumes the 8-byte uid of
-> `components-plan.md`, `incarnation << 32 | serial`.
+> **Status.** Nothing here is implemented yet. The ECS's
+> [`Uid`](../ecs/entities.md#uid) is the 8-byte `incarnation << 32 | serial`
+> this document assumes, but the schema still has the 12-byte `uentity`.
 
 ## Principles
 

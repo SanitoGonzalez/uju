@@ -3,6 +3,7 @@ use std::any::Any;
 use crate::ecs::component::Component;
 use crate::ecs::entity::Entity;
 use crate::ecs::storage::{
+    Storage,
     join::{Entities, Joinable},
     sparse_array::SparseArray,
     table::Table,
@@ -90,8 +91,9 @@ impl<T: Component> SparseSet<T> {
         (self.dense[index] == entity).then_some(index)
     }
 
-    pub fn entities(&self) -> impl Iterator<Item = &Entity> {
-        self.dense.iter()
+    #[inline]
+    pub fn entities(&self) -> &[Entity] {
+        &self.dense
     }
 
     pub fn components(&self) -> impl Iterator<Item = &T> {
@@ -154,9 +156,12 @@ impl<T: Component> Table for SparseSet<T> {
         self
     }
 
+    #[inline]
     fn len(&self) -> usize {
         self.len()
     }
+
+    #[inline]
     fn is_empty(&self) -> bool {
         self.is_empty()
     }
@@ -165,6 +170,7 @@ impl<T: Component> Table for SparseSet<T> {
         self.remove(entity).is_some()
     }
 
+    #[inline]
     fn contains(&self, entity: Entity) -> bool {
         self.contains(entity)
     }
@@ -174,24 +180,37 @@ impl<T: Component> Table for SparseSet<T> {
     }
 }
 
-unsafe impl<'a, T: Component> Joinable<'a> for &'a SparseSet<T> {
-    type Item = &'a T;
+impl<T: Component> Storage for SparseSet<T> {
+    type Component = T;
+    type Mut<'a> = &'a mut T;
+    type JoinMut<'a> = &'a mut SparseSet<T>;
 
     #[inline]
-    fn len(&self) -> usize {
-        self.dense.len()
+    fn entities(&self) -> &[Entity] {
+        &self.dense
     }
 
     #[inline]
-    fn entities(&self) -> Entities<'a> {
-        let set = *self;
-        set.dense.iter().copied()
+    fn get(&self, entity: Entity) -> Option<&T> {
+        self.get(entity)
     }
 
     #[inline]
-    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
-        let set = *self;
-        set.get(entity)
+    fn get_mut(&mut self, entity: Entity) -> Option<&mut T> {
+        self.get_mut(entity)
+    }
+
+    fn insert(&mut self, entity: Entity, component: T) -> Option<T> {
+        self.insert(entity, component)
+    }
+
+    fn remove(&mut self, entity: Entity) -> Option<T> {
+        self.remove(entity)
+    }
+
+    #[inline]
+    fn join_mut(&mut self) -> &mut SparseSet<T> {
+        self
     }
 }
 

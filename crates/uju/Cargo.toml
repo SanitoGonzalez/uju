@@ -28,3 +28,14 @@ socket2 = "0.6"
 smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "query"
+harness = false
+
+[[bench]]
+name = "despawn"
+harness = false

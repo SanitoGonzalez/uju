@@ -5,7 +5,7 @@ use linkme::distributed_slice;
 
 pub type Id = u16;
 
-pub trait Unique: Send + 'static {
+pub trait Unique: 'static {
     fn id() -> Id;
 }
 

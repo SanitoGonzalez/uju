@@ -2,34 +2,38 @@ use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
 
 use crate::ecs::{
+    commands::Commands,
     component::{self, Component},
-    entity::{Entity, Registry, UniversalAllocator, UniversalId},
+    entity::{Entity, Registry, Uid, UidAllocator},
     storage::{
         table::Table,
         view::{View, ViewMut},
     },
     unique::{self, Unique},
 };
-use crate::topology::{NodeId, ShardId};
 
+/// A shard's entities, component tables and uniques.
+///
+/// A world is built on its shard's thread and never leaves it.
 pub struct World {
     pub(crate) entities: RefCell<Registry>,
     pub(crate) tables: Vec<RefCell<Box<dyn Table>>>,
     pub(crate) uniques: Vec<RefCell<Option<Box<dyn Any>>>>,
+    commands: RefCell<Commands>,
 }
 
 impl World {
-    /// `node` and `shard` name the minter of this world's [`UniversalId`]s.
-    pub fn new(node: NodeId, shard: ShardId) -> Self {
-        // todo: resume from the persisted serial high-water mark instead of 0
-        let universal = UniversalAllocator::new(node, shard, 0);
+    /// A world with no [`UidAllocator`]: it [`adopt`](Self::adopt)s uids but cannot
+    /// [`promote`](Self::promote) until one is installed.
+    pub fn new() -> Self {
         Self {
-            entities: RefCell::new(Registry::new(universal)),
+            entities: RefCell::new(Registry::new()),
             tables: component::registrations()
                 .into_iter()
                 .map(|registration| RefCell::new((registration.new_table)()))
                 .collect(),
             uniques: (0..unique::count()).map(|_| RefCell::new(None)).collect(),
+            commands: RefCell::new(Commands::default()),
         }
     }
 
@@ -45,37 +49,100 @@ impl World {
     ///
     /// Panics if any view is borrowed at the time.
     pub fn despawn(&self, entity: Entity) -> bool {
-        if !self.entities.borrow_mut().despawn(entity) {
-            return false;
+        self.despawn_batch(std::slice::from_ref(&entity)) == 1
+    }
+
+    /// Despawns every live entity of `entities`, borrowing each table once,
+    /// and returns how many it despawned. Dead entities and repeats are
+    /// skipped.
+    ///
+    /// Panics if any view is borrowed at the time.
+    pub fn despawn_batch(&self, entities: &[Entity]) -> usize {
+        let despawned = {
+            let mut registry = self.entities.borrow_mut();
+            entities
+                .iter()
+                .filter(|&&entity| registry.despawn(entity))
+                .count()
+        };
+        if despawned == 0 {
+            return 0;
         }
 
+        // a dead entity's probe misses, so the whole slice goes to each table
         for table in &self.tables {
-            table.borrow_mut().remove(entity);
+            let mut table = table.borrow_mut();
+            if !table.is_empty() {
+                table.remove_batch(entities);
+            }
         }
-        true
+        despawned
+    }
+
+    /// The queue of deferred changes, applied by [`flush`](Self::flush). It
+    /// is a borrow of its own, so it is available inside a query's loop.
+    ///
+    /// Panics if the queue is borrowed at the time, such as by a
+    /// `Commands` held across this call.
+    pub fn commands(&self) -> RefMut<'_, Commands> {
+        self.commands.borrow_mut()
+    }
+
+    /// Applies the queued [`commands`](Self::commands), in order. Commands
+    /// queued while applying, such as by a closure, apply in the same flush.
+    ///
+    /// Panics if a command conflicts with a live borrow, such as a view of a
+    /// table it changes, or if the queue is borrowed at the time.
+    pub fn flush(&self) {
+        if self.commands.borrow().is_empty() {
+            return;
+        }
+
+        // keep the queue unborrowed while applying, so commands can queue more
+        let mut commands = Commands::default();
+        loop {
+            std::mem::swap(&mut *self.commands.borrow_mut(), &mut commands);
+            if commands.is_empty() {
+                break;
+            }
+            commands.apply(self);
+        }
     }
 
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.entities.borrow().is_alive(entity)
     }
 
-    /// See [`Registry::universal`].
-    pub fn universal(&self, entity: Entity) -> Option<UniversalId> {
-        self.entities.borrow().universal(entity)
+    /// See [`Registry::install_uid_allocator`].
+    pub fn install_uid_allocator(&self, allocator: UidAllocator) -> Option<UidAllocator> {
+        self.entities.borrow_mut().install_uid_allocator(allocator)
+    }
+
+    /// See [`Registry::uid_allocator_mut`]. The runtime sets the next spare and takes the
+    /// retired incarnations through it.
+    ///
+    /// Panics if the registry is borrowed at the time.
+    pub fn uid_allocator_mut(&self) -> Option<RefMut<'_, UidAllocator>> {
+        RefMut::filter_map(self.entities.borrow_mut(), Registry::uid_allocator_mut).ok()
+    }
+
+    /// See [`Registry::uid`].
+    pub fn uid(&self, entity: Entity) -> Option<Uid> {
+        self.entities.borrow().uid(entity)
     }
 
     /// See [`Registry::promote`].
-    pub fn promote(&self, entity: Entity) -> Option<UniversalId> {
+    pub fn promote(&self, entity: Entity) -> Option<Uid> {
         self.entities.borrow_mut().promote(entity)
     }
 
     /// See [`Registry::resolve`].
-    pub fn resolve(&self, uid: UniversalId) -> Option<Entity> {
+    pub fn resolve(&self, uid: Uid) -> Option<Entity> {
         self.entities.borrow().resolve(uid)
     }
 
     /// See [`Registry::adopt`].
-    pub fn adopt(&self, uid: UniversalId) -> Option<Entity> {
+    pub fn adopt(&self, uid: Uid) -> Option<Entity> {
         self.entities.borrow_mut().adopt(uid)
     }
 
@@ -115,22 +182,33 @@ impl World {
         self.get_unique_mut().expect("unique not inserted")
     }
 
+    /// Shared access to `C`'s [`Storage`](Component::Storage).
     pub fn view<C: Component>(&self) -> View<'_, C> {
         View(Ref::map(self.tables[C::id() as usize].borrow(), |table| {
-            table.as_any().downcast_ref().unwrap()
+            table.as_any().downcast_ref::<C::Storage>().unwrap()
         }))
     }
 
+    /// Mutable access to `C`'s [`Storage`](Component::Storage).
     pub fn view_mut<C: Component>(&self) -> ViewMut<'_, C> {
         ViewMut(RefMut::map(
             self.tables[C::id() as usize].borrow_mut(),
-            |table| table.as_any_mut().downcast_mut().unwrap(),
+            |table| table.as_any_mut().downcast_mut::<C::Storage>().unwrap(),
         ))
+    }
+}
+
+impl Default for World {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+    use std::rc::Rc;
+
     use super::*;
     use crate::ecs::{Component, Unique};
 
@@ -149,7 +227,7 @@ mod tests {
     #[test]
     fn world_tables() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
         let entity = world.spawn();
 
         assert_ne!(Alpha::id(), Beta::id());
@@ -164,7 +242,7 @@ mod tests {
     #[test]
     fn world_uniques() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
 
         assert_ne!(Counter::id(), Config::id());
         assert!(world.get_unique::<Counter>().is_none());
@@ -190,13 +268,14 @@ mod tests {
     #[test]
     fn world_despawn_clears_tables() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
         let e0 = world.spawn();
         let e1 = world.spawn();
 
         world.view_mut::<Alpha>().insert(e0, Alpha(1));
         world.view_mut::<Beta>().insert(e0, Beta(2));
         world.view_mut::<Alpha>().insert(e1, Alpha(3));
+        world.install_uid_allocator(UidAllocator::new(NonZeroU32::MIN, NonZeroU32::MAX));
         let u0 = world.promote(e0).unwrap();
 
         assert!(world.despawn(e0));
@@ -213,11 +292,61 @@ mod tests {
         assert_eq!(world.view::<Alpha>().get(recycled), None);
     }
 
+    #[derive(Component)]
+    struct Shared(Rc<i32>);
+
+    #[derive(Unique)]
+    struct SharedUnique(Rc<i32>);
+
+    #[test]
+    fn world_holds_non_send() {
+        crate::ecs::init();
+        let world = World::new();
+        let entity = world.spawn();
+        let value = Rc::new(7);
+
+        world
+            .view_mut::<Shared>()
+            .insert(entity, Shared(value.clone()));
+        world.insert_unique(SharedUnique(value.clone()));
+        assert_eq!(*world.view::<Shared>().get(entity).unwrap().0, 7);
+        assert_eq!(*world.unique::<SharedUnique>().0, 7);
+        assert_eq!(Rc::strong_count(&value), 3);
+    }
+
+    #[test]
+    fn world_uids() {
+        crate::ecs::init();
+        let world = World::new();
+        let e0 = world.spawn();
+
+        // nothing to mint from until an allocator is installed
+        assert_eq!(world.promote(e0), None);
+        assert!(world.uid_allocator_mut().is_none());
+        let adopted = Uid::new(NonZeroU32::new(9).unwrap(), 42);
+        let e1 = world.adopt(adopted).unwrap();
+        assert_eq!(world.resolve(adopted), Some(e1));
+        assert_eq!(world.uid(e1), Some(adopted));
+
+        let current = NonZeroU32::new(3).unwrap();
+        let spare = NonZeroU32::new(4).unwrap();
+        let installed = world.install_uid_allocator(UidAllocator::new(current, spare));
+        assert!(installed.is_none());
+        let u0 = world.promote(e0).unwrap();
+        assert_eq!(u0, Uid::new(current, 0));
+        assert_eq!(world.uid(e0), Some(u0));
+        assert_eq!(world.resolve(u0), Some(e0));
+
+        let mut allocator = world.uid_allocator_mut().unwrap();
+        assert_eq!(allocator.spare(), Some(spare));
+        assert!(allocator.take_retired().is_empty());
+    }
+
     #[test]
     #[should_panic(expected = "unique not inserted")]
     fn world_unique_missing() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
         let _ = world.unique::<Counter>();
     }
 }

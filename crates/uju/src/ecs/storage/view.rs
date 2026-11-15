@@ -2,32 +2,32 @@ use std::cell::{Ref, RefMut};
 use std::ops::{Deref, DerefMut};
 
 use crate::ecs::component::Component;
-use crate::ecs::entity::Entity;
-use crate::ecs::storage::join::{Entities, Joinable};
-use crate::ecs::storage::sparse_set::SparseSet;
+use crate::ecs::storage::{Storage, join::IntoJoinable};
 
 /// Shared borrow of one component's storage, checked out of the [`World`].
 ///
-/// Derefs to [`SparseSet<C>`] for direct access (`get`, `contains`, `iter`),
-/// and `&view` is a join term: `join((&transforms, &velocities))`.
+/// Derefs to [`C::Storage`](Component::Storage) for direct access (`get`,
+/// `contains`, `iter`), and `&view` is a join term:
+/// `join((&transforms, &velocities))`.
 ///
 /// The borrow is dynamic (`RefCell`), so it must be dropped before the same
 /// component is checked out mutably.
 ///
 /// [`World`]: crate::ecs::world::World
-pub struct View<'w, C: Component>(pub(crate) Ref<'w, SparseSet<C>>);
+pub struct View<'w, C: Component>(pub(crate) Ref<'w, C::Storage>);
 
 /// Exclusive borrow of one component's storage, checked out of the [`World`].
 ///
-/// Derefs to [`SparseSet<C>`] including mutation (`insert`, `remove`,
-/// `get_mut`), and both `&view` (shared) and `&mut view` (mutable) are join
-/// terms: `join((&mut velocities, &transforms))`.
+/// Derefs to [`C::Storage`](Component::Storage) including mutation
+/// (`insert`, `remove`, `get_mut`), and both `&view` (shared) and
+/// `&mut view` (mutable) are join terms:
+/// `join((&mut velocities, &transforms))`.
 ///
 /// [`World`]: crate::ecs::world::World
-pub struct ViewMut<'w, C: Component>(pub(crate) RefMut<'w, SparseSet<C>>);
+pub struct ViewMut<'w, C: Component>(pub(crate) RefMut<'w, C::Storage>);
 
 impl<C: Component> Deref for View<'_, C> {
-    type Target = SparseSet<C>;
+    type Target = C::Storage;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -36,7 +36,7 @@ impl<C: Component> Deref for View<'_, C> {
 }
 
 impl<C: Component> Deref for ViewMut<'_, C> {
-    type Target = SparseSet<C>;
+    type Target = C::Storage;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -51,71 +51,30 @@ impl<C: Component> DerefMut for ViewMut<'_, C> {
     }
 }
 
-// SAFETY: delegates to the `&SparseSet` impl's guarantees.
-unsafe impl<'a, C: Component> Joinable<'a> for &'a View<'_, C> {
-    type Item = &'a C;
+impl<'a, C: Component> IntoJoinable<'a> for &'a View<'_, C> {
+    type Joinable = &'a C::Storage;
 
     #[inline]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    fn entities(&self) -> Entities<'a> {
-        let set: &'a SparseSet<C> = &self.0;
-        Joinable::entities(&set)
-    }
-
-    #[inline]
-    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
-        let set: &'a SparseSet<C> = &self.0;
-        set.get(entity)
+    fn into_joinable(self) -> Self::Joinable {
+        &self.0
     }
 }
 
-// SAFETY: delegates to the `&SparseSet` impl's guarantees.
-unsafe impl<'a, C: Component> Joinable<'a> for &'a ViewMut<'_, C> {
-    type Item = &'a C;
+impl<'a, C: Component> IntoJoinable<'a> for &'a ViewMut<'_, C> {
+    type Joinable = &'a C::Storage;
 
     #[inline]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    fn entities(&self) -> Entities<'a> {
-        let set: &'a SparseSet<C> = &self.0;
-        Joinable::entities(&set)
-    }
-
-    #[inline]
-    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
-        let set: &'a SparseSet<C> = &self.0;
-        set.get(entity)
+    fn into_joinable(self) -> Self::Joinable {
+        &self.0
     }
 }
 
-// SAFETY: delegates to the `&mut SparseSet` impl's guarantees.
-unsafe impl<'a, C: Component> Joinable<'a> for &'a mut ViewMut<'_, C> {
-    type Item = &'a mut C;
+impl<'a, C: Component> IntoJoinable<'a> for &'a mut ViewMut<'_, C> {
+    type Joinable = <C::Storage as Storage>::JoinMut<'a>;
 
     #[inline]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    fn entities(&self) -> Entities<'a> {
-        // SAFETY: `self` borrows the view (and through the `RefMut` guard,
-        // the set) exclusively for `'a`; joins never mutate `dense`.
-        unsafe { self.0.entities_unbound() }
-    }
-
-    #[inline]
-    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
-        // SAFETY: exclusive borrow for `'a` held by `self`; at-most-once per
-        // entity is forwarded from the caller.
-        unsafe { self.0.get_mut_unbound(entity) }
+    fn into_joinable(self) -> Self::Joinable {
+        self.0.join_mut()
     }
 }
 
@@ -142,7 +101,7 @@ mod tests {
     #[test]
     fn view_join() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
 
         for index in 0..4 {
             world
@@ -173,7 +132,7 @@ mod tests {
     #[test]
     fn view_mut_as_shared_term() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
 
         world.view_mut::<Position>().insert(entity(0), Position(5));
         world.view_mut::<Speed>().insert(entity(0), Speed(7));
@@ -189,7 +148,7 @@ mod tests {
     #[should_panic(expected = "already mutably borrowed")]
     fn view_conflict_panics() {
         crate::ecs::init();
-        let world = World::new(0, 0);
+        let world = World::new();
 
         let _positions = world.view_mut::<Position>();
         let _conflict = world.view::<Position>();

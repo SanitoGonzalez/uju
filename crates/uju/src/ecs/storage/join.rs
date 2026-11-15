@@ -2,11 +2,13 @@ use std::iter::Copied;
 use std::slice;
 
 use crate::ecs::entity::Entity;
+use crate::ecs::storage::{Storage, table::Table};
 
 pub type Entities<'a> = Copied<slice::Iter<'a, Entity>>;
 
-/// A term of a [`join`]: shared (`&SparseSet<T>`), mutable
-/// (`&mut SparseSet<T>`), or a tuple of terms.
+/// A term of a [`join`], as it iterates: a shared storage (`&S`), a
+/// storage's [`JoinMut`](Storage::JoinMut), a query filter, or a tuple of
+/// terms.
 ///
 /// # Safety
 ///
@@ -35,17 +37,34 @@ pub unsafe trait Joinable<'a> {
     }
 }
 
-/// Iterates the entities carrying every term, yielding each term's component.
-pub fn join<'a, J: Joinable<'a>>(terms: J) -> Join<'a, J> {
-    Join {
-        entities: terms.entities(),
-        terms,
-    }
+/// What [`join`] accepts: a storage or a view borrowed shared (`&view`)
+/// or mutably (`&mut view`), or a tuple of those.
+pub trait IntoJoinable<'a> {
+    type Joinable: Joinable<'a>;
+
+    fn into_joinable(self) -> Self::Joinable;
+}
+
+/// Iterates the entities carrying every term, yielding each term's item:
+/// `&C` for a shared term, the storage's [`Mut`](Storage::Mut) for a
+/// mutable one.
+pub fn join<'a, J: IntoJoinable<'a>>(terms: J) -> Join<'a, J::Joinable> {
+    Join::new(terms.into_joinable())
 }
 
 pub struct Join<'a, J> {
     entities: Entities<'a>,
     terms: J,
+}
+
+impl<'a, J: Joinable<'a>> Join<'a, J> {
+    #[inline]
+    pub(crate) fn new(terms: J) -> Self {
+        Self {
+            entities: terms.entities(),
+            terms,
+        }
+    }
 }
 
 impl<'a, J: Joinable<'a>> Iterator for Join<'a, J> {
@@ -62,6 +81,46 @@ impl<'a, J: Joinable<'a>> Iterator for Join<'a, J> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         (0, self.entities.size_hint().1)
+    }
+}
+
+// SAFETY: `entities` yields the storage's dense entities, each once.
+unsafe impl<'a, S: Storage> Joinable<'a> for &'a S {
+    type Item = &'a S::Component;
+
+    #[inline]
+    fn len(&self) -> usize {
+        Table::len(*self)
+    }
+
+    #[inline]
+    fn entities(&self) -> Entities<'a> {
+        let storage: &'a S = self;
+        storage.entities().iter().copied()
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        let storage: &'a S = self;
+        storage.get(entity)
+    }
+}
+
+impl<'a, S: Storage> IntoJoinable<'a> for &'a S {
+    type Joinable = Self;
+
+    #[inline]
+    fn into_joinable(self) -> Self {
+        self
+    }
+}
+
+impl<'a, S: Storage> IntoJoinable<'a> for &'a mut S {
+    type Joinable = S::JoinMut<'a>;
+
+    #[inline]
+    fn into_joinable(self) -> Self::Joinable {
+        self.join_mut()
     }
 }
 
@@ -97,6 +156,16 @@ macro_rules! impl_joinable {
                 unsafe {
                     Some(($head_term.get(entity)?, $($tail_term.get(entity)?,)*))
                 }
+            }
+        }
+
+        impl<'a, $head: IntoJoinable<'a> $(, $tail: IntoJoinable<'a>)*> IntoJoinable<'a> for ($head, $($tail,)*) {
+            type Joinable = ($head::Joinable, $($tail::Joinable,)*);
+
+            #[inline]
+            fn into_joinable(self) -> Self::Joinable {
+                let ($head_term, $($tail_term,)*) = self;
+                ($head_term.into_joinable(), $($tail_term.into_joinable(),)*)
             }
         }
     };

@@ -20,12 +20,12 @@ pub fn expand(ast: DeriveInput) -> Result<TokenStream> {
                 ::uju::ecs::component::Registration {
                     name: ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident)),
                     id: ::core::cell::UnsafeCell::new(u16::MAX),
-                    new_table: || ::std::boxed::Box::new(
-                        ::uju::ecs::storage::sparse_set::SparseSet::<#ident>::new(),
-                    ),
+                    new_table: ::uju::ecs::component::new_table::<#ident>,
                 };
 
             impl ::uju::ecs::component::Component for #ident {
+                type Storage = ::uju::ecs::storage::sparse_set::SparseSet<#ident>;
+
                 #[inline(always)]
                 fn id() -> ::uju::ecs::component::Id {
                     unsafe { *REGISTRATION.id.get() }

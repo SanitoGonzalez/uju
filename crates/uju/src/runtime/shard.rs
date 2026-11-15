@@ -12,7 +12,6 @@ use tracing::{error, info};
 use crate::ecs::world::World;
 use crate::net::{self, transport::tcp};
 use crate::runtime::error::Result;
-use crate::runtime::node::Node;
 use crate::runtime::shard::message::Frame;
 use crate::time::Time;
 use crate::topology::ShardId;
@@ -194,7 +193,8 @@ impl Builder {
             .build()?;
 
         let (stop, token) = StopSource::new();
-        let world = World::new(Node::current().id(), id);
+        // todo: install a uid allocator with the two incarnations director hands this shard
+        let world = World::new();
         world.insert_unique(Time::new());
         let shard = Rc::new(Shard {
             id,
