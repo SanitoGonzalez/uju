@@ -205,9 +205,8 @@ A section holds one component's changes. Sections come in ascending
 - **Patches.** `len` follows the same rule, applied to the
   [patch](wire-format.md#patches)'s largest encoding.
 - **Ops.** `ops` is the entity's ops of the tick, in order, laid out as a
-  `vec` of the op union with no `max_length`. An encoder that finds them
-  larger than the component's full encoding sends the value instead, so
-  `len` fits a `u16`.
+  `vec` of the op union with no `max_length`. An encoder whose ops for
+  an entity would not fit `len`, a `u16`, sends the value instead.
 - An entity appears at most once in a section. Within a tick, an add then a
   remove cancel out, a remove then an add is a value, and a resync drops
   the tick's ops.
