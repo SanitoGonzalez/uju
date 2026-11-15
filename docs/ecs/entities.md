@@ -186,8 +186,9 @@ for (e, hp) in q.iter() {
 An entity's cell is a `Cell`, a plain type holding a `u32` cell id. It is
 not a component: the registry keeps it beside the entity's uid.
 
-- **uju sets it.** Gameplay reads it with `world.cell(entity)` and never
-  sets it.
+- **uju sets it**, from the entity's `Transform`, as [Setting
+  cells](#setting-cells) says. Gameplay reads it with `world.cell(entity)`
+  and never sets it.
 - **None** for a dead entity, and for one uju has not placed in a cell.
 - **Despawn** forgets the cell, so a recycled index starts without one.
 - **Start of tick.** The registry also keeps the cell each entity had when
@@ -199,6 +200,60 @@ not a component: the registry keeps it beside the entity's uid.
 | `Cell::new(id)`, `cell.id()` | Converts from and to the `u32` id |
 | `world.cell(entity)` | The entity's cell, or `None` |
 | `world.entities().cell_index()` | The [cell index](#cell-index), borrowed |
+
+### Grid
+
+A `Grid`, a unique of the `World`, cuts the world into square cells of side
+`size`. It cuts the ground plane: `x` and `y` in 2D, `x` and `z` in 3D,
+where `y` is up. Cell `(0, 0)` starts at the origin.
+
+```
+id := (row + 32768):u16 << 16 | (column + 32768):u16
+
+column := floor(x / size)        row := floor(y / size), or z in 3D
+```
+
+- **Coordinates** run from `-32768` to `32767` on each axis. A position
+  past the last cell of an axis falls in it.
+- **Margin.** An entity leaves its cell only once it is more than `margin`
+  past one of the cell's borders, on either axis. One standing on a line
+  keeps its cell rather than switching every tick.
+- **Checked.** `Grid::new(size, margin)` panics unless `size` is finite
+  and positive, and `margin` finite and not negative.
+
+| Method | Gives |
+|---|---|
+| `Grid::new(size, margin)` | A grid |
+| `grid.size()`, `grid.margin()` | The cell side and the margin |
+| `grid.cell(position)` | The cell holding `position` |
+| `grid.cell_from(cell, position)` | `cell` while `position` is within the margin around it, else `grid.cell(position)` |
+
+```rust
+let grid = Grid::new(64.0, 4.0);
+let cell = grid.cell(Vector::new(10.0, 70.0)); // column 0, row 1 in 2D
+assert_eq!(cell.id(), 32769 << 16 | 32768);
+// 2 past the border: within the margin
+assert_eq!(grid.cell_from(cell, Vector::new(10.0, 62.0)), cell);
+```
+
+### Setting cells
+
+uju sets cells once per tick, before replication encodes it. It walks the
+entities whose `Transform` was added or written this tick, so its cost
+follows what moved. `world.cell(entity)` reads the cell as of that point.
+
+- **First seen.** An entity with no cell, or whose `Transform` was added
+  this tick, takes the cell holding its position, and gets its uid, as by
+  `promote`. This is when it enters replication.
+- **Moving.** Any other entity keeps its cell while within the margin, and
+  takes the cell holding its position once past it.
+- **Replicas** are skipped. The runtime sets their cell as they enter.
+- **No `Transform`, no cell.** An entity that never had a `Transform` is
+  never placed in a cell and is never replicated. One that loses its
+  `Transform` keeps the cell it had.
+- **Only writes count.** Reading through a mutable `Transform` marks
+  nothing, so it moves nothing. See [Change
+  tracking](change-tracking.md#tracked-tables).
 
 ### Cell index
 

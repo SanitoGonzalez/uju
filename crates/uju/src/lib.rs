@@ -1,6 +1,7 @@
 extern crate self as uju;
 
 pub mod ecs;
+pub mod grid;
 pub mod math;
 pub mod net;
 pub mod physics;

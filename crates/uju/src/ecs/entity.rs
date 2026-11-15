@@ -603,10 +603,6 @@ impl Registry {
     /// `entity` is dead.
     ///
     /// Panics if the cell index is borrowed, such as by a query's `iter_in`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "set by uju's cell system and the runtime")
-    )]
     pub(crate) fn set_cell(&self, entity: Entity, cell: Cell) {
         let mut entries = self.entries.borrow_mut();
         if !entries.is_alive(entity) {

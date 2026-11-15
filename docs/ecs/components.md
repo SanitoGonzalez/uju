@@ -66,6 +66,9 @@ access hands out.
 | [`TagTable<C>`](change-tracking.md#tags) | `&C` | Yes | Yes, as additions and removals |
 | [`OpsTable<C>`](change-tracking.md#ops) | `OpsMut<C>`, which applies ops | Yes | Yes, as ops |
 
+uju's built-in `Transform` is stored in a `Tracked` table, so uju sets the
+[cells](entities.md#setting-cells) of only the entities that moved.
+
 ### SparseSet
 
 A `SparseSet<C>` keeps its values in a dense array, beside a dense array of
