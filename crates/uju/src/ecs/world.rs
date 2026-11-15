@@ -4,9 +4,10 @@ use std::cell::{Ref, RefCell, RefMut};
 use crate::ecs::{
     cell::Cell,
     commands::Commands,
-    component::{self, Component},
+    component::{self, Component, Ops},
     entity::{Despawned, Entity, Registry, Uid, UidAllocator},
     storage::{
+        ops::OpsTable,
         table::Table,
         view::{View, ViewMut},
     },
@@ -171,6 +172,31 @@ impl World {
         for table in &mut self.tables {
             table.get_mut().end_tick();
         }
+    }
+
+    /// Applies `op` to `entity`'s `C` and records it, as
+    /// [`OpsMut::apply`](crate::ecs::storage::ops::OpsMut::apply) does.
+    /// `None` when `entity` holds no `C` or is a replica.
+    ///
+    /// Panics if `C`'s table is borrowed at the time, such as by a query.
+    pub fn apply_op<C: Ops<Storage = OpsTable<C>>>(
+        &self,
+        entity: Entity,
+        op: C::Op,
+    ) -> Option<Result<(), C::Error>> {
+        let mut table = self.view_mut::<C>();
+        let mut value = table.get_mut(entity)?;
+        Some(value.apply(op))
+    }
+
+    /// Sends `entity`'s full `C` in the next delta, dropping its ops of this
+    /// tick, as [`OpsTable::resync`] does. Returns `false` when `entity`
+    /// holds no `C` or is a replica.
+    ///
+    /// Panics if `C`'s table is borrowed at the time, such as by a query.
+    pub fn resync<C: Ops<Storage = OpsTable<C>>>(&self, entity: Entity) -> bool {
+        let mut table = self.view_mut::<C>();
+        !self.is_replica(entity) && table.resync(entity)
     }
 
     pub fn insert_unique<U: Unique>(&self, unique: U) -> Option<U> {

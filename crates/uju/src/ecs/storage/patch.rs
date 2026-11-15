@@ -421,6 +421,7 @@ impl<T: Patch> Table for PatchTable<T> {
         &mut self,
         buf: &[u8],
         resolve: &mut dyn FnMut(Uid) -> Option<Entity>,
+        _failed: &mut Vec<Uid>,
     ) -> Result<usize, DecodeError> {
         self.apply(buf, resolve)
     }
@@ -1174,7 +1175,9 @@ mod tests {
             buf.extend_from_slice(&uid(1).to_bits().to_le_bytes());
             buf.push(patch.len() as u8);
             buf.extend_from_slice(patch);
-            table.apply_section(&buf, &mut resolve).map(|_| ())
+            table
+                .apply_section(&buf, &mut resolve, &mut Vec::new())
+                .map(|_| ())
         };
 
         // a value bit without its dirty bit, then a truncated patch
@@ -1194,7 +1197,7 @@ mod tests {
         buf.extend_from_slice(&[2, 0x00, 0x02]);
         let mut table = world.tables[Stats::id() as usize].borrow_mut();
         assert_eq!(
-            table.apply_section(&buf, &mut |_| Some(other)),
+            table.apply_section(&buf, &mut |_| Some(other), &mut Vec::new()),
             Ok(buf.len())
         );
         drop(table);

@@ -7,8 +7,8 @@ cannot hold: a cell's delta easily outgrows a message's 65535 bytes, so
 frames use `u32` lengths, and only the items inside them, such as a
 component's encoding, stay schema objects.
 
-> **Status.** Only the [sections](#sections) of `replace` and `patch`
-> components and of tags are implemented, by the ECS's
+> **Status.** Only the [sections](#sections) of `replace`, `patch` and
+> `ops` components and of tags are implemented, by the ECS's
 > [replicated tables](../ecs/change-tracking.md#sections). The ECS's
 > [`Uid`](../ecs/entities.md#uid) is the 8-byte `incarnation << 32 | serial`
 > this document assumes, but the schema still has the 12-byte `uentity`.

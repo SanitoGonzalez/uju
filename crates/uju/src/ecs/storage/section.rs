@@ -311,8 +311,8 @@ pub(crate) mod testing {
     }
 
     /// Applies one section on `edge`, adopting the uids it does not hold
-    /// as replicas.
-    pub(crate) fn apply<C: Component>(edge: &World, section: &[u8]) {
+    /// as replicas. Returns the uids whose ops failed to apply.
+    pub(crate) fn apply<C: Component>(edge: &World, section: &[u8]) -> Vec<Uid> {
         let id = u16::from_le_bytes([section[0], section[1]]);
         let mut table = edge.tables[C::id() as usize].borrow_mut();
         assert_eq!(table.replication().unwrap().wire_id, id);
@@ -321,8 +321,12 @@ pub(crate) mod testing {
             edge.entities().set_replica(entity, true);
             Some(entity)
         };
-        let read = table.apply_section(&section[2..], &mut resolve).unwrap();
+        let mut failed = Vec::new();
+        let read = table
+            .apply_section(&section[2..], &mut resolve, &mut failed)
+            .unwrap();
         assert_eq!(read, section.len() - 2);
+        failed
     }
 
     /// `C`'s values on `world` by uid, in uid order.

@@ -63,6 +63,7 @@ access hands out.
 | [`ReplaceTable<C>`](change-tracking.md#tracked-tables) | `TrackedMut<C>` | Yes | Yes, as whole values |
 | [`PatchTable<C>`](change-tracking.md#field-masks) | `C::Mut`, which marks fields | Yes | Yes, as patches of the fields written |
 | [`TagTable<C>`](change-tracking.md#tags) | `&C` | Yes | Yes, as additions and removals |
+| [`OpsTable<C>`](change-tracking.md#ops) | `OpsMut<C>`, which applies ops | Yes | Yes, as ops |
 
 ### SparseSet
 
@@ -150,7 +151,8 @@ assert_eq!(hps.get(e), Some(&Hp(7)));
 
 A `SparseSet` offers the following. Tracked storages offer the same but
 `iter_mut` and `components_mut`, and a `TagTable` also but `components`,
-plus their [changes](change-tracking.md#tracked-tables).
+plus their [changes](change-tracking.md#tracked-tables). An `OpsTable` adds
+[`resync`, `get_mut_untracked` and `ops`](change-tracking.md#ops).
 
 | Method | Does |
 |---|---|

@@ -213,6 +213,7 @@ impl<T: Replace> Table for ReplaceTable<T> {
         &mut self,
         buf: &[u8],
         resolve: &mut dyn FnMut(Uid) -> Option<Entity>,
+        _failed: &mut Vec<Uid>,
     ) -> Result<usize, DecodeError> {
         self.apply(buf, resolve)
     }
@@ -525,7 +526,12 @@ mod tests {
         let world = World::new();
         let mut table = world.tables[Health::id() as usize].borrow_mut();
         let mut resolve = |uid| world.resolve(uid);
-        let mut apply = |buf: &[u8]| table.apply_section(buf, &mut resolve).unwrap_err().kind;
+        let mut apply = |buf: &[u8]| {
+            table
+                .apply_section(buf, &mut resolve, &mut Vec::new())
+                .unwrap_err()
+                .kind
+        };
 
         assert_eq!(apply(&[]), DecodeErrorKind::Size);
         // a `replace` component has no changes part
@@ -544,7 +550,7 @@ mod tests {
 
         // an empty part reads, and an unknown uid is skipped
         assert_eq!(
-            table.apply_section(&[0b001, 0, 0, 0, 0], &mut resolve),
+            table.apply_section(&[0b001, 0, 0, 0, 0], &mut resolve, &mut Vec::new()),
             Ok(5)
         );
         let mut known = vec![0b101, 16, 0, 0, 0];
@@ -554,7 +560,7 @@ mod tests {
         known.extend_from_slice(&uid(1).to_bits().to_le_bytes());
         known.extend_from_slice(&[0xAA; 3]);
         assert_eq!(
-            table.apply_section(&known, &mut resolve),
+            table.apply_section(&known, &mut resolve, &mut Vec::new()),
             Ok(known.len() - 3)
         );
         assert!(table.is_empty());

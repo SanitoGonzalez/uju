@@ -202,6 +202,7 @@ impl<T: Replicated + Default> Table for TagTable<T> {
         &mut self,
         buf: &[u8],
         resolve: &mut dyn FnMut(Uid) -> Option<Entity>,
+        _failed: &mut Vec<Uid>,
     ) -> Result<usize, DecodeError> {
         self.apply(buf, resolve)
     }
@@ -420,13 +421,19 @@ mod tests {
         // a tag has no changes part
         let mut table = edge.tables[Dead::id() as usize].borrow_mut();
         let error = table
-            .apply_section(&[0b010, 0, 0, 0, 0], &mut |uid| edge.resolve(uid))
+            .apply_section(
+                &[0b010, 0, 0, 0, 0],
+                &mut |uid| edge.resolve(uid),
+                &mut Vec::new(),
+            )
             .unwrap_err();
         assert_eq!(error.kind, DecodeErrorKind::Padding);
         let error = table
-            .apply_section(&[0b001, 4, 0, 0, 0, 1, 0, 0, 0], &mut |uid| {
-                edge.resolve(uid)
-            })
+            .apply_section(
+                &[0b001, 4, 0, 0, 0, 1, 0, 0, 0],
+                &mut |uid| edge.resolve(uid),
+                &mut Vec::new(),
+            )
             .unwrap_err();
         assert_eq!(error.kind, DecodeErrorKind::Length);
     }

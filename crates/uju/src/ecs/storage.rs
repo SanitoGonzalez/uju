@@ -1,5 +1,6 @@
 mod bits;
 pub mod join;
+pub mod ops;
 pub mod patch;
 pub mod replace;
 mod section;

@@ -8,7 +8,7 @@ and applies the sections it receives. Storages in general are in
 
 ## Tracked tables
 
-Four storages track changes:
+Five storages track changes:
 
 | Storage | For | Mutable item | Replicated |
 |---|---|---|---|
@@ -16,6 +16,7 @@ Four storages track changes:
 | `ReplaceTable<C>` | A schema component sent as its whole value, `C: Replace` | `TrackedMut<C>` | Yes |
 | `PatchTable<C>` | A schema component sent as patches of its fields, `C: Patch` | `C::Mut` | Yes |
 | `TagTable<C>` | A [tag](#tags), `C: Replicated + Default` | `&C` | Yes |
+| `OpsTable<C>` | A schema component changed only through [ops](#ops), `C: Ops` | `OpsMut<C>` | Yes |
 
 A component picks one as its storage:
 
@@ -25,10 +26,11 @@ A component picks one as its storage:
 struct Hp(u32);
 ```
 
-All four lay values out as a [`SparseSet`](components.md#sparseset) does,
+All five lay values out as a [`SparseSet`](components.md#sparseset) does,
 which they never hand out. Beside the dense array they keep, per entry, a
 **dirty bit** and an **added bit**, and a **remove log** of entities. A
-`PatchTable` also keeps a [field mask](#field-masks) per entry.
+`PatchTable` also keeps a [field mask](#field-masks) per entry, and an
+`OpsTable` the [tick's ops](#the-arena).
 
 | Method | Gives |
 |---|---|
@@ -112,6 +114,70 @@ holds unit structs, which take no memory, so it stores only membership.
   `Changed<C>` terms match it.
 - **Receiving.** The receiver builds the tag with `Default`.
 
+## Ops
+
+An `OpsTable` holds a component that changes only through ops, so that
+every change reaches replicas. It hands out no `&mut C`.
+
+- **Applying.** Mutable access yields an `OpsMut<C>`, which derefs to `&C`
+  and has `apply(op)`. It calls `Ops::apply` on the value and returns its
+  `Result`. An op that succeeds is recorded and marks the entry dirty.
+- **Failing.** An op that fails is not recorded, since replicas would fail
+  it too. `Ops::apply` must leave the value as it was when it fails.
+- **One entity.** `world.apply_op::<C>(entity, op)` applies one op. It
+  returns `None` when the entity holds no `C` or is a replica, and panics
+  like any conflicting borrow while a query holds the table.
+
+```rust
+let mut q = Query::<(Mut<Inventory>, Pickup)>::new(&world);
+for (_, (mut inv, pickup)) in q.iter() {
+    if inv.has_room() {
+        let slot = inv.free_slot();
+        inv.apply(InventoryOp::Add { item: pickup.0, slot })?;
+    }
+}
+
+world.apply_op::<Inventory>(entity, InventoryOp::Clear); // Option<Result<..>>
+```
+
+| Method | Does |
+|---|---|
+| `get_mut(entity)` | The `OpsMut`, or `None` |
+| `insert(entity, value)` | Inserts or replaces. A replaced value is resynced |
+| `resync(entity)` | Sends the full value in the next delta, dropping the tick's ops |
+| `get_mut_untracked(entity)` | `&mut C`, recording nothing |
+| `ops(entity)` | The entity's ops recorded this tick, in order |
+
+- **Sent whole.** An entry added, inserted over or resynced this tick is
+  sent as its full value. It records no op for the rest of the tick, since
+  the value sent holds them, and the ops it had are dropped.
+- **Untracked writes.** `get_mut_untracked` is safe, but replicas miss what
+  it writes until a resync. A replica diverging is a logic error, not
+  undefined behavior, so its name warns rather than `unsafe`.
+- **Resync.** `world.resync::<C>(entity)` resyncs an owned entity, and
+  returns `false` for a replica or an entity without `C`.
+
+```rust
+let mut inventories = world.view_mut::<Inventory>();
+inventories.get_mut_untracked(entity).unwrap().items.clear();
+drop(inventories);
+world.resync::<Inventory>(entity);
+```
+
+### The arena
+
+- **One arena per table.** The tick's ops sit in one `Vec<(C::Op, u32)>`,
+  each op beside the position of its entity's next op.
+- **8 bytes per entry.** Each entry keeps the `u32` positions of its first
+  and last op. Recording appends to the arena and links the entry's last
+  op to it, so no entity owns a heap block.
+- **In order.** The encoder follows an entry's links, so it reads the
+  entity's ops in the order applied, without sorting.
+- **Moves.** A removal swaps the last entry into the hole, and its
+  positions move with its bits. A resync or a removal resets them.
+- **End of tick.** One `clear()` empties the arena, and the positions of
+  the entries marked dirty are reset with the bits.
+
 ## Removals and despawns
 
 - **The remove log.** A removal logs the entity, and nothing else.
@@ -130,12 +196,12 @@ holds unit structs, which take no memory, so it stores only membership.
 ## Replicas
 
 A replica's state comes from its owner, so a replicated table, a
-`ReplaceTable`, a `PatchTable` or a `TagTable`, never marks or logs it
-through the runtime's path:
+`ReplaceTable`, a `PatchTable`, a `TagTable` or an `OpsTable`, never marks
+or logs it through the runtime's path:
 
 - **Writes skip replicas.** A `Mut<C>` query term, a `ViewMut`'s `get_mut`
-  and a `&mut view_mut` join term over a replicated table skip replicas.
-  Reads see them.
+  and a `&mut view_mut` join term over a replicated table skip replicas,
+  and so do `world.apply_op` and `world.resync`. Reads see them.
 - **Once per entity.** A query with such a term is filtered as by
   [`Owned`](queries.md#terms), once whatever the number of such terms.
 - **Received state is untracked.** Applying a section inserts, overwrites
@@ -147,7 +213,7 @@ through the runtime's path:
 
 Every schema component and tag implements `Replicated`. A component with a
 value also implements `Valued`, its full encoding, and its mode's trait,
-`Replace` or `Patch`. A tag implements `Replicated` alone.
+`Replace`, `Patch` or `Ops`. A tag implements `Replicated` alone.
 
 ```rust
 pub trait Replicated: Component {
@@ -173,6 +239,13 @@ pub trait Patch: Valued {
     fn encode_patch(&self, mask: &[u8], buf: &mut [u8]) -> Result<usize, EncodeError>;
     fn apply(&mut self, patch: Self::Patch<'_>);
 }
+
+pub trait Ops: Valued {
+    type Op: Encode + for<'a> Decode<'a> + 'static;
+    type Error;
+
+    fn apply(&mut self, op: &Self::Op) -> Result<(), Self::Error>;
+}
 ```
 
 | Item | Meaning |
@@ -188,7 +261,10 @@ pub trait Patch: Valued {
 | `Patch<'a>` | A received patch, validated by `Decode` |
 | `new_mut` | Wraps an entry's value and its `FieldMask` |
 | `patch_size`, `encode_patch` | The patch of the fields set in `mask`, from the current value. The mask is the patch's dirty bits, as is |
-| `apply` | Overwrites the fields the patch holds |
+| `Patch::apply` | Overwrites the fields the patch holds |
+| `Op` | The op type, a schema [union](../protocol/wire-format.md#unions) |
+| `Error` | Why an op could not be applied |
+| `Ops::apply` | Applies an op, leaving the value as it was when it fails |
 
 ### Writing a Patch
 
@@ -235,6 +311,36 @@ such as a join's, share the table's masks with no `unsafe`, as
 zero, so `encode_patch` copies it in as the patch's dirty bits and adds
 the bits that follow them.
 
+### Writing Ops
+
+`Ops::apply` gives an op its meaning, the same on the sim and on every
+receiver. The op type is a plain enum with its encoding:
+
+```rust
+impl Ops for Inventory {
+    type Op = InventoryOp;
+    type Error = InventoryError;
+
+    fn apply(&mut self, op: &InventoryOp) -> Result<(), InventoryError> {
+        match *op {
+            InventoryOp::Add { item, slot } => {
+                if self.items.contains_key(&slot) {
+                    return Err(InventoryError::Occupied(slot));
+                }
+                self.items.insert(slot, item);
+            }
+            InventoryOp::Remove(slot) => {
+                self.items.remove(&slot).ok_or(InventoryError::Empty(slot))?;
+            }
+            InventoryOp::Clear => self.items.clear(),
+        }
+        Ok(())
+    }
+}
+```
+
+The checks come before the writes, so a failing op changes nothing.
+
 ## The Table interface
 
 The runtime drives every table through `Table`, without generics. A table
@@ -248,7 +354,7 @@ apply one.
 | `changed(&mut out)` | Appends the entities added or marked dirty this tick |
 | `removed()` | The remove log |
 | `encode_section(full, changed, removed, &mut out)` | Appends one section, and returns whether it wrote one |
-| `apply_section(buf, resolve)` | Applies one section, and returns its length |
+| `apply_section(buf, resolve, &mut failed)` | Applies one section, and returns its length |
 | `end_tick()` | Clears the bits and the log |
 | `despawn_batch(entities)` | Drops despawned entities' values without logging them |
 
@@ -262,7 +368,12 @@ apply one.
 - **`changed`** lists the pairs of entities reported by `changed`. A
   `replace` change is a full value too. A `patch` change is a full value
   when the entry was added this tick, and a patch of its marked fields
-  otherwise. A tag's is an addition.
+  otherwise. An `ops` change is a full value when the entry was added,
+  inserted over or resynced this tick, and its ops otherwise. A tag's is
+  an addition.
+- **Overflow.** When an entity's ops would not fit the item's `u16` `len`,
+  its full value goes in the values part instead. The value's size is
+  never computed to compare.
 - **`removed`** lists the uids for the removed part: the logged entities
   that are alive and do not hold the component again.
 - An entity must not be in both `full` and `changed`. Entities holding no
@@ -275,21 +386,31 @@ apply one.
 | `ReplaceTable` | `uid \| value` | None | `uid` |
 | `PatchTable` | `uid \| value` | `uid \| len \| patch` | `uid` |
 | `TagTable` | `uid` | None | `uid` |
+| `OpsTable` | `uid \| len \| value` | `uid \| len:u16 \| ops` | `uid` |
 
 A fixed-size component's values are packed `uid | value` items, so they
 read as a slice of views. A variable-size one's are `uid | len | value`,
 with a 1-byte `len` when `C::MAX_ENCODED_SIZE` is at most 255, and 2 bytes
 otherwise. A patch always has a `len`, 1 byte when `C::MAX_PATCH_SIZE` is
-at most 255, and 2 otherwise.
+at most 255, and 2 otherwise. An `ops` item's `len` is 2 bytes, and `ops`
+is a `vec` of `C::Op` with no `max_length`: a 2-byte count, then each op
+behind a length prefix but the last, 1 byte when `C::Op::MAX_ENCODED_SIZE`
+is at most 255, and 2 otherwise.
 
 `apply_section` reads the section after its component id: the `parts`
 byte and the parts. For each item it calls `resolve(uid)`, which names the
 entity to apply it to, or returns `None` to skip it. Values are inserted or
-overwritten, patches applied with `Patch::apply`, tags added with
-`Default`, and removed uids removed, all untracked. A patch to an entity
-that holds no value is skipped. A part the table does not write, a
-truncated part, an invalid value or patch, or a zero incarnation is an
-error.
+overwritten, patches applied with `Patch::apply`, ops with `Ops::apply` in
+order, tags added with `Default`, and removed uids removed, all untracked.
+A patch or ops to an entity that holds no value are skipped. A part the
+table does not write, a truncated part, an invalid value, patch or op, or a
+zero incarnation is an error.
+
+An `Ops::apply` that fails is not an error of the section, and nothing
+panics. The entity's uid is appended to `failed`, its later ops in the
+section are skipped, and the rest of the section applies. The entity's
+value is then stale until a full value replaces it, so the caller asks the
+sender for one.
 
 ```rust
 // on the sim, at the end of the tick, with `table: &dyn Table`
@@ -299,5 +420,6 @@ table.changed(&mut changed);
 table.encode_section(&entered, &bucket, &removed, &mut frame)?;
 
 // on the receiver, with `table: &mut dyn Table`
-let read = table.apply_section(&section[2..], &mut |uid| world.resolve(uid))?;
+let mut failed = Vec::new();
+let read = table.apply_section(&section[2..], &mut |uid| world.resolve(uid), &mut failed)?;
 ```

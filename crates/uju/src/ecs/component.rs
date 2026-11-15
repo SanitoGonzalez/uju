@@ -36,7 +36,8 @@ pub enum Visibility {
 ///
 /// A tag implements only this trait, and is stored in a
 /// [`TagTable`](crate::ecs::storage::tag::TagTable). A component with a
-/// value also implements [`Valued`] and its mode's trait.
+/// value also implements [`Valued`] and its mode's trait, [`Replace`],
+/// [`Patch`] or [`Ops`].
 pub trait Replicated: Component {
     /// The id in the component id space, which names it on the wire.
     const WIRE_ID: u16;
@@ -100,6 +101,24 @@ pub trait Patch: Valued {
 
     /// Overwrites the fields the patch holds.
     fn apply(&mut self, patch: Self::Patch<'_>);
+}
+
+/// A component changed only through operations the user defines, stored in
+/// an [`OpsTable`](crate::ecs::storage::ops::OpsTable).
+///
+/// The table hands out no `&mut Self`. Its wrapper applies an op with
+/// [`apply`](Ops::apply) and records it, and the tick's delta sends the
+/// recorded ops, which each receiver applies with the same method.
+pub trait Ops: Valued {
+    /// The op type, a schema union.
+    type Op: Encode + for<'a> Decode<'a> + 'static;
+
+    /// Why an op could not be applied.
+    type Error;
+
+    /// Applies `op`. An op that fails is not recorded, so it must leave the
+    /// value as it was.
+    fn apply(&mut self, op: &Self::Op) -> Result<(), Self::Error>;
 }
 
 /// What the runtime needs to route a replicated table's sections, read
