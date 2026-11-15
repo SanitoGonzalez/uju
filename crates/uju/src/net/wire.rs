@@ -58,7 +58,7 @@ pub trait Encode {
 
 /// A value validated out of exactly the bytes of one encoding: a view, or
 /// an owned value copied out, as a
-/// [`Replace`](crate::ecs::component::Replace) component decodes.
+/// [`Valued`](crate::ecs::component::Valued) component decodes.
 pub trait Decode<'a>: Sized {
     fn decode(buf: &'a [u8]) -> Result<Self, DecodeError>;
 }

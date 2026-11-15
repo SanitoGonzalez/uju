@@ -1,10 +1,13 @@
 mod bits;
 pub mod join;
+pub mod patch;
 pub mod replace;
+mod section;
 pub mod sparse_array;
 pub mod sparse_bitset;
 pub mod sparse_set;
 pub mod table;
+pub mod tag;
 pub mod tracked;
 pub mod view;
 

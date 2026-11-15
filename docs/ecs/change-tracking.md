@@ -8,12 +8,14 @@ and applies the sections it receives. Storages in general are in
 
 ## Tracked tables
 
-Two storages track changes:
+Four storages track changes:
 
-| Storage | For | Replicated |
-|---|---|---|
-| `Tracked<C>` | Any component, such as a hand-written one that a system wants `Changed<C>` on | No |
-| `ReplaceTable<C>` | A schema component sent as its whole value, `C: Replace` | Yes |
+| Storage | For | Mutable item | Replicated |
+|---|---|---|---|
+| `Tracked<C>` | Any component, such as a hand-written one that a system wants `Changed<C>` on | `TrackedMut<C>` | No |
+| `ReplaceTable<C>` | A schema component sent as its whole value, `C: Replace` | `TrackedMut<C>` | Yes |
+| `PatchTable<C>` | A schema component sent as patches of its fields, `C: Patch` | `C::Mut` | Yes |
+| `TagTable<C>` | A [tag](#tags), `C: Replicated + Default` | `&C` | Yes |
 
 A component picks one as its storage:
 
@@ -23,13 +25,14 @@ A component picks one as its storage:
 struct Hp(u32);
 ```
 
-Both lay values out as a [`SparseSet`](components.md#sparseset) does, which
-they never hand out. Beside the dense array they keep, per entry, a **dirty
-bit** and an **added bit**, and a **remove log** of entities.
+All four lay values out as a [`SparseSet`](components.md#sparseset) does,
+which they never hand out. Beside the dense array they keep, per entry, a
+**dirty bit** and an **added bit**, and a **remove log** of entities. A
+`PatchTable` also keeps a [field mask](#field-masks) per entry.
 
 | Method | Gives |
 |---|---|
-| `get_mut(entity)` | A `TrackedMut`, or `None` |
+| `get_mut(entity)` | The mutable item, or `None` |
 | `insert(entity, value)` | Inserts or replaces, marking the entry |
 | `remove(entity)` | Removes, logging the entity |
 | `is_changed(entity)` | Whether the entry was added or marked dirty this tick |
@@ -37,10 +40,12 @@ bit** and an **added bit**, and a **remove log** of entities.
 | `changed()` | The entities added or marked dirty this tick, in dense order |
 | `removed()` | The entities removed this tick, in removal order |
 
-They also offer `get`, `contains`, `len`, `is_empty`, `entities`, `iter`,
-`components` and `clear`, as a `SparseSet` does. Mutable iteration goes
-through a [query](queries.md) or [`join`](queries.md#join), whose items are
-`TrackedMut`.
+A `TagTable` has `added()` in place of `is_changed` and `changed()`, since
+a tag is never marked dirty. They also offer `get`, `contains`, `len`,
+`is_empty`, `entities`, `iter` and `clear`, as a `SparseSet` does, and all
+but `TagTable` offer `components`.
+Mutable iteration goes through a [query](queries.md) or
+[`join`](queries.md#join), whose items are the mutable items.
 
 ## Dirty and added bits
 
@@ -56,11 +61,56 @@ through a [query](queries.md) or [`join`](queries.md#join), whose items are
 - **Shared words.** The `TrackedMut`s alive at once, such as a join's,
   share the words and set their bits through `&Cell<u64>`. That is a plain
   load and store, with no `unsafe`, since a `World` runs on one thread.
-- **End of tick.** The `World` clears every table's bits and log when the
-  tick ends.
+- **End of tick.** The `World` clears every table's bits, masks and log
+  when the tick ends.
 
 A write that leaves the value as it was still marks it, and so does a
 value changed and changed back within the tick. Nothing is compared.
+
+## Field masks
+
+A `PatchTable` tracks changes per field, so a change sends only the
+fields written:
+
+- **One mask per entry.** Beside the dense array, each entry has
+  `C::FIELDS.div_ceil(8)` bytes, a bit per top-level field in declaration
+  order. `C` stays a plain struct, and entities without it pay nothing.
+- **Marking on write.** Mutable access yields `C::Mut`, a wrapper with a
+  `*_mut()` accessor per field, which marks the field and the entry dirty,
+  and a read accessor, which marks nothing. `as_mut_all()` hands out
+  `&mut C` and marks every field.
+
+  ```rust
+  let mut stats = view.get_mut(entity).unwrap();   // StatsMut<'_>
+  *stats.hp_mut() -= 10;                            // marks hp
+  let hp = stats.hp();                              // marks nothing
+  stats.as_mut_all().take_damage(5);                // marks every field
+  ```
+
+- **Insert.** Inserting over a value marks every field. A new value is
+  marked added and dirty, and its mask stays clear, since it is sent whole.
+- **Moves.** A removal swaps the last entry into the hole, and its mask
+  moves with its bits.
+- **End of tick.** The masks of the entries marked dirty are cleared with
+  the bits.
+- `mask(entity)` reads an entry's mask.
+
+A field whose accessor was called is sent even if its value ends up
+unchanged. Nothing is compared or cloned.
+
+## Tags
+
+A tag has no value: only its addition and removal travel. A `TagTable`
+holds unit structs, which take no memory, so it stores only membership.
+
+- **Insert.** Adding a tag marks the entry added. Inserting one the entity
+  holds changes nothing and marks nothing, so `Changed<C>` keeps the
+  entities that gained the tag this tick.
+- **No writes.** The mutable item is `&C`, as there is nothing to write. A
+  `Mut<C>` term reads, and skips replicas as for any replicated table.
+- **Queries.** A tag is a component, so `C`, `With<C>`, `Without<C>` and
+  `Changed<C>` terms match it.
+- **Receiving.** The receiver builds the tag with `Default`.
 
 ## Removals and despawns
 
@@ -79,11 +129,12 @@ value changed and changed back within the tick. Nothing is compared.
 
 ## Replicas
 
-A replica's state comes from its owner, so a `ReplaceTable` never marks or
-logs it through the runtime's path:
+A replica's state comes from its owner, so a replicated table, a
+`ReplaceTable`, a `PatchTable` or a `TagTable`, never marks or logs it
+through the runtime's path:
 
 - **Writes skip replicas.** A `Mut<C>` query term, a `ViewMut`'s `get_mut`
-  and a `&mut view_mut` join term over a `ReplaceTable` skip replicas.
+  and a `&mut view_mut` join term over a replicated table skip replicas.
   Reads see them.
 - **Once per entity.** A query with such a term is filtered as by
   [`Owned`](queries.md#terms), once whatever the number of such terms.
@@ -94,8 +145,9 @@ logs it through the runtime's path:
 
 ## Replicated components
 
-A schema component implements `Replicated`, and a `replace` one also
-`Replace`:
+Every schema component and tag implements `Replicated`. A component with a
+value also implements `Valued`, its full encoding, and its mode's trait,
+`Replace` or `Patch`. A tag implements `Replicated` alone.
 
 ```rust
 pub trait Replicated: Component {
@@ -104,8 +156,22 @@ pub trait Replicated: Component {
     const HALO: bool = !matches!(Self::VISIBILITY, Visibility::None);
 }
 
-pub trait Replace: Replicated + Encode + for<'a> Decode<'a> {
+pub trait Valued: Replicated + Encode + for<'a> Decode<'a> {
     const SIZE: Option<usize>;
+}
+
+pub trait Replace: Valued {}
+
+pub trait Patch: Valued {
+    const FIELDS: usize;
+    const MAX_PATCH_SIZE: Option<usize>;
+    type Mut<'a>;
+    type Patch<'a>: Decode<'a>;
+
+    fn new_mut<'a>(value: &'a mut Self, mask: FieldMask<'a, Self>) -> Self::Mut<'a>;
+    fn patch_size(&self, mask: &[u8]) -> usize;
+    fn encode_patch(&self, mask: &[u8], buf: &mut [u8]) -> Result<usize, EncodeError>;
+    fn apply(&mut self, patch: Self::Patch<'_>);
 }
 ```
 
@@ -114,8 +180,60 @@ pub trait Replace: Replicated + Encode + for<'a> Decode<'a> {
 | `WIRE_ID` | The [component id](../protocol/wire-format.md#component-ids) |
 | `VISIBILITY` | `Public`, `Owner`, `None`, or `Audience(id)` with the audience's [wire id](../protocol/wire-format.md#audience-ids) |
 | `HALO` | Whether neighbor shards receive it. `true` unless `VISIBILITY` is `None` |
-| `SIZE` | The size of every encoding when they all have one, `None` otherwise |
+| `SIZE` | The size of every full encoding when they all have one, `None` otherwise |
 | `Encode`, `Decode` | The full encoding. `Decode` yields the owned value |
+| `FIELDS` | The number of top-level fields, a bit each in the mask |
+| `MAX_PATCH_SIZE` | The largest [patch](../protocol/wire-format.md#patches), `None` when only the message cap bounds it |
+| `Mut<'a>` | The wrapper mutable access yields |
+| `Patch<'a>` | A received patch, validated by `Decode` |
+| `new_mut` | Wraps an entry's value and its `FieldMask` |
+| `patch_size`, `encode_patch` | The patch of the fields set in `mask`, from the current value. The mask is the patch's dirty bits, as is |
+| `apply` | Overwrites the fields the patch holds |
+
+### Writing a Patch
+
+protoc generates these impls for a `@replicate(patch)` component. The
+wrapper holds the value and the entry's `FieldMask`, and each `*_mut()`
+accessor calls `mark` with the field's index before handing the field
+out:
+
+```rust
+pub struct StatsMut<'a> {
+    value: &'a mut Stats,
+    mask: FieldMask<'a, Stats>,
+}
+
+impl StatsMut<'_> {
+    pub fn hp(&self) -> u16 {
+        self.value.hp
+    }
+
+    pub fn hp_mut(&mut self) -> &mut u16 {
+        self.mask.mark(1);
+        &mut self.value.hp
+    }
+
+    pub fn as_mut_all(&mut self) -> &mut Stats {
+        self.mask.mark_all();
+        self.value
+    }
+}
+
+impl Patch for Stats {
+    type Mut<'a> = StatsMut<'a>;
+
+    fn new_mut<'a>(value: &'a mut Self, mask: FieldMask<'a, Self>) -> StatsMut<'a> {
+        StatsMut { value, mask }
+    }
+    // ...
+}
+```
+
+`FieldMask` sets its bits through `Cell`s, so the wrappers alive at once,
+such as a join's, share the table's masks with no `unsafe`, as
+`TrackedMut`s share the dirty bits. The mask's bits past `FIELDS` stay
+zero, so `encode_patch` copies it in as the patch's dirty bits and adds
+the bits that follow them.
 
 ## The Table interface
 
@@ -142,7 +260,9 @@ apply one.
 - **`full`** lists `(uid, entity)` pairs whose full value goes in the values
   part, such as the entities that entered the cell this tick.
 - **`changed`** lists the pairs of entities reported by `changed`. A
-  `replace` change is a full value too.
+  `replace` change is a full value too. A `patch` change is a full value
+  when the entry was added this tick, and a patch of its marked fields
+  otherwise. A tag's is an addition.
 - **`removed`** lists the uids for the removed part: the logged entities
   that are alive and do not hold the component again.
 - An entity must not be in both `full` and `changed`. Entities holding no
@@ -150,16 +270,26 @@ apply one.
 - **Snapshots** are sections with only `full`, listing every entity of the
   sub-frame.
 
+| Table | Values part | Changes part | Removed part |
+|---|---|---|---|
+| `ReplaceTable` | `uid \| value` | None | `uid` |
+| `PatchTable` | `uid \| value` | `uid \| len \| patch` | `uid` |
+| `TagTable` | `uid` | None | `uid` |
+
 A fixed-size component's values are packed `uid | value` items, so they
 read as a slice of views. A variable-size one's are `uid | len | value`,
 with a 1-byte `len` when `C::MAX_ENCODED_SIZE` is at most 255, and 2 bytes
-otherwise.
+otherwise. A patch always has a `len`, 1 byte when `C::MAX_PATCH_SIZE` is
+at most 255, and 2 otherwise.
 
 `apply_section` reads the section after its component id: the `parts`
 byte and the parts. For each item it calls `resolve(uid)`, which names the
 entity to apply it to, or returns `None` to skip it. Values are inserted or
-overwritten and removed uids removed, all untracked. A `replace` section
-with a changes part, a truncated part or a zero incarnation is an error.
+overwritten, patches applied with `Patch::apply`, tags added with
+`Default`, and removed uids removed, all untracked. A patch to an entity
+that holds no value is skipped. A part the table does not write, a
+truncated part, an invalid value or patch, or a zero incarnation is an
+error.
 
 ```rust
 // on the sim, at the end of the tick, with `table: &dyn Table`

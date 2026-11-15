@@ -1,20 +1,14 @@
-use std::any::{Any, type_name};
+use std::any::Any;
 
 use crate::ecs::component::{Replace, Replication};
 use crate::ecs::entity::{Entity, Uid};
 use crate::ecs::storage::{
     Storage, Tracking,
+    section::{self, REMOVED, VALUES},
     table::Table,
     tracked::{Tracked, TrackedJoin, TrackedMut},
 };
-use crate::net::wire::{
-    Decode, DecodeError, DecodeErrorKind, Encode, EncodeError, EncodeErrorKind,
-};
-
-/// The section part holding full values.
-const VALUES: u8 = 1 << 0;
-/// The section part holding removed uids.
-const REMOVED: u8 = 1 << 2;
+use crate::net::wire::{DecodeError, EncodeError};
 
 /// The table of a `replace` component: a [`Tracked`] table whose changes
 /// travel as whole values.
@@ -102,26 +96,6 @@ impl<T: Replace> ReplaceTable<T> {
         self.0.clear();
     }
 
-    /// Appends `uid | value`, the value with a length prefix unless every
-    /// encoding has the same size.
-    fn write_item(uid: Uid, value: &T, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.extend_from_slice(&uid.to_bits().to_le_bytes());
-        let size = match T::SIZE {
-            Some(size) => size,
-            None => {
-                let size = value.encoded_size();
-                let width = prefix_width::<T>();
-                debug_assert!(size < 1 << (8 * width));
-                out.extend_from_slice(&size.to_le_bytes()[..width]);
-                size
-            }
-        };
-        let at = out.len();
-        out.resize(at + size, 0);
-        value.encode(&mut out[at..])?;
-        Ok(())
-    }
-
     fn write_section(
         &self,
         full: &[(Uid, Entity)],
@@ -129,76 +103,18 @@ impl<T: Replace> ReplaceTable<T> {
         removed: &[Uid],
         out: &mut Vec<u8>,
     ) -> Result<bool, EncodeError> {
-        let start = out.len();
-        out.extend_from_slice(&T::WIRE_ID.to_le_bytes());
-        out.push(0);
-        let mut parts = 0;
-
-        // a replace change is a full value, so both lists are values
-        let part = begin_part(out);
-        for &(uid, entity) in full.iter().chain(changed) {
-            if let Some(value) = self.0.get(entity) {
-                Self::write_item(uid, value, out)?;
-            }
-        }
-        if out.len() > part + 4 {
-            end_part::<T>(out, part)?;
-            parts |= VALUES;
-        } else {
-            out.truncate(part);
-        }
-
-        if !removed.is_empty() {
-            let part = begin_part(out);
-            for uid in removed {
-                out.extend_from_slice(&uid.to_bits().to_le_bytes());
-            }
-            end_part::<T>(out, part)?;
-            parts |= REMOVED;
-        }
-
-        if parts == 0 {
-            out.truncate(start);
-            return Ok(false);
-        }
-        out[start + 2] = parts;
-        Ok(true)
-    }
-
-    fn apply_values(
-        &mut self,
-        items: &[u8],
-        at: usize,
-        resolve: &mut dyn FnMut(Uid) -> Option<Entity>,
-    ) -> Result<(), DecodeError> {
-        let mut pos = 0;
-        while pos < items.len() {
-            let uid = read_uid::<T>(items, pos, at)?;
-            pos += 8;
-            let size = match T::SIZE {
-                Some(size) => size,
-                None => {
-                    let width = prefix_width::<T>();
-                    let prefix = items
-                        .get(pos..pos + width)
-                        .ok_or_else(|| error::<T>(at + pos, DecodeErrorKind::Size))?;
-                    pos += width;
-                    prefix
-                        .iter()
-                        .rev()
-                        .fold(0, |size, &byte| size << 8 | byte as usize)
+        section::encode::<T>(out, |parts| {
+            // a replace change is a full value, so both lists are values
+            parts.part(VALUES, |out| {
+                for &(uid, entity) in full.iter().chain(changed) {
+                    if let Some(value) = self.0.get(entity) {
+                        section::put_value(out, uid, value)?;
+                    }
                 }
-            };
-            let bytes = items
-                .get(pos..pos + size)
-                .ok_or_else(|| error::<T>(at + pos, DecodeErrorKind::Size))?;
-            pos += size;
-            let value = <T as Decode<'_>>::decode(bytes)?;
-            if let Some(entity) = resolve(uid) {
-                self.0.insert_untracked(entity, value);
-            }
-        }
-        Ok(())
+                Ok(())
+            })?;
+            parts.removed(removed)
+        })
     }
 
     fn apply(
@@ -206,87 +122,22 @@ impl<T: Replace> ReplaceTable<T> {
         buf: &[u8],
         resolve: &mut dyn FnMut(Uid) -> Option<Entity>,
     ) -> Result<usize, DecodeError> {
-        let parts = *buf
-            .first()
-            .ok_or_else(|| error::<T>(0, DecodeErrorKind::Size))?;
-        if parts & !(VALUES | REMOVED) != 0 {
-            return Err(error::<T>(0, DecodeErrorKind::Padding));
-        }
-        let mut at = 1;
-
-        if parts & VALUES != 0 {
-            let (items, start) = read_part::<T>(buf, &mut at)?;
-            self.apply_values(items, start, resolve)?;
-        }
-        if parts & REMOVED != 0 {
-            let (items, start) = read_part::<T>(buf, &mut at)?;
-            if items.len() % 8 != 0 {
-                return Err(error::<T>(start, DecodeErrorKind::Length));
+        section::decode::<T>(buf, VALUES | REMOVED, |part, items, at| {
+            if part == VALUES {
+                section::read_values::<T>(items, at, |uid, value| {
+                    if let Some(entity) = resolve(uid) {
+                        self.0.insert_untracked(entity, value);
+                    }
+                })
+            } else {
+                section::read_uids::<T>(items, at, |uid| {
+                    if let Some(entity) = resolve(uid) {
+                        self.0.remove_untracked(entity);
+                    }
+                })
             }
-            for pos in (0..items.len()).step_by(8) {
-                let uid = read_uid::<T>(items, pos, start)?;
-                if let Some(entity) = resolve(uid) {
-                    self.0.remove_untracked(entity);
-                }
-            }
-        }
-        Ok(at)
+        })
     }
-}
-
-/// The width of a variable-size value's length prefix: 1 byte when every
-/// encoding fits it, 2 otherwise.
-fn prefix_width<T: Encode>() -> usize {
-    match T::MAX_ENCODED_SIZE {
-        Some(max) if max <= u8::MAX as usize => 1,
-        _ => 2,
-    }
-}
-
-/// Appends a part's `u32` length, to fill in by [`end_part`], and returns
-/// where it starts.
-fn begin_part(out: &mut Vec<u8>) -> usize {
-    let part = out.len();
-    out.extend_from_slice(&[0; 4]);
-    part
-}
-
-fn end_part<T>(out: &mut [u8], part: usize) -> Result<(), EncodeError> {
-    let length = u32::try_from(out.len() - part - 4)
-        .map_err(|_| EncodeError::new(type_name::<T>(), EncodeErrorKind::TooLarge))?;
-    out[part..part + 4].copy_from_slice(&length.to_le_bytes());
-    Ok(())
-}
-
-/// Reads the part at `at`, its `u32` length and its items, and moves `at`
-/// past it. Returns the items and where they start.
-fn read_part<'a, T>(buf: &'a [u8], at: &mut usize) -> Result<(&'a [u8], usize), DecodeError> {
-    let length = buf
-        .get(*at..*at + 4)
-        .ok_or_else(|| error::<T>(*at, DecodeErrorKind::Size))?;
-    let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
-    let start = *at + 4;
-    let items = buf
-        .get(start..start + length)
-        .ok_or_else(|| error::<T>(start, DecodeErrorKind::Size))?;
-    *at = start + length;
-    Ok((items, start))
-}
-
-/// Reads the uid at `pos` of `items`, which start at `at` of the section.
-fn read_uid<T>(items: &[u8], pos: usize, at: usize) -> Result<Uid, DecodeError> {
-    let bytes = items
-        .get(pos..pos + 8)
-        .ok_or_else(|| error::<T>(at + pos, DecodeErrorKind::Size))?;
-    let bits = u64::from_le_bytes(bytes.try_into().unwrap());
-    if bits >> 32 == 0 {
-        return Err(error::<T>(at + pos, DecodeErrorKind::Range));
-    }
-    Ok(Uid::from_bits(bits))
-}
-
-fn error<T>(offset: usize, kind: DecodeErrorKind) -> DecodeError {
-    DecodeError::new(offset, type_name::<T>(), kind)
 }
 
 impl<T: Replace> Default for ReplaceTable<T> {
@@ -355,9 +206,7 @@ impl<T: Replace> Table for ReplaceTable<T> {
         removed: &[Uid],
         out: &mut Vec<u8>,
     ) -> Result<bool, EncodeError> {
-        let start = out.len();
         self.write_section(full, changed, removed, out)
-            .inspect_err(|_| out.truncate(start))
     }
 
     fn apply_section(
@@ -428,12 +277,12 @@ mod tests {
     use super::*;
     use crate::ecs::Component;
     use crate::ecs::cell::Cell;
-    use crate::ecs::component::{Component as ComponentTrait, Replicated, Visibility};
-    use crate::ecs::entity::UidAllocator;
+    use crate::ecs::component::{Component as _, Replicated, Valued, Visibility};
     use crate::ecs::query::{Changed, Mut, Query, Replica};
     use crate::ecs::storage::join::join;
+    use crate::ecs::storage::section::testing::{apply, encode_changes, sim, uid, values};
     use crate::ecs::world::World;
-    use crate::net::wire::en;
+    use crate::net::wire::{Decode, DecodeErrorKind, Encode, en};
 
     #[derive(Component, Debug, Clone, PartialEq)]
     #[component(storage = ReplaceTable<Self>)]
@@ -447,9 +296,11 @@ mod tests {
         const VISIBILITY: Visibility = Visibility::Public;
     }
 
-    impl Replace for Health {
+    impl Valued for Health {
         const SIZE: Option<usize> = Some(8);
     }
+
+    impl Replace for Health {}
 
     impl Encode for Health {
         const MAX_ENCODED_SIZE: Option<usize> = Some(8);
@@ -492,9 +343,11 @@ mod tests {
                 const VISIBILITY: Visibility = Visibility::None;
             }
 
-            impl Replace for $name {
+            impl Valued for $name {
                 const SIZE: Option<usize> = None;
             }
+
+            impl Replace for $name {}
 
             impl Encode for $name {
                 const MAX_ENCODED_SIZE: Option<usize> = $max;
@@ -529,10 +382,6 @@ mod tests {
 
     #[derive(Component, Debug, PartialEq)]
     struct Body(u32);
-
-    fn uid(serial: u32) -> Uid {
-        Uid::new(NonZeroU32::new(1).unwrap(), serial)
-    }
 
     #[test]
     fn replace_section_layout() {
@@ -586,64 +435,6 @@ mod tests {
         assert_eq!(replication.wire_id, 2);
         assert_eq!(replication.visibility, Visibility::Public);
         assert!(replication.halo);
-    }
-
-    /// Encodes `C`'s changes on `sim` as one section, as the encoder does:
-    /// through the untyped table, with uids from the registry.
-    fn encode_changes<C: ComponentTrait>(sim: &World, full: &[Entity]) -> Vec<u8> {
-        let table = sim.tables[C::id() as usize].borrow();
-        let named = |entities: &mut dyn Iterator<Item = Entity>| {
-            entities
-                .filter_map(|e| Some((sim.uid(e)?, e)))
-                .collect::<Vec<_>>()
-        };
-        let mut changed = Vec::new();
-        table.changed(&mut changed);
-        changed.retain(|e| !full.contains(e));
-        let removed = table
-            .removed()
-            .iter()
-            .filter(|&&e| sim.is_alive(e) && !table.contains(e))
-            .filter_map(|&e| sim.uid(e))
-            .collect::<Vec<_>>();
-
-        let mut out = Vec::new();
-        let full = named(&mut full.iter().copied());
-        let changed = named(&mut changed.into_iter());
-        table
-            .encode_section(&full, &changed, &removed, &mut out)
-            .unwrap();
-        out
-    }
-
-    /// Applies one section on `edge`, adopting the uids it does not hold.
-    fn apply<C: ComponentTrait>(edge: &World, section: &[u8]) {
-        let id = u16::from_le_bytes([section[0], section[1]]);
-        let mut table = edge.tables[C::id() as usize].borrow_mut();
-        assert_eq!(table.replication().unwrap().wire_id, id);
-        let mut resolve = |uid| {
-            let entity = edge.resolve(uid).or_else(|| edge.adopt(uid))?;
-            edge.entities().set_replica(entity, true);
-            Some(entity)
-        };
-        let read = table.apply_section(&section[2..], &mut resolve).unwrap();
-        assert_eq!(read, section.len() - 2);
-    }
-
-    fn sim() -> World {
-        let world = World::new();
-        world.install_uid_allocator(UidAllocator::new(NonZeroU32::MIN, NonZeroU32::MAX));
-        world
-    }
-
-    fn values<C: Replace<Storage = ReplaceTable<C>> + Clone>(world: &World) -> Vec<(Uid, C)> {
-        let mut values = world
-            .view::<C>()
-            .iter()
-            .map(|(e, value)| (world.uid(e).unwrap(), value.clone()))
-            .collect::<Vec<_>>();
-        values.sort_by_key(|(uid, _)| *uid);
-        values
     }
 
     fn health(hp: u32) -> Health {

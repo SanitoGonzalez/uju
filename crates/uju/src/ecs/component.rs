@@ -3,8 +3,8 @@ use std::sync::Once;
 
 use linkme::distributed_slice;
 
-use crate::ecs::storage::{Storage, table::Table};
-use crate::net::wire::{Decode, Encode};
+use crate::ecs::storage::{Storage, patch::FieldMask, table::Table};
+use crate::net::wire::{Decode, Encode, EncodeError};
 
 pub type Id = u16;
 
@@ -33,6 +33,10 @@ pub enum Visibility {
 
 /// A component declared in the schema, which travels with its entity: what
 /// every component and tag has.
+///
+/// A tag implements only this trait, and is stored in a
+/// [`TagTable`](crate::ecs::storage::tag::TagTable). A component with a
+/// value also implements [`Valued`] and its mode's trait.
 pub trait Replicated: Component {
     /// The id in the component id space, which names it on the wire.
     const WIRE_ID: u16;
@@ -43,15 +47,59 @@ pub trait Replicated: Component {
     const HALO: bool = !matches!(Self::VISIBILITY, Visibility::None);
 }
 
-/// A [`Replicated`] component whose changes travel as its whole value,
-/// stored in a [`ReplaceTable`](crate::ecs::storage::replace::ReplaceTable).
+/// A [`Replicated`] component with a value, as every one but a tag has: its
+/// full encoding, which entering entities, snapshots and resyncs send
+/// whatever the mode.
 ///
 /// Decoding yields the owned value, so the type implements `Decode` for
 /// every lifetime.
-pub trait Replace: Replicated + Encode + for<'a> Decode<'a> {
+pub trait Valued: Replicated + Encode + for<'a> Decode<'a> {
     /// The size of every encoding, when they all have one. A section packs
     /// the values of such a component with no length prefix.
     const SIZE: Option<usize>;
+}
+
+/// A component whose changes travel as its whole value, stored in a
+/// [`ReplaceTable`](crate::ecs::storage::replace::ReplaceTable).
+pub trait Replace: Valued {}
+
+/// A component whose changes travel as patches of the top-level fields
+/// written this tick, stored in a
+/// [`PatchTable`](crate::ecs::storage::patch::PatchTable).
+///
+/// The table keeps a mask per entry, a bit per field in declaration order,
+/// and hands out [`Mut`](Patch::Mut) wrappers that set the bits. The patch
+/// is encoded from the mask and the current value, with no copy of the last
+/// value sent.
+pub trait Patch: Valued {
+    /// The number of top-level fields. A mask takes `FIELDS.div_ceil(8)`
+    /// bytes, and its bits past `FIELDS` stay zero.
+    const FIELDS: usize;
+
+    /// The largest encoding of a patch, `None` when only
+    /// [`MAX_SIZE`](crate::net::wire::MAX_SIZE) bounds it.
+    const MAX_PATCH_SIZE: Option<usize>;
+
+    /// The value borrowed mutably: `*_mut()` accessors that mark their
+    /// field through the [`FieldMask`], and read accessors that do not.
+    type Mut<'a>;
+
+    /// A received patch, validated by decoding.
+    type Patch<'a>: Decode<'a>;
+
+    fn new_mut<'a>(value: &'a mut Self, mask: FieldMask<'a, Self>) -> Self::Mut<'a>;
+
+    /// The exact number of bytes [`encode_patch`](Patch::encode_patch)
+    /// writes for `mask`.
+    fn patch_size(&self, mask: &[u8]) -> usize;
+
+    /// Writes the patch of the fields set in `mask` to the start of `buf`,
+    /// which holds at least [`patch_size`](Patch::patch_size) bytes, and
+    /// returns its length. The mask is the patch's dirty bits, as is.
+    fn encode_patch(&self, mask: &[u8], buf: &mut [u8]) -> Result<usize, EncodeError>;
+
+    /// Overwrites the fields the patch holds.
+    fn apply(&mut self, patch: Self::Patch<'_>);
 }
 
 /// What the runtime needs to route a replicated table's sections, read

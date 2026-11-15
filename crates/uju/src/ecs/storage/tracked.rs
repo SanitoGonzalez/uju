@@ -142,6 +142,42 @@ impl<T: Component> Tracked<T> {
         self.removed.clear();
     }
 
+    /// `entity`'s dense position, if it holds a value.
+    #[inline]
+    pub(crate) fn index_of(&self, entity: Entity) -> Option<usize> {
+        self.set.index_of(entity)
+    }
+
+    /// The value at dense position `position`, which must be in bounds.
+    #[inline]
+    pub(crate) fn value_at(&self, position: usize) -> &T {
+        self.set.value_at(position)
+    }
+
+    #[inline]
+    pub(crate) fn is_added_at(&self, position: usize) -> bool {
+        self.added.get(position)
+    }
+
+    /// The dense positions added or marked dirty this tick, in order.
+    pub(crate) fn changed_positions(&self) -> impl Iterator<Item = usize> + '_ {
+        self.dirty.ones()
+    }
+
+    /// The values and a marker of their dirty bits, borrowed apart, for a
+    /// table that hands out wrappers of its own.
+    #[inline]
+    pub(crate) fn split_mut(&mut self) -> (&mut SparseSet<T>, Marker<'_>) {
+        (&mut self.set, self.dirty.marker())
+    }
+
+    /// `entity`'s value borrowed mutably without marking it, for state
+    /// received from another world.
+    #[inline]
+    pub(crate) fn get_mut_untracked(&mut self, entity: Entity) -> Option<&mut T> {
+        self.set.get_mut(entity)
+    }
+
     /// Inserts or replaces a value without marking it, for state received
     /// from another world.
     pub(crate) fn insert_untracked(&mut self, entity: Entity, component: T) -> Option<T> {
@@ -309,10 +345,8 @@ impl<T: Component> Storage for Tracked<T> {
 
     #[inline]
     fn join_mut(&mut self) -> TrackedJoin<'_, T> {
-        TrackedJoin {
-            set: &mut self.set,
-            dirty: self.dirty.marker(),
-        }
+        let (set, dirty) = self.split_mut();
+        TrackedJoin { set, dirty }
     }
 }
 

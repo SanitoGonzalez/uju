@@ -1,8 +1,9 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use uju::ecs::component::{Replace, Replicated, Visibility};
+use uju::ecs::component::{Patch, Replace, Replicated, Valued, Visibility};
 use uju::ecs::storage::join::join;
+use uju::ecs::storage::patch::{FieldMask, PatchTable};
 use uju::ecs::storage::replace::ReplaceTable;
 use uju::ecs::storage::tracked::Tracked;
 use uju::net::wire::{Decode, DecodeError, DecodeErrorKind, Encode, EncodeError, en};
@@ -37,9 +38,11 @@ impl Replicated for ReplacePosition {
     const VISIBILITY: Visibility = Visibility::Public;
 }
 
-impl Replace for ReplacePosition {
+impl Valued for ReplacePosition {
     const SIZE: Option<usize> = Some(12);
 }
+
+impl Replace for ReplacePosition {}
 
 impl Encode for ReplacePosition {
     const MAX_ENCODED_SIZE: Option<usize> = Some(12);
@@ -69,6 +72,127 @@ impl Decode<'_> for ReplacePosition {
     }
 }
 
+/// `Position` in a [`PatchTable`], with a field per axis.
+#[derive(Component)]
+#[component(storage = PatchTable<Self>)]
+struct PatchPosition {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Replicated for PatchPosition {
+    const WIRE_ID: u16 = 2;
+    const VISIBILITY: Visibility = Visibility::Public;
+}
+
+impl Valued for PatchPosition {
+    const SIZE: Option<usize> = Some(12);
+}
+
+impl Encode for PatchPosition {
+    const MAX_ENCODED_SIZE: Option<usize> = Some(12);
+
+    fn encoded_size(&self) -> usize {
+        12
+    }
+
+    fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+        en::encode(self, buf, "PatchPosition")
+    }
+
+    fn write(&self, w: &mut en::Writer<'_>) -> Result<(), EncodeError> {
+        for value in [self.x, self.y, self.z] {
+            w.put(&value.to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+impl Decode<'_> for PatchPosition {
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        let [x, y, z] = ReplacePosition::decode(buf)?.0;
+        Ok(Self { x, y, z })
+    }
+}
+
+/// A patch's sent axes.
+struct PositionPatch([Option<f32>; 3]);
+
+impl Decode<'_> for PositionPatch {
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        let error = |kind| DecodeError::new(0, "PositionPatch", kind);
+        let (&mask, mut rest) = buf.split_first().ok_or(error(DecodeErrorKind::Size))?;
+        if mask > 0b111 {
+            return Err(error(DecodeErrorKind::Padding));
+        }
+        let mut axes = [None; 3];
+        for (axis, value) in axes.iter_mut().enumerate() {
+            if mask & 1 << axis != 0 {
+                let (bytes, tail) = rest
+                    .split_first_chunk::<4>()
+                    .ok_or(error(DecodeErrorKind::Size))?;
+                *value = Some(f32::from_le_bytes(*bytes));
+                rest = tail;
+            }
+        }
+        if !rest.is_empty() {
+            return Err(error(DecodeErrorKind::Size));
+        }
+        Ok(PositionPatch(axes))
+    }
+}
+
+impl Patch for PatchPosition {
+    const FIELDS: usize = 3;
+    const MAX_PATCH_SIZE: Option<usize> = Some(13);
+
+    type Mut<'a> = PatchPositionMut<'a>;
+    type Patch<'a> = PositionPatch;
+
+    fn new_mut<'a>(value: &'a mut Self, mask: FieldMask<'a, Self>) -> PatchPositionMut<'a> {
+        PatchPositionMut { value, mask }
+    }
+
+    fn patch_size(&self, mask: &[u8]) -> usize {
+        1 + 4 * mask[0].count_ones() as usize
+    }
+
+    fn encode_patch(&self, mask: &[u8], buf: &mut [u8]) -> Result<usize, EncodeError> {
+        let mut w = en::Writer::new(buf, "PositionPatch");
+        w.put(mask)?;
+        for (axis, value) in [self.x, self.y, self.z].into_iter().enumerate() {
+            if mask[0] & 1 << axis != 0 {
+                w.put(&value.to_le_bytes())?;
+            }
+        }
+        Ok(w.pos())
+    }
+
+    fn apply(&mut self, patch: PositionPatch) {
+        let [x, y, z] = patch.0;
+        self.x = x.unwrap_or(self.x);
+        self.y = y.unwrap_or(self.y);
+        self.z = z.unwrap_or(self.z);
+    }
+}
+
+struct PatchPositionMut<'a> {
+    value: &'a mut PatchPosition,
+    mask: FieldMask<'a, PatchPosition>,
+}
+
+impl PatchPositionMut<'_> {
+    fn x(&self) -> f32 {
+        self.value.x
+    }
+
+    fn y_mut(&mut self) -> &mut f32 {
+        self.mask.mark(1);
+        &mut self.value.y
+    }
+}
+
 /// Every entity has a `Position`, every 2nd a `Velocity`, every 3rd an
 /// `Accel` and every 5th is `Frozen`, so terms overlap only in part.
 fn world() -> World {
@@ -85,6 +209,14 @@ fn world() -> World {
         world
             .view_mut::<ReplacePosition>()
             .insert(entity, ReplacePosition([index as f32; 3]));
+        world.view_mut::<PatchPosition>().insert(
+            entity,
+            PatchPosition {
+                x: index as f32,
+                y: index as f32,
+                z: index as f32,
+            },
+        );
         if index % 2 == 0 {
             world
                 .view_mut::<Velocity>()
@@ -145,6 +277,27 @@ fn bench(c: &mut Criterion) {
             for (_, mut position) in query.iter() {
                 position.0[1] += 1.0;
             }
+        })
+    });
+
+    // marks one field of every entry
+    c.bench_function("patch/mut_single", |b| {
+        let mut query = Query::<Mut<PatchPosition>>::new(&world);
+        b.iter(|| {
+            for (_, mut position) in query.iter() {
+                *position.y_mut() += 1.0;
+            }
+        })
+    });
+
+    c.bench_function("patch/mut_read", |b| {
+        let mut query = Query::<Mut<PatchPosition>>::new(&world);
+        b.iter(|| {
+            let mut sum = 0.0;
+            for (_, position) in query.iter() {
+                sum += position.x();
+            }
+            black_box(sum)
         })
     });
 

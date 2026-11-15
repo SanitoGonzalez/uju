@@ -94,6 +94,12 @@ impl<T: Component> SparseSet<T> {
 
     /// The value at dense position `index`, which must be in bounds.
     #[inline]
+    pub(crate) fn value_at(&self, index: usize) -> &T {
+        &self.data[index]
+    }
+
+    /// The value at dense position `index`, which must be in bounds.
+    #[inline]
     pub(crate) fn value_mut_at(&mut self, index: usize) -> &mut T {
         &mut self.data[index]
     }
