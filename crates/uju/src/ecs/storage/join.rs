@@ -140,15 +140,17 @@ macro_rules! impl_joinable {
             #[allow(unused_mut, unused_assignments, unused_variables)]
             fn entities(&self) -> Entities<'a> {
                 let ($head_term, $($tail_term,)*) = self;
+                // a filter that cannot drive panics in `entities`, so only
+                // the shortest term is asked
                 let mut len = $head_term.len();
-                let mut entities = $head_term.entities();
+                let mut entities = None;
                 $(
                     if $tail_term.len() < len {
                         len = $tail_term.len();
-                        entities = $tail_term.entities();
+                        entities = Some($tail_term.entities());
                     }
                 )*
-                entities
+                entities.unwrap_or_else(|| $head_term.entities())
             }
 
             unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {

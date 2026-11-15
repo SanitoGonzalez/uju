@@ -34,6 +34,8 @@ for (entity, (position, velocity)) in query.iter() {
 | `Mut<C>` | Holding `C` | `C::Storage`'s [`Mut`](components.md#storage) item, `&mut C` for a `SparseSet` | Mutably |
 | `With<C>` | Holding `C` | Nothing | Shared |
 | `Without<C>` | Not holding `C` | Nothing | Shared |
+| `Owned` | Owned by this `World` | Nothing | None. Borrows the replica flags shared |
+| `Replica` | [Replicas](entities.md#replicas) | Nothing | None. Borrows the replica flags shared |
 | `(T0, T1, ...)` | Matching every term | The terms' items | As its terms do |
 
 - **Tuples** hold up to 12 terms and nest. Nested tuples flatten into one
@@ -41,8 +43,11 @@ for (entity, (position, velocity)) in query.iter() {
   `(Mut<A>, With<F>)` yields the `Mut` item alone.
 - **Mutable terms stand alone.** `Mut<C>` conflicts with any other term
   over `C`, such as `With<C>`, and panics. `Mut<C>` already requires `C`.
-- **`Without` alone** cannot drive iteration, so `iter()` panics on a
-  query whose terms are all `Without`.
+- **Filters alone.** `Without`, `Owned` and `Replica` cannot drive
+  iteration, so `iter()` panics on a query made only of them. `iter_in`
+  accepts one, since the cell drives.
+- **`Owned` and `Replica` leave spawning free.** The replica flags are a
+  borrow of their own, so a loop over such a query can still spawn.
 
 ## Driving
 
@@ -54,7 +59,34 @@ one's size.
 - `C`, `Mut<C>` and `With<C>` count their table's entities. So a `With<C>`
   over a small table drives a query over large ones.
 - `Without<C>` lists the entities it excludes, so it never drives.
+  `Owned` and `Replica` list none, so they never drive either.
 - A tuple drives with its smallest term.
+- In [`iter_in`](#iter_in), the cell's list is one more term.
+
+## iter_in
+
+A cell is a value, not a type, so it is an argument of the iteration rather
+than a term. `query.iter_in(cell)` walks the entities of the query that are
+in `cell`:
+
+```rust
+let mut q = Query::<(Mut<Hp>, Pos, Owned)>::new(&world);
+for cell in cells {
+    for (e, (hp, pos)) in q.iter_in(cell) { ... }
+}
+```
+
+- **One more term.** The cell's list from the
+  [cell index](entities.md#cell-index) joins as a term that matches the
+  entities in the cell. It drives when it is the shortest, so a query over
+  large tables costs the cell's size.
+- **No repeats.** An entity is in one cell only, so iterating several cells
+  in turn never yields an entity twice.
+- **Filters combine.** `Owned` and `Replica` filter it as any query.
+  Replicas are in the index, so without a filter `iter_in` yields both.
+- **Borrows.** The first `iter_in` borrows the cell index shared, until the
+  query is dropped. Spawning stays free inside the loop. A cell with no
+  entity yields nothing.
 
 ## join
 

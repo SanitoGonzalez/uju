@@ -1,8 +1,10 @@
+use std::cell::Ref;
 use std::marker::PhantomData;
 
 use crate::ecs::{
+    cell::{Cell, CellIndex},
     component::Component,
-    entity::Entity,
+    entity::{Entity, Replicas},
     storage::{
         Storage,
         join::{Entities, Join, Joinable},
@@ -34,9 +36,21 @@ pub struct With<C: Component>(PhantomData<C>);
 /// term.
 pub struct Without<C: Component>(PhantomData<C>);
 
+/// Filters a query to the entities this world owns, skipping replicas.
+///
+/// Holds a shared borrow of the [`Replicas`] flags. It never drives
+/// iteration.
+pub struct Owned;
+
+/// Filters a query to replicas, the entities another shard owns.
+///
+/// Holds a shared borrow of the [`Replicas`] flags. It never drives
+/// iteration.
+pub struct Replica;
+
 /// A term of a [`Query`]: a bare component type reads (`&C`), [`Mut<C>`]
-/// writes (the storage's [`Storage::Mut`]), [`With<C>`]/[`Without<C>`] filter, and a tuple of terms
-/// composes. Filters are stripped from the yielded item, and tuples flatten:
+/// writes (the storage's [`Storage::Mut`]), [`With<C>`]/[`Without<C>`] and
+/// [`Owned`]/[`Replica`] filter, and a tuple of terms composes. Filters are stripped from the yielded item, and tuples flatten:
 /// `(A, B, (With<Foo>, Without<Bar>))` yields `(&A, &B)`, and a lone data
 /// term yields its item bare - `(Mut<A>, With<Foo>)` yields `&mut A`.
 pub trait Term {
@@ -187,6 +201,90 @@ unsafe impl<'q, S: Storage> Joinable<'q> for WithoutJoin<'q, S> {
     }
 }
 
+impl Term for Owned {
+    type View<'w> = Ref<'w, Replicas>;
+    type Join<'q, 'w: 'q> = OwnedJoin<'q>;
+    type Item<'q, 'w: 'q, Rest> = Rest;
+
+    fn fetch(world: &World) -> Self::View<'_> {
+        world.entities().replicas()
+    }
+
+    fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w> {
+        OwnedJoin(view)
+    }
+
+    #[inline]
+    fn item<'q, 'w: 'q, Rest>((): (), rest: Rest) -> Self::Item<'q, 'w, Rest> {
+        rest
+    }
+}
+
+impl Term for Replica {
+    type View<'w> = Ref<'w, Replicas>;
+    type Join<'q, 'w: 'q> = ReplicaJoin<'q>;
+    type Item<'q, 'w: 'q, Rest> = Rest;
+
+    fn fetch(world: &World) -> Self::View<'_> {
+        world.entities().replicas()
+    }
+
+    fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w> {
+        ReplicaJoin(view)
+    }
+
+    #[inline]
+    fn item<'q, 'w: 'q, Rest>((): (), rest: Rest) -> Self::Item<'q, 'w, Rest> {
+        rest
+    }
+}
+
+/// [`Owned`] as a join term.
+pub struct OwnedJoin<'q>(&'q Replicas);
+
+// SAFETY: `entities` is unreachable (`len` keeps this term from ever being
+// the shortest); `get` hands out no references.
+unsafe impl<'q> Joinable<'q> for OwnedJoin<'q> {
+    type Item = ();
+
+    #[inline]
+    fn len(&self) -> usize {
+        usize::MAX
+    }
+
+    fn entities(&self) -> Entities<'q> {
+        panic!("`Owned` cannot drive iteration - a query needs a term that lists entities")
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        (!self.0.contains(entity)).then_some(())
+    }
+}
+
+/// [`Replica`] as a join term.
+pub struct ReplicaJoin<'q>(&'q Replicas);
+
+// SAFETY: `entities` is unreachable (`len` keeps this term from ever being
+// the shortest); `get` hands out no references.
+unsafe impl<'q> Joinable<'q> for ReplicaJoin<'q> {
+    type Item = ();
+
+    #[inline]
+    fn len(&self) -> usize {
+        usize::MAX
+    }
+
+    fn entities(&self) -> Entities<'q> {
+        panic!("`Replica` cannot drive iteration - a query needs a term that lists entities")
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        self.0.contains(entity).then_some(())
+    }
+}
+
 /// One collected query item prepended onto the rest, built by
 /// [`Term::item`] and turned back into a flat tuple by [`Flatten`].
 pub struct Cons<Head, Rest>(Head, Rest);
@@ -317,15 +415,20 @@ impl_term!(
 ///
 /// Borrows are dynamic (`RefCell`); a term conflicting with any live borrow
 /// of the same component (another query, a view) panics at
-/// [`Query::new`].
+/// [`Query::new`]. [`iter_in`](Self::iter_in) also borrows the cell index,
+/// from its first call until the query is dropped.
 pub struct Query<'w, Q: Term> {
+    world: &'w World,
     views: Q::View<'w>,
+    cells: Option<Ref<'w, CellIndex>>,
 }
 
 impl<'w, Q: Term> Query<'w, Q> {
     pub fn new(world: &'w World) -> Self {
         Self {
+            world,
             views: Q::fetch(world),
+            cells: None,
         }
     }
 
@@ -340,6 +443,27 @@ impl<'w, Q: Term> Query<'w, Q> {
     {
         Join::new(Q::join(&mut self.views))
             .map(|(entity, item)| (entity, Q::item(item, Nil).flatten()))
+    }
+
+    /// Like [`iter`](Self::iter), over the entities in `cell` only. The
+    /// cell's list joins as one more term, so it drives iteration when it is
+    /// the shortest.
+    ///
+    /// Panics if the cell index is borrowed mutably, which only uju does,
+    /// between systems.
+    pub fn iter_in<'q>(
+        &'q mut self,
+        cell: Cell,
+    ) -> impl Iterator<Item = (Entity, <Q::Item<'q, 'w, Nil> as Flatten>::Flat)>
+    where
+        Q::Item<'q, 'w, Nil>: Flatten,
+    {
+        let world = self.world;
+        let cells = self
+            .cells
+            .get_or_insert_with(|| world.entities().cell_index());
+        Join::new((Q::join(&mut self.views), cells.join(cell)))
+            .map(|(entity, (item, ()))| (entity, Q::item(item, Nil).flatten()))
     }
 }
 
@@ -419,6 +543,14 @@ mod tests {
             assert_eq!(e, entity(1));
             position.0 = 10;
         }
+        drop(query);
+
+        // a filter first does not drive
+        let mut query = Query::<(Without<Frozen>, Position, With<Velocity>)>::new(&world);
+        assert_eq!(
+            query.iter().map(|(e, _)| e).collect::<Vec<_>>(),
+            [entity(1)]
+        );
         drop(query);
 
         // flat filters strip the same way, leaving the data tuple
@@ -524,6 +656,127 @@ mod tests {
         drop(query);
 
         assert_eq!(world.view::<C0>().get(target), Some(&C0(100)));
+    }
+
+    #[test]
+    fn query_owned_replica() {
+        crate::ecs::init();
+        let world = World::new();
+        let entities = (0..4).map(|_| world.spawn()).collect::<Vec<_>>();
+        for &entity in &entities {
+            world.view_mut::<Position>().insert(entity, Position(0));
+        }
+        world.entities().set_replica(entities[1], true);
+        world.entities().set_replica(entities[2], true);
+
+        // non-schema components stay writable on replicas
+        let mut query = Query::<(Mut<Position>, Replica)>::new(&world);
+        for (_, position) in query.iter() {
+            position.0 = 1;
+        }
+        drop(query);
+
+        let mut query = Query::<(Position, Owned)>::new(&world);
+        let owned = query.iter().map(|(e, p)| (e, p.0)).collect::<Vec<_>>();
+        assert_eq!(owned, [(entities[0], 0), (entities[3], 0)]);
+
+        // spawning inside the loop does not conflict with the flags
+        let mut query = Query::<(Position, Replica)>::new(&world);
+        for (e, position) in query.iter() {
+            assert_eq!(position.0, 1);
+            assert!(world.is_replica(e));
+            world.spawn();
+        }
+    }
+
+    #[test]
+    fn query_iter_in() {
+        crate::ecs::init();
+        let world = World::new();
+        let (a, b) = (Cell::new(1), Cell::new(2));
+        let entities = (0..6).map(|_| world.spawn()).collect::<Vec<_>>();
+        for (index, &entity) in entities.iter().enumerate() {
+            world
+                .view_mut::<Position>()
+                .insert(entity, Position(index as i32));
+            world
+                .entities()
+                .set_cell(entity, if index < 4 { a } else { b });
+        }
+        world.view_mut::<Frozen>().insert(entities[2], Frozen);
+        world.view_mut::<Frozen>().insert(entities[5], Frozen);
+        world.entities().set_replica(entities[1], true);
+
+        let mut query = Query::<Mut<Position>>::new(&world);
+        let in_a = query.iter_in(a).map(|(e, _)| e).collect::<Vec<_>>();
+        assert_eq!(in_a, entities[..4]);
+        for (_, position) in query.iter_in(b) {
+            position.0 += 10;
+        }
+        assert_eq!(query.iter_in(Cell::new(3)).count(), 0);
+        drop(query);
+        assert_eq!(
+            world.view::<Position>().get(entities[5]),
+            Some(&Position(15))
+        );
+
+        // a smaller table drives, and the cell is a probe
+        let mut query = Query::<(Position, With<Frozen>)>::new(&world);
+        let frozen = query.iter_in(b).map(|(e, p)| (e, p.0)).collect::<Vec<_>>();
+        assert_eq!(frozen, [(entities[5], 15)]);
+        drop(query);
+
+        let mut query = Query::<Owned>::new(&world);
+        let owned = query.iter_in(a).map(|(e, ())| e).collect::<Vec<_>>();
+        assert_eq!(owned, [entities[0], entities[2], entities[3]]);
+        let mut query = Query::<(Position, Replica)>::new(&world);
+        let replicas = query.iter_in(a).map(|(e, _)| e).collect::<Vec<_>>();
+        assert_eq!(replicas, [entities[1]]);
+    }
+
+    #[test]
+    fn query_iter_in_spawns() {
+        crate::ecs::init();
+        let world = World::new();
+        let cell = Cell::new(0);
+        let e = world.spawn();
+        world.view_mut::<Position>().insert(e, Position(0));
+        world.entities().set_cell(e, cell);
+
+        let mut query = Query::<Position>::new(&world);
+        for (e, _) in query.iter_in(cell) {
+            let spawned = world.spawn();
+            world.commands().insert(spawned, Position(1));
+            assert_eq!(world.cell(e), Some(cell));
+        }
+        drop(query);
+        world.flush();
+        assert_eq!(world.view::<Position>().len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "already borrowed")]
+    fn set_cell_inside_iter_in_panics() {
+        crate::ecs::init();
+        let world = World::new();
+        let cell = Cell::new(0);
+        let e = world.spawn();
+        world.view_mut::<Position>().insert(e, Position(0));
+        world.entities().set_cell(e, cell);
+
+        let mut query = Query::<Position>::new(&world);
+        for (e, _) in query.iter_in(cell) {
+            world.entities().set_cell(e, Cell::new(1));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot drive iteration")]
+    fn query_owned_alone_panics() {
+        crate::ecs::init();
+        let world = World::new();
+
+        let _ = Query::<Owned>::new(&world).iter();
     }
 
     #[test]

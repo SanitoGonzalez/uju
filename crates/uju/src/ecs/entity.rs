@@ -1,7 +1,9 @@
+use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 
+use crate::ecs::cell::{Cell, CellIndex};
 use crate::ecs::hash::FoldBuildHasher;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -348,84 +350,204 @@ impl UidAllocator {
     }
 }
 
-/// Owns a world's local entities and their mapping to [`Uid`]s.
+/// Which entities are replicas: a bit per entity index, set by the runtime for
+/// the entities another shard owns.
+///
+/// [`Owned`](crate::ecs::query::Owned) and [`Replica`](crate::ecs::query::Replica)
+/// filter queries by it.
+#[derive(Default)]
+pub struct Replicas {
+    words: Vec<u64>,
+}
+
+impl Replicas {
+    /// Whether `entity`, which must be alive, is a replica.
+    #[inline]
+    pub fn contains(&self, entity: Entity) -> bool {
+        let index = entity.index_sparse();
+        self.words
+            .get(index / 64)
+            .is_some_and(|word| word & (1 << (index % 64)) != 0)
+    }
+
+    fn set(&mut self, index: usize, replica: bool) {
+        let word = index / 64;
+        if word >= self.words.len() {
+            if !replica {
+                return;
+            }
+            self.words.resize(word + 1, 0);
+        }
+        let mask = 1 << (index % 64);
+        if replica {
+            self.words[word] |= mask;
+        } else {
+            self.words[word] &= !mask;
+        }
+    }
+}
+
+/// An owned entity despawned this tick, with its uid and the cell it had at
+/// the start of the tick.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Despawned {
+    pub uid: Uid,
+    pub cell: Cell,
+}
+
+/// What the [`Registry`] keeps per entity index.
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    uid: Option<Uid>,
+    cell: Option<Cell>,
+    /// The cell at the start of the tick.
+    start: Option<Cell>,
+}
+
+/// The [`Registry`]'s entity allocator, with each entity's uid and cell.
+pub(crate) struct Entries {
+    local: Allocator,
+    allocator: Option<UidAllocator>,
+    slots: Vec<Slot>,
+    entities: HashMap<Uid, Entity, FoldBuildHasher>,
+    /// The indices whose cell changed this tick, possibly repeated.
+    moved: Vec<usize>,
+}
+
+impl Entries {
+    #[inline]
+    pub(crate) fn is_alive(&self, entity: Entity) -> bool {
+        self.local.is_alive(entity)
+    }
+
+    fn slot(&self, entity: Entity) -> Option<&Slot> {
+        if !self.is_alive(entity) {
+            return None;
+        }
+        self.slots.get(entity.index_sparse())
+    }
+
+    fn slot_mut(&mut self, index: usize) -> &mut Slot {
+        if index >= self.slots.len() {
+            self.slots.resize(index + 1, Slot::default());
+        }
+        &mut self.slots[index]
+    }
+
+    fn bind(&mut self, entity: Entity, uid: Uid) {
+        self.slot_mut(entity.index_sparse()).uid = Some(uid);
+        self.entities.insert(uid, entity);
+    }
+}
+
+/// Owns a world's local entities, their [`Uid`]s and [`Cell`]s, which of them
+/// are replicas, and the cell index.
 ///
 /// A local [`Entity`] never leaves its world. A [`Uid`] is minted lazily, only once the
 /// entity has to be named from outside (see [`promote`](Self::promote)), or adopted
 /// from another world (see [`adopt`](Self::adopt)).
+///
+/// The entity allocator, the replica flags and the cell index are each a borrow of
+/// their own, so a query holding the flags or the index can still spawn.
 pub struct Registry {
-    local: Allocator,
-    allocator: Option<UidAllocator>,
-    uids: Vec<Option<Uid>>,
-    entities: HashMap<Uid, Entity, FoldBuildHasher>,
+    entries: RefCell<Entries>,
+    replicas: RefCell<Replicas>,
+    cells: RefCell<CellIndex>,
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self {
-            local: Allocator::new(),
-            allocator: None,
-            uids: Vec::new(),
-            entities: HashMap::default(),
+            entries: RefCell::new(Entries {
+                local: Allocator::new(),
+                allocator: None,
+                slots: Vec::new(),
+                entities: HashMap::default(),
+                moved: Vec::new(),
+            }),
+            replicas: RefCell::default(),
+            cells: RefCell::default(),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.local.len()
+        self.entries.borrow().local.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.local.is_empty()
+        self.entries.borrow().local.is_empty()
+    }
+
+    pub(crate) fn entries(&self) -> Ref<'_, Entries> {
+        self.entries.borrow()
     }
 
     /// The allocator [`promote`](Self::promote) mints from, if one is installed.
-    pub fn uid_allocator(&self) -> Option<&UidAllocator> {
-        self.allocator.as_ref()
+    pub fn uid_allocator(&self) -> Option<Ref<'_, UidAllocator>> {
+        Ref::filter_map(self.entries.borrow(), |entries| entries.allocator.as_ref()).ok()
     }
 
     /// The allocator [`promote`](Self::promote) mints from, if one is installed.
-    pub fn uid_allocator_mut(&mut self) -> Option<&mut UidAllocator> {
-        self.allocator.as_mut()
+    pub fn uid_allocator_mut(&self) -> Option<RefMut<'_, UidAllocator>> {
+        RefMut::filter_map(self.entries.borrow_mut(), |entries| {
+            entries.allocator.as_mut()
+        })
+        .ok()
     }
 
     /// Installs the allocator [`promote`](Self::promote) mints from, returning the
     /// previous one.
-    pub fn install_uid_allocator(&mut self, allocator: UidAllocator) -> Option<UidAllocator> {
-        self.allocator.replace(allocator)
+    pub fn install_uid_allocator(&self, allocator: UidAllocator) -> Option<UidAllocator> {
+        self.entries.borrow_mut().allocator.replace(allocator)
     }
 
     pub fn is_alive(&self, entity: Entity) -> bool {
-        self.local.is_alive(entity)
+        self.entries.borrow().is_alive(entity)
     }
 
     /// Allocates a local entity. It has no [`Uid`] until promoted.
-    pub fn spawn(&mut self) -> Entity {
-        self.local.alloc()
+    pub fn spawn(&self) -> Entity {
+        self.entries.borrow_mut().local.alloc()
     }
 
-    /// Frees `entity` and forgets its [`Uid`], if any.
-    pub fn despawn(&mut self, entity: Entity) -> bool {
-        if !self.local.dealloc(entity) {
-            return false;
-        }
+    /// Frees every live entity of `entities`, forgets their uids and cells and
+    /// clears their replica flags. Logs each owned one that had a uid and a cell
+    /// at the start of the tick into `log`. Returns how many it freed.
+    pub(crate) fn despawn_batch(&self, entities: &[Entity], log: &mut Vec<Despawned>) -> usize {
+        let mut entries = self.entries.borrow_mut();
+        let mut replicas = self.replicas.borrow_mut();
+        let mut cells = self.cells.borrow_mut();
 
-        // the slot will be recycled, so its mapping must not outlive the entity
-        if let Some(uid) = self
-            .uids
-            .get_mut(entity.index_sparse())
-            .and_then(Option::take)
-        {
-            self.entities.remove(&uid);
+        let mut despawned = 0;
+        for &entity in entities {
+            if !entries.local.dealloc(entity) {
+                continue;
+            }
+            despawned += 1;
+
+            // the slot will be recycled, so nothing of it may outlive the entity
+            let index = entity.index_sparse();
+            let replica = replicas.contains(entity);
+            replicas.set(index, false);
+            let Some(slot) = entries.slots.get_mut(index).map(std::mem::take) else {
+                continue;
+            };
+            if let Some(uid) = slot.uid {
+                entries.entities.remove(&uid);
+            }
+            if let Some(cell) = slot.cell {
+                cells.remove(cell, entity);
+            }
+            if !replica && let (Some(uid), Some(cell)) = (slot.uid, slot.start) {
+                log.push(Despawned { uid, cell });
+            }
         }
-        true
+        despawned
     }
 
     /// The [`Uid`] of `entity`, if it is alive and has one.
     pub fn uid(&self, entity: Entity) -> Option<Uid> {
-        if !self.is_alive(entity) {
-            return None;
-        }
-        self.uids.get(entity.index_sparse()).copied().flatten()
+        self.entries.borrow().slot(entity)?.uid
     }
 
     /// The [`Uid`] of `entity`, minting one on first use. `None` if `entity` is dead, or
@@ -433,45 +555,117 @@ impl Registry {
     ///
     /// Panics if the installed allocator's current incarnation has run out and it has no
     /// spare (see [`UidAllocator::alloc`]).
-    pub fn promote(&mut self, entity: Entity) -> Option<Uid> {
-        if !self.is_alive(entity) {
+    pub fn promote(&self, entity: Entity) -> Option<Uid> {
+        let mut entries = self.entries.borrow_mut();
+        if !entries.is_alive(entity) {
             return None;
         }
-
-        let index = entity.index_sparse();
-        if let Some(uid) = self.uids.get(index).copied().flatten() {
+        if let Some(uid) = entries.slot(entity).and_then(|slot| slot.uid) {
             return Some(uid);
         }
 
-        let uid = self.allocator.as_mut()?.alloc();
-        self.bind(entity, uid);
+        let uid = entries.allocator.as_mut()?.alloc();
+        entries.bind(entity, uid);
         Some(uid)
     }
 
     /// The local entity carrying `uid`, if this world holds it.
     pub fn resolve(&self, uid: Uid) -> Option<Entity> {
-        self.entities.get(&uid).copied()
+        self.entries.borrow().entities.get(&uid).copied()
     }
 
     /// Spawns a local entity for an existing `uid`, e.g. one migrating in or replicated
     /// from another world. `None` if `uid` already has a local entity here.
-    pub fn adopt(&mut self, uid: Uid) -> Option<Entity> {
-        if self.entities.contains_key(&uid) {
+    pub fn adopt(&self, uid: Uid) -> Option<Entity> {
+        let mut entries = self.entries.borrow_mut();
+        if entries.entities.contains_key(&uid) {
             return None;
         }
 
-        let entity = self.local.alloc();
-        self.bind(entity, uid);
+        let entity = entries.local.alloc();
+        entries.bind(entity, uid);
         Some(entity)
     }
 
-    fn bind(&mut self, entity: Entity, uid: Uid) {
-        let index = entity.index_sparse();
-        if index >= self.uids.len() {
-            self.uids.resize(index + 1, None);
+    /// The [`Cell`] of `entity`, if it is alive and has one.
+    pub fn cell(&self, entity: Entity) -> Option<Cell> {
+        self.entries.borrow().slot(entity)?.cell
+    }
+
+    /// The [`Cell`] `entity` had at the start of the tick, if it is alive and
+    /// had one.
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the encoder"))]
+    pub(crate) fn tick_start_cell(&self, entity: Entity) -> Option<Cell> {
+        self.entries.borrow().slot(entity)?.start
+    }
+
+    /// Moves `entity` to `cell` and updates the cell index. Does nothing if
+    /// `entity` is dead.
+    ///
+    /// Panics if the cell index is borrowed, such as by a query's `iter_in`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "set by uju's cell system and the runtime")
+    )]
+    pub(crate) fn set_cell(&self, entity: Entity, cell: Cell) {
+        let mut entries = self.entries.borrow_mut();
+        if !entries.is_alive(entity) {
+            return;
         }
-        self.uids[index] = Some(uid);
-        self.entities.insert(uid, entity);
+
+        let index = entity.index_sparse();
+        let slot = entries.slot_mut(index);
+        let previous = slot.cell;
+        if previous == Some(cell) {
+            return;
+        }
+        let first_move = previous == slot.start;
+        slot.cell = Some(cell);
+        if first_move {
+            entries.moved.push(index);
+        }
+
+        let mut cells = self.cells.borrow_mut();
+        if let Some(previous) = previous {
+            cells.remove(previous, entity);
+        }
+        cells.insert(cell, entity);
+    }
+
+    /// The cell index: per [`Cell`], the entities in it.
+    pub fn cell_index(&self) -> Ref<'_, CellIndex> {
+        self.cells.borrow()
+    }
+
+    /// Whether `entity` is alive and a replica of an entity another shard owns.
+    pub fn is_replica(&self, entity: Entity) -> bool {
+        self.is_alive(entity) && self.replicas.borrow().contains(entity)
+    }
+
+    /// The replica flags.
+    pub fn replicas(&self) -> Ref<'_, Replicas> {
+        self.replicas.borrow()
+    }
+
+    /// Marks `entity` as a replica, or as owned. Does nothing if `entity` is
+    /// dead.
+    #[cfg_attr(not(test), expect(dead_code, reason = "set by the runtime"))]
+    pub(crate) fn set_replica(&self, entity: Entity, replica: bool) {
+        if self.is_alive(entity) {
+            self.replicas
+                .borrow_mut()
+                .set(entity.index_sparse(), replica);
+        }
+    }
+
+    /// Rolls each entity's cell into its cell at the start of the tick.
+    pub(crate) fn end_tick(&mut self) {
+        let entries = self.entries.get_mut();
+        for index in entries.moved.drain(..) {
+            if let Some(slot) = entries.slots.get_mut(index) {
+                slot.start = slot.cell;
+            }
+        }
     }
 }
 
@@ -723,14 +917,20 @@ mod tests {
     }
 
     fn registry() -> Registry {
-        let mut registry = Registry::new();
+        let registry = Registry::new();
         registry.install_uid_allocator(allocator());
         registry
     }
 
+    impl Registry {
+        fn despawn(&self, entity: Entity) -> bool {
+            self.despawn_batch(&[entity], &mut Vec::new()) == 1
+        }
+    }
+
     #[test]
     fn registry_spawn_is_local_only() {
-        let mut registry = registry();
+        let registry = registry();
         let e0 = registry.spawn();
 
         assert!(registry.is_alive(e0));
@@ -745,7 +945,7 @@ mod tests {
 
     #[test]
     fn registry_promote() {
-        let mut registry = registry();
+        let registry = registry();
         let e0 = registry.spawn();
         let e1 = registry.spawn();
 
@@ -764,7 +964,7 @@ mod tests {
 
     #[test]
     fn registry_promote_dead() {
-        let mut registry = registry();
+        let registry = registry();
         let e0 = registry.spawn();
         assert!(registry.despawn(e0));
 
@@ -777,7 +977,7 @@ mod tests {
 
     #[test]
     fn registry_promote_without_allocator() {
-        let mut registry = Registry::new();
+        let registry = Registry::new();
         let e0 = registry.spawn();
         assert_eq!(registry.promote(e0), None);
         assert_eq!(registry.uid(e0), None);
@@ -789,7 +989,7 @@ mod tests {
 
     #[test]
     fn registry_promote_switches() {
-        let mut registry = registry();
+        let registry = registry();
         let e0 = registry.spawn();
         let u0 = registry.promote(e0).unwrap();
 
@@ -798,7 +998,7 @@ mod tests {
         assert_eq!(registry.promote(e1), Some(uid(4, 0)));
         assert_eq!(registry.promote(e0), Some(u0)); // minted ids stay
 
-        let allocator = registry.uid_allocator_mut().unwrap();
+        let mut allocator = registry.uid_allocator_mut().unwrap();
         assert_eq!(allocator.take_retired(), [incarnation(3)]);
         assert_eq!(allocator.set_spare(incarnation(5)), None);
     }
@@ -806,11 +1006,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "uid serials exhausted and no spare incarnation")]
     fn registry_promote_exhausted() {
-        let mut registry = registry();
-        let allocator = registry.uid_allocator_mut().unwrap();
-        allocator.next = UidAllocator::SERIALS;
-        allocator.alloc();
-        allocator.next = UidAllocator::SERIALS;
+        let registry = registry();
+        {
+            let mut allocator = registry.uid_allocator_mut().unwrap();
+            allocator.next = UidAllocator::SERIALS;
+            allocator.alloc();
+            allocator.next = UidAllocator::SERIALS;
+        }
 
         let e0 = registry.spawn();
         registry.promote(e0);
@@ -818,7 +1020,7 @@ mod tests {
 
     #[test]
     fn registry_despawn_forgets_mapping() {
-        let mut registry = registry();
+        let registry = registry();
         let e0 = registry.spawn();
         let u0 = registry.promote(e0).unwrap();
 
@@ -839,7 +1041,7 @@ mod tests {
 
     #[test]
     fn registry_stale_handle() {
-        let mut registry = registry();
+        let registry = registry();
         let e0 = registry.spawn();
         registry.despawn(e0);
         let recycled = registry.spawn();
@@ -854,7 +1056,7 @@ mod tests {
 
     #[test]
     fn registry_adopt() {
-        let mut registry = registry();
+        let registry = registry();
         let foreign = uid(9, 42);
 
         let e0 = registry.adopt(foreign).unwrap();
@@ -874,8 +1076,8 @@ mod tests {
 
     #[test]
     fn registry_migrate_round_trip() {
-        let mut source = registry();
-        let mut target = Registry::new();
+        let source = registry();
+        let target = Registry::new();
         target.install_uid_allocator(UidAllocator::new(incarnation(5), incarnation(6)));
 
         let e = source.spawn();
@@ -891,5 +1093,143 @@ mod tests {
         let back = source.adopt(uid).unwrap();
         assert_ne!(back, e);
         assert_eq!(source.uid(back), Some(uid));
+    }
+
+    #[test]
+    fn registry_replica_flags() {
+        let registry = registry();
+        let owned = registry.spawn();
+        let replica = registry.adopt(uid(9, 1)).unwrap();
+        registry.set_replica(replica, true);
+
+        assert!(!registry.is_replica(owned));
+        assert!(registry.is_replica(replica));
+        assert!(registry.replicas().contains(replica));
+
+        // promoted by a migration
+        registry.set_replica(replica, false);
+        assert!(!registry.is_replica(replica));
+
+        // a recycled slot starts owned
+        registry.set_replica(replica, true);
+        assert!(registry.despawn(replica));
+        assert!(!registry.is_replica(replica));
+        let recycled = registry.spawn();
+        assert_eq!(recycled.index(), replica.index());
+        assert!(!registry.is_replica(recycled));
+
+        // a dead entity is never marked
+        registry.set_replica(replica, true);
+        assert!(!registry.is_replica(recycled));
+    }
+
+    #[test]
+    fn registry_borrows_apart() {
+        let registry = registry();
+        let e0 = registry.spawn();
+        registry.set_cell(e0, Cell::new(1));
+
+        // spawning only borrows the allocator
+        let replicas = registry.replicas();
+        let cells = registry.cell_index();
+        let e1 = registry.spawn();
+        assert!(!replicas.contains(e1));
+        assert_eq!(cells.entities(Cell::new(1)), &[e0]);
+    }
+
+    #[test]
+    fn registry_cells() {
+        let registry = registry();
+        let (a, b) = (Cell::new(1), Cell::new(2));
+        let e0 = registry.spawn();
+        let e1 = registry.spawn();
+        assert_eq!(registry.cell(e0), None);
+
+        registry.set_cell(e0, a);
+        registry.set_cell(e1, a);
+        assert_eq!(registry.cell(e0), Some(a));
+        assert_eq!(registry.cell_index().entities(a), &[e0, e1]);
+
+        registry.set_cell(e0, b);
+        assert_eq!(registry.cell(e0), Some(b));
+        assert_eq!(registry.cell_index().entities(a), &[e1]);
+        assert_eq!(registry.cell_index().entities(b), &[e0]);
+
+        // a dead entity gets no cell
+        assert!(registry.despawn(e1));
+        registry.set_cell(e1, b);
+        assert_eq!(registry.cell(e1), None);
+        assert!(registry.cell_index().entities(a).is_empty());
+        assert_eq!(registry.cell_index().entities(b), &[e0]);
+
+        // the recycled slot starts with none
+        let recycled = registry.spawn();
+        assert_eq!(recycled.index(), e1.index());
+        assert_eq!(registry.cell(recycled), None);
+        assert!(!registry.cell_index().contains(b, recycled));
+    }
+
+    #[test]
+    fn registry_tick_start_cell() {
+        let mut registry = registry();
+        let (a, b, c) = (Cell::new(1), Cell::new(2), Cell::new(3));
+        let e0 = registry.spawn();
+        let e1 = registry.spawn();
+
+        registry.set_cell(e0, a);
+        assert_eq!(registry.tick_start_cell(e0), None); // entered
+        registry.end_tick();
+        assert_eq!(registry.tick_start_cell(e0), Some(a));
+
+        // moved and back, then on: the start stays until the tick ends
+        registry.set_cell(e0, b);
+        registry.set_cell(e0, a);
+        registry.set_cell(e0, c);
+        registry.set_cell(e1, b);
+        assert_eq!(registry.tick_start_cell(e0), Some(a));
+        assert_eq!(registry.tick_start_cell(e1), None);
+        registry.end_tick();
+        assert_eq!(registry.tick_start_cell(e0), Some(c));
+        assert_eq!(registry.tick_start_cell(e1), Some(b));
+
+        assert!(registry.despawn(e0));
+        assert_eq!(registry.tick_start_cell(e0), None);
+        let recycled = registry.spawn();
+        assert_eq!(registry.tick_start_cell(recycled), None);
+        registry.end_tick();
+        assert_eq!(registry.tick_start_cell(recycled), None);
+    }
+
+    #[test]
+    fn registry_despawn_log() {
+        let mut registry = registry();
+        let cell = Cell::new(4);
+        let replica = registry.adopt(uid(9, 1)).unwrap();
+        let unnamed = registry.spawn();
+        let entered = registry.spawn();
+        let owned = registry.spawn();
+        let uid_only = registry.spawn();
+        registry.set_replica(replica, true);
+        for entity in [replica, unnamed, owned] {
+            registry.set_cell(entity, cell);
+        }
+        for entity in [entered, owned, uid_only] {
+            registry.promote(entity);
+        }
+        registry.end_tick();
+        registry.set_cell(entered, cell);
+
+        let mut log = Vec::new();
+        let all = [replica, unnamed, entered, owned, uid_only];
+        assert_eq!(registry.despawn_batch(&all, &mut log), 5);
+        // only the owned entity with a uid and a cell before this tick
+        assert_eq!(
+            log,
+            [Despawned {
+                uid: uid(3, 1),
+                cell
+            }]
+        );
+        assert!(registry.cell_index().entities(cell).is_empty());
     }
 }

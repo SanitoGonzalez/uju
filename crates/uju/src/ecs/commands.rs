@@ -89,7 +89,7 @@ impl Commands {
                         .remove_batch(&self.entities[run]);
                 }
                 Command::Insert(id, entity, insert) => {
-                    let registry = world.entities.borrow();
+                    let registry = world.entities.entries();
                     let mut table = world.tables[id as usize].borrow_mut();
                     if registry.is_alive(entity) {
                         insert(&mut **table, entity);

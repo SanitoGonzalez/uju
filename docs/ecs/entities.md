@@ -1,8 +1,10 @@
 # Entities
 
 How a `World` names its entities. An entity has a local handle, its
-[`Entity`](#entity), and may have a cluster-wide name, its [`Uid`](#uid).
-The [`Registry`](#registry) keeps both and the map between them.
+[`Entity`](#entity), and may have a cluster-wide name, its [`Uid`](#uid),
+and a [`Cell`](#cells). It is owned by its `World` or is a
+[replica](#replicas) of one another shard owns. The [`Registry`](#registry)
+keeps all of it.
 
 ## Entity
 
@@ -36,11 +38,16 @@ assert!(!world.is_alive(e));
 | `world.despawn_batch(&entities)` | Despawns every live entity of the slice, and returns how many |
 | `world.commands().despawn(entity)` | Despawns at the next [flush](commands.md) |
 
-- **Spawning is always immediate.** The registry is a borrow of its own, so
-  a query's loop can spawn and hold the new entity at once.
-- **Despawning touches every table.** `despawn` and `despawn_batch` panic
-  when a view or a query holds any table. Inside a query's loop,
+- **Spawning is always immediate.** The entity allocator is a borrow of
+  its own, so a query's loop can spawn and hold the new entity at once.
+- **Despawning touches everything.** `despawn` and `despawn_batch` drop the
+  entity from every table, its cell and the replica flags, so they panic
+  while any view or query is alive. Inside a query's loop,
   [`commands().despawn`](commands.md) defers it.
+- **Despawns are logged.** The `World` notes each despawn of an owned
+  entity that was in a cell at the start of the tick, with its uid and that
+  cell, so replication can tell receivers it is gone. Replicas and entities
+  never in a cell are not noted.
 - **Batches.** `despawn_batch` borrows each table once for the whole
   slice, and skips tables that hold nothing. Dead entities and repeats in
   the slice are skipped.
@@ -148,10 +155,76 @@ let retired = world.uid_allocator_mut().map(|mut uids| uids.take_retired());
 world.uid_allocator_mut().unwrap().set_spare(incarnation(5));
 ```
 
+## Replicas
+
+A sim's `World` holds the entities it owns and, near its borders, replicas
+of entities other shards own. An edge's `World` holds replicas only.
+
+- **A flag, not a component.** The registry keeps a bit per entity index.
+  Only uju's runtime sets or clears it, between systems. A despawn clears
+  it, so a recycled index starts owned.
+- **Reading it.** `world.is_replica(entity)` reads the flag, `false` for a
+  dead entity. The [`Owned` and `Replica`](queries.md#terms) query filters
+  keep or skip replicas.
+- **Reads see both.** Queries without a filter yield owned entities and
+  replicas alike, so gameplay can target and collide across a border.
+
+```rust
+let mut q = Query::<(Mut<Hp>, Owned)>::new(&world);
+for (e, hp) in q.iter() {
+    hp.0 += 1; // never a replica
+}
+```
+
+## Cells
+
+An entity's cell is a `Cell`, a plain type holding a `u32` cell id. It is
+not a component: the registry keeps it beside the entity's uid.
+
+- **uju sets it.** Gameplay reads it with `world.cell(entity)` and never
+  sets it.
+- **None** for a dead entity, and for one uju has not placed in a cell.
+- **Despawn** forgets the cell, so a recycled index starts without one.
+- **Start of tick.** The registry also keeps the cell each entity had when
+  the tick began, so replication can tell an entity that moved from one
+  that entered.
+
+| Method | Gives |
+|---|---|
+| `Cell::new(id)`, `cell.id()` | Converts from and to the `u32` id |
+| `world.cell(entity)` | The entity's cell, or `None` |
+| `world.entities().cell_index()` | The [cell index](#cell-index), borrowed |
+
+### Cell index
+
+The registry keeps, per cell, a dense list of the entities in it, and per
+entity its position in that list. A cell change or a despawn updates it
+with a `swap_remove`, in O(1).
+
+- **Replicas are listed too.**
+- **Queries by cell.** [`query.iter_in(cell)`](queries.md#iter_in) joins a
+  cell's list as one more term.
+- **Reading it.** `cell_index().entities(cell)` is the cell's list, in no
+  promised order, empty for a cell with no entity. `cells()` iterates the
+  cells holding at least one entity, and `contains(cell, entity)` probes.
+- **Stable within a system.** Only uju reorders a cell's list, between
+  systems, so no loop sees it change.
+
 ## Registry
 
-The `Registry` owns a `World`'s entities. `world.entities()` borrows it, and
+The `Registry` owns a `World`'s entities. `world.entities()` returns it, and
 the `World`'s methods above forward to it.
+
+It holds three parts, each a borrow of its own:
+
+| Part | Holds | Borrowed mutably by |
+|---|---|---|
+| Entity allocator | Generations, uids, cells, the uid map | `spawn`, `promote`, `adopt`, `despawn`, and uju when it sets a cell |
+| Replica flags | A bit per entity index | `despawn`, and uju's runtime |
+| Cell index | Per cell, its entities | `despawn`, and uju when it sets a cell |
+
+So a query holding the replica flags or the cell index can still spawn and
+promote inside its loop.
 
 - **Entity to uid** is a slot per entity index, cleared on despawn, so a
   recycled index never inherits a uid.

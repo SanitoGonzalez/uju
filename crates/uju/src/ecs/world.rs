@@ -2,9 +2,10 @@ use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
 
 use crate::ecs::{
+    cell::Cell,
     commands::Commands,
     component::{self, Component},
-    entity::{Entity, Registry, Uid, UidAllocator},
+    entity::{Despawned, Entity, Registry, Uid, UidAllocator},
     storage::{
         table::Table,
         view::{View, ViewMut},
@@ -16,10 +17,11 @@ use crate::ecs::{
 ///
 /// A world is built on its shard's thread and never leaves it.
 pub struct World {
-    pub(crate) entities: RefCell<Registry>,
+    pub(crate) entities: Registry,
     pub(crate) tables: Vec<RefCell<Box<dyn Table>>>,
     pub(crate) uniques: Vec<RefCell<Option<Box<dyn Any>>>>,
     commands: RefCell<Commands>,
+    despawns: RefCell<Vec<Despawned>>,
 }
 
 impl World {
@@ -27,27 +29,28 @@ impl World {
     /// [`promote`](Self::promote) until one is installed.
     pub fn new() -> Self {
         Self {
-            entities: RefCell::new(Registry::new()),
+            entities: Registry::new(),
             tables: component::registrations()
                 .into_iter()
                 .map(|registration| RefCell::new((registration.new_table)()))
                 .collect(),
             uniques: (0..unique::count()).map(|_| RefCell::new(None)).collect(),
             commands: RefCell::new(Commands::default()),
+            despawns: RefCell::default(),
         }
     }
 
-    pub fn entities(&self) -> Ref<'_, Registry> {
-        self.entities.borrow()
+    pub fn entities(&self) -> &Registry {
+        &self.entities
     }
 
     pub fn spawn(&self) -> Entity {
-        self.entities.borrow_mut().spawn()
+        self.entities.spawn()
     }
 
     /// Frees `entity` and drops its components from every table.
     ///
-    /// Panics if any view is borrowed at the time.
+    /// Panics if any view or query is borrowed at the time.
     pub fn despawn(&self, entity: Entity) -> bool {
         self.despawn_batch(std::slice::from_ref(&entity)) == 1
     }
@@ -56,15 +59,11 @@ impl World {
     /// and returns how many it despawned. Dead entities and repeats are
     /// skipped.
     ///
-    /// Panics if any view is borrowed at the time.
+    /// Panics if any view or query is borrowed at the time.
     pub fn despawn_batch(&self, entities: &[Entity]) -> usize {
-        let despawned = {
-            let mut registry = self.entities.borrow_mut();
-            entities
-                .iter()
-                .filter(|&&entity| registry.despawn(entity))
-                .count()
-        };
+        let despawned = self
+            .entities
+            .despawn_batch(entities, &mut self.despawns.borrow_mut());
         if despawned == 0 {
             return 0;
         }
@@ -110,40 +109,65 @@ impl World {
     }
 
     pub fn is_alive(&self, entity: Entity) -> bool {
-        self.entities.borrow().is_alive(entity)
+        self.entities.is_alive(entity)
     }
 
     /// See [`Registry::install_uid_allocator`].
     pub fn install_uid_allocator(&self, allocator: UidAllocator) -> Option<UidAllocator> {
-        self.entities.borrow_mut().install_uid_allocator(allocator)
+        self.entities.install_uid_allocator(allocator)
     }
 
     /// See [`Registry::uid_allocator_mut`]. The runtime sets the next spare and takes the
     /// retired incarnations through it.
     ///
-    /// Panics if the registry is borrowed at the time.
+    /// Panics if the entity allocator is borrowed at the time.
     pub fn uid_allocator_mut(&self) -> Option<RefMut<'_, UidAllocator>> {
-        RefMut::filter_map(self.entities.borrow_mut(), Registry::uid_allocator_mut).ok()
+        self.entities.uid_allocator_mut()
     }
 
     /// See [`Registry::uid`].
     pub fn uid(&self, entity: Entity) -> Option<Uid> {
-        self.entities.borrow().uid(entity)
+        self.entities.uid(entity)
     }
 
     /// See [`Registry::promote`].
     pub fn promote(&self, entity: Entity) -> Option<Uid> {
-        self.entities.borrow_mut().promote(entity)
+        self.entities.promote(entity)
     }
 
     /// See [`Registry::resolve`].
     pub fn resolve(&self, uid: Uid) -> Option<Entity> {
-        self.entities.borrow().resolve(uid)
+        self.entities.resolve(uid)
     }
 
     /// See [`Registry::adopt`].
     pub fn adopt(&self, uid: Uid) -> Option<Entity> {
-        self.entities.borrow_mut().adopt(uid)
+        self.entities.adopt(uid)
+    }
+
+    /// See [`Registry::cell`].
+    pub fn cell(&self, entity: Entity) -> Option<Cell> {
+        self.entities.cell(entity)
+    }
+
+    /// See [`Registry::is_replica`].
+    pub fn is_replica(&self, entity: Entity) -> bool {
+        self.entities.is_replica(entity)
+    }
+
+    /// The owned entities despawned this tick that had a uid and a cell at
+    /// the start of it, in despawn order.
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the encoder"))]
+    pub(crate) fn despawns(&self) -> Ref<'_, [Despawned]> {
+        Ref::map(self.despawns.borrow(), Vec::as_slice)
+    }
+
+    /// Ends the tick: rolls each entity's cell into its cell at the start of
+    /// the tick, and clears the despawn log.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by the runtime's tick"))]
+    pub(crate) fn end_tick(&mut self) {
+        self.entities.end_tick();
+        self.despawns.get_mut().clear();
     }
 
     pub fn insert_unique<U: Unique>(&self, unique: U) -> Option<U> {
@@ -340,6 +364,51 @@ mod tests {
         let mut allocator = world.uid_allocator_mut().unwrap();
         assert_eq!(allocator.spare(), Some(spare));
         assert!(allocator.take_retired().is_empty());
+    }
+
+    #[test]
+    fn world_despawn_log() {
+        crate::ecs::init();
+        let mut world = World::new();
+        world.install_uid_allocator(UidAllocator::new(NonZeroU32::MIN, NonZeroU32::MAX));
+        let (a, b) = (Cell::new(1), Cell::new(2));
+        let entities = (0..5).map(|_| world.spawn()).collect::<Vec<_>>();
+        let replica = world
+            .adopt(Uid::new(NonZeroU32::new(9).unwrap(), 0))
+            .unwrap();
+        world.entities().set_replica(replica, true);
+        world.entities().set_cell(replica, a);
+        let uids = entities
+            .iter()
+            .map(|&entity| {
+                world.entities().set_cell(entity, a);
+                world.promote(entity).unwrap()
+            })
+            .collect::<Vec<_>>();
+        world.end_tick();
+
+        // the cell at the start of the tick, though it moved since
+        world.entities().set_cell(entities[0], b);
+        assert!(world.despawn(entities[0]));
+        world.despawn_batch(&[entities[1], replica, entities[1]]);
+        world.commands().despawn(entities[2]);
+        world.flush();
+
+        let logged = |uid, cell| Despawned { uid, cell };
+        assert_eq!(
+            *world.despawns(),
+            [logged(uids[0], a), logged(uids[1], a), logged(uids[2], a)]
+        );
+        assert_eq!(world.cell(entities[0]), None);
+        assert!(!world.is_replica(replica));
+        let mut listed = world.entities().cell_index().entities(a).to_vec();
+        listed.sort();
+        assert_eq!(listed, [entities[3], entities[4]]);
+
+        world.end_tick();
+        assert!(world.despawns().is_empty());
+        world.despawn(entities[3]);
+        assert_eq!(*world.despawns(), [logged(uids[3], a)]);
     }
 
     #[test]

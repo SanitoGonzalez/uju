@@ -37,8 +37,8 @@ own, so it is available inside any query's loop or while views are held.
   command, or drop the borrow first.
 - **Closures** are `FnOnce(&World) + 'static`, for any change the queue
   does not name, such as a unique or an entity's [uid](entities.md#uid).
-- **Spawning stays immediate.** `world.spawn()` only borrows the registry,
-  so a loop spawns at once, holds the new entity, and queues its
+- **Spawning stays immediate.** `world.spawn()` only borrows the entity
+  allocator, so a loop spawns at once, holds the new entity, and queues its
   components.
 
 ## Flush
@@ -70,7 +70,7 @@ it touches once rather than once per command:
 |---|---|
 | Consecutive despawns | The registry once, then each table once, as one [`despawn_batch`](entities.md#spawning-and-despawning) |
 | Consecutive removes of one component | That component's table once |
-| Consecutive inserts of one component | That component's table and the registry once |
+| Consecutive inserts of one component | That component's table and the entity allocator once |
 
 A despawn of a run costs a probe per table, not a `RefCell` borrow per table
 per entity. A command of another kind ends the run, so batching never
