@@ -471,6 +471,8 @@ Deltas name components by the static ids the protocol compiler assigns
 the ids `uju::ecs` assigns at startup, which differ between binaries that
 link different components, such as a sim and an edge.
 
+[Frames](../protocol/frames.md) lays out the streams, batches and frames.
+
 ### Cell handoff
 
 Director decides that cell `c` moves from shard S to shard S′. Then:

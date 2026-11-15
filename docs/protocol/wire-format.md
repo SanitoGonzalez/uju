@@ -502,6 +502,7 @@ The protocol doesn't frame messages. The application must send enough to
 decode one, typically the message id and the body's byte length, and may
 batch, compress, or fragment as it likes. Fixed-size messages need no length,
 because the id determines it.
+uju's runtime frames them as [Frames](frames.md) describes.
 
 An id means something only within its [space](#message-ids), so an
 envelope must say which space it is in:
