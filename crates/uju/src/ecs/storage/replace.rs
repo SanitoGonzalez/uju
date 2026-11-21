@@ -586,6 +586,13 @@ mod tests {
         drop(query);
         assert_eq!(Query::<Health>::new(&world).iter().count(), 4);
 
+        // an optional write skips replicas as a whole, as `get` does
+        let mut query = Query::<(Body, Option<Mut<Health>>)>::new(&world);
+        let owned = query.iter().map(|(e, _)| e).collect::<Vec<_>>();
+        assert_eq!(owned, [entities[0], entities[3]]);
+        assert!(query.get(entities[1]).is_none());
+        drop(query);
+
         // components outside the schema stay writable on replicas
         let mut query = Query::<(Mut<Body>, Health)>::new(&world);
         assert_eq!(query.iter().count(), 4);

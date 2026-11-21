@@ -32,12 +32,12 @@ pub struct With<C: Component>(PhantomData<C>);
 /// yielded item.
 ///
 /// Holds a shared borrow of `C`'s table. Its entity set is a complement, so
-/// it can never drive iteration - a query needs at least one non-`Without`
-/// term.
+/// it never drives iteration.
 pub struct Without<C: Component>(PhantomData<C>);
 
 /// Filters a query to entities whose `C` was added or marked dirty since the
-/// tick began, contributing nothing to the yielded item.
+/// tick began, contributing nothing to the yielded item. An added value is
+/// marked dirty too, so it matches both `Changed<C>` and [`Added<C>`].
 ///
 /// `C`'s storage must track changes, such as a
 /// [`Tracked`](crate::ecs::storage::tracked::Tracked) one:
@@ -54,6 +54,36 @@ pub struct Without<C: Component>(PhantomData<C>);
 /// Holds a shared borrow of `C`'s table, and drives like [`With<C>`].
 pub struct Changed<C: Component>(PhantomData<C>);
 
+/// Filters a query to entities that gained `C` since the tick began,
+/// contributing nothing to the yielded item.
+///
+/// `C`'s storage must track changes, such as a
+/// [`Tracked`](crate::ecs::storage::tracked::Tracked) one:
+///
+/// ```compile_fail,E0277
+/// # use uju::prelude::*;
+/// #[derive(Component)]
+/// struct Hp(u32);
+///
+/// let world = World::new();
+/// let _ = Query::<(Hp, Added<Hp>)>::new(&world); // a `SparseSet`
+/// ```
+///
+/// Holds a shared borrow of `C`'s table, and drives like [`With<C>`].
+pub struct Added<C: Component>(PhantomData<C>);
+
+/// Yields whether the entity carries `C`, as a `bool`, matching every entity.
+///
+/// Holds a shared borrow of `C`'s table. It never drives iteration.
+pub struct Has<C: Component>(PhantomData<C>);
+
+/// Filters a query to entities matching any of the [`Filter`]s in the tuple
+/// `T`, such as `Or<(With<A>, Changed<B>)>`, contributing nothing to the
+/// yielded item. A nested tuple matches when all of its filters do.
+///
+/// Holds its filters' borrows. It never drives iteration.
+pub struct Or<T>(PhantomData<T>);
+
 /// Filters a query to the entities this world owns, skipping replicas.
 ///
 /// Holds a shared borrow of the [`Replicas`] flags. It never drives
@@ -67,9 +97,10 @@ pub struct Owned;
 pub struct Replica;
 
 /// A term of a [`Query`]: a bare component type reads (`&C`), [`Mut<C>`]
-/// writes (the storage's [`Storage::Mut`]), [`With<C>`]/[`Without<C>`],
-/// [`Changed<C>`] and [`Owned`]/[`Replica`] filter, and a tuple of terms
-/// composes. Filters are stripped from the yielded item, and tuples flatten:
+/// writes (the storage's [`Storage::Mut`]), `Option<C>` and
+/// `Option<Mut<C>>` read or write when present, [`Has<C>`] yields a `bool`,
+/// the [`Filter`]s filter, and a tuple of terms composes. Filters are
+/// stripped from the yielded item, and tuples flatten:
 /// `(A, B, (With<Foo>, Without<Bar>))` yields `(&A, &B)`, and a lone data
 /// term yields its item bare - `(Mut<A>, With<Foo>)` yields `&mut A`.
 pub trait Term {
@@ -93,6 +124,18 @@ pub trait Term {
         rest: Rest,
     ) -> Self::Item<'q, 'w, Rest>;
 }
+
+/// A [`Term`] that only filters, contributing nothing to the yielded item:
+/// [`With`], [`Without`], [`Changed`], [`Added`], [`Owned`], [`Replica`],
+/// [`Or`], and tuples of filters. [`Or`] takes filters.
+pub trait Filter: Term {}
+
+impl<C: Component> Filter for With<C> {}
+impl<C: Component> Filter for Without<C> {}
+impl<C: Component<Storage: Tracking>> Filter for Changed<C> {}
+impl<C: Component<Storage: Tracking>> Filter for Added<C> {}
+impl Filter for Owned {}
+impl Filter for Replica {}
 
 impl<C: Component> Term for C {
     type View<'w> = View<'w, C>;
@@ -220,6 +263,162 @@ unsafe impl<'q, S: Tracking> Joinable<'q> for ChangedJoin<'q, S> {
     }
 }
 
+impl<C: Component<Storage: Tracking>> Term for Added<C> {
+    type View<'w> = View<'w, C>;
+    type Join<'q, 'w: 'q> = AddedJoin<'q, C::Storage>;
+    type Item<'q, 'w: 'q, Rest> = Rest;
+
+    fn fetch(world: &World) -> Self::View<'_> {
+        world.view()
+    }
+
+    fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w> {
+        AddedJoin(view)
+    }
+
+    #[inline]
+    fn item<'q, 'w: 'q, Rest>((): (), rest: Rest) -> Self::Item<'q, 'w, Rest> {
+        rest
+    }
+}
+
+/// [`Added`] as a join term.
+pub struct AddedJoin<'q, S: Tracking>(&'q S);
+
+// SAFETY: `entities` delegates to the shared storage term's guarantees;
+// `get` hands out no references.
+unsafe impl<'q, S: Tracking> Joinable<'q> for AddedJoin<'q, S> {
+    type Item = ();
+
+    #[inline]
+    fn len(&self) -> usize {
+        Table::len(self.0)
+    }
+
+    #[inline]
+    fn entities(&self) -> Entities<'q> {
+        Joinable::entities(&self.0)
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        self.0.is_added(entity).then_some(())
+    }
+}
+
+impl<C: Component> Term for Has<C> {
+    type View<'w> = View<'w, C>;
+    type Join<'q, 'w: 'q> = HasJoin<'q, C::Storage>;
+    type Item<'q, 'w: 'q, Rest> = Cons<bool, Rest>;
+
+    fn fetch(world: &World) -> Self::View<'_> {
+        world.view()
+    }
+
+    fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w> {
+        HasJoin(view)
+    }
+
+    #[inline]
+    fn item<'q, 'w: 'q, Rest>(item: bool, rest: Rest) -> Self::Item<'q, 'w, Rest> {
+        Cons(item, rest)
+    }
+}
+
+/// [`Has`] as a join term.
+pub struct HasJoin<'q, S: Storage>(&'q S);
+
+// SAFETY: `entities` is unreachable (`len` keeps this term from ever being
+// the shortest); `get` hands out no references.
+unsafe impl<'q, S: Storage> Joinable<'q> for HasJoin<'q, S> {
+    type Item = bool;
+
+    #[inline]
+    fn len(&self) -> usize {
+        usize::MAX
+    }
+
+    fn entities(&self) -> Entities<'q> {
+        unreachable!("`Has` never drives")
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        Some(Table::contains(self.0, entity))
+    }
+}
+
+impl<C: Component> Term for Option<C> {
+    type View<'w> = View<'w, C>;
+    type Join<'q, 'w: 'q> = OptionJoin<&'q C::Storage>;
+    type Item<'q, 'w: 'q, Rest> = Cons<Option<&'q C>, Rest>;
+
+    fn fetch(world: &World) -> Self::View<'_> {
+        world.view()
+    }
+
+    #[inline]
+    fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w> {
+        OptionJoin(view)
+    }
+
+    #[inline]
+    fn item<'q, 'w: 'q, Rest>(item: Option<&'q C>, rest: Rest) -> Self::Item<'q, 'w, Rest> {
+        Cons(item, rest)
+    }
+}
+
+impl<C: Component> Term for Option<Mut<C>> {
+    type View<'w> = ViewMut<'w, C>;
+    type Join<'q, 'w: 'q> = OptionJoin<<C::Storage as Storage>::JoinMut<'q>>;
+    type Item<'q, 'w: 'q, Rest> = Cons<Option<<C::Storage as Storage>::Mut<'q>>, Rest>;
+
+    // the whole query skips replicas, as for `Mut<C>`, rather than yielding
+    // `None` for a replica that holds `C`
+    const SKIPS_REPLICAS: bool = <C::Storage as Storage>::REPLICATED;
+
+    fn fetch(world: &World) -> Self::View<'_> {
+        world.view_mut()
+    }
+
+    #[inline]
+    fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w> {
+        OptionJoin(view.join_mut())
+    }
+
+    #[inline]
+    fn item<'q, 'w: 'q, Rest>(
+        item: Option<<C::Storage as Storage>::Mut<'q>>,
+        rest: Rest,
+    ) -> Self::Item<'q, 'w, Rest> {
+        Cons(item, rest)
+    }
+}
+
+/// An `Option` term as a join term: matches every entity, and yields the
+/// inner term's item when it matches.
+pub struct OptionJoin<J>(J);
+
+// SAFETY: `entities` is unreachable (`len` keeps this term from ever being
+// the shortest); `get` probes the inner term once per probe of its own.
+unsafe impl<'q, J: Joinable<'q>> Joinable<'q> for OptionJoin<J> {
+    type Item = Option<J::Item>;
+
+    #[inline]
+    fn len(&self) -> usize {
+        usize::MAX
+    }
+
+    fn entities(&self) -> Entities<'q> {
+        unreachable!("`Option` never drives")
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+        Some(unsafe { self.0.get(entity) })
+    }
+}
+
 /// [`With`] as a join term.
 pub struct WithJoin<'q, S: Storage>(&'q S);
 
@@ -260,7 +459,7 @@ unsafe impl<'q, S: Storage> Joinable<'q> for WithoutJoin<'q, S> {
     }
 
     fn entities(&self) -> Entities<'q> {
-        panic!("`Without` cannot drive iteration - a query needs at least one non-`Without` term")
+        unreachable!("`Without` never drives")
     }
 
     #[inline]
@@ -321,7 +520,7 @@ unsafe impl<'q> Joinable<'q> for OwnedJoin<'q> {
     }
 
     fn entities(&self) -> Entities<'q> {
-        panic!("`Owned` cannot drive iteration - a query needs a term that lists entities")
+        unreachable!("`Owned` never drives")
     }
 
     #[inline]
@@ -372,12 +571,43 @@ unsafe impl<'q> Joinable<'q> for ReplicaJoin<'q> {
     }
 
     fn entities(&self) -> Entities<'q> {
-        panic!("`Replica` cannot drive iteration - a query needs a term that lists entities")
+        unreachable!("`Replica` never drives")
     }
 
     #[inline]
     unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
         self.0.contains(entity).then_some(())
+    }
+}
+
+/// The live entities a query walks when none of its terms drives: `None`
+/// when one does.
+struct Alive<'q>(Option<&'q [Entity]>);
+
+// SAFETY: `entities` yields the allocator's live entities, each once;
+// `get` hands out no references.
+unsafe impl<'q> Joinable<'q> for Alive<'q> {
+    type Item = ();
+
+    #[inline]
+    fn len(&self) -> usize {
+        // below the terms that never drive, above every table
+        match self.0 {
+            Some(_) => usize::MAX - 1,
+            None => usize::MAX,
+        }
+    }
+
+    fn entities(&self) -> Entities<'q> {
+        self.0
+            .expect("a query with a driving term lists no live entities")
+            .iter()
+            .copied()
+    }
+
+    #[inline]
+    unsafe fn get(&mut self, _: Entity) -> Option<Self::Item> {
+        Some(())
     }
 }
 
@@ -491,8 +721,58 @@ macro_rules! impl_term {
                 fold_item_expr!(rest; $($T $t),+)
             }
         }
+
+        impl<$($T: Filter),+> Filter for ($($T,)+) {}
+
+        impl<$($T: Filter),+> Term for Or<($($T,)+)> {
+            type View<'w> = ($($T::View<'w>,)+);
+            type Join<'q, 'w: 'q> = OrJoin<($($T::Join<'q, 'w>,)+)>;
+            type Item<'q, 'w: 'q, Rest> = Rest;
+
+            fn fetch(world: &World) -> Self::View<'_> {
+                ($($T::fetch(world),)+)
+            }
+
+            fn join<'q, 'w>(view: &'q mut Self::View<'w>) -> Self::Join<'q, 'w> {
+                let ($($t,)+) = view;
+                OrJoin(($($T::join($t),)+))
+            }
+
+            #[inline]
+            fn item<'q, 'w: 'q, Rest>((): (), rest: Rest) -> Self::Item<'q, 'w, Rest> {
+                rest
+            }
+        }
+
+        impl<$($T: Filter),+> Filter for Or<($($T,)+)> {}
+
+        // SAFETY: `entities` is unreachable (`len` keeps this term from ever
+        // being the shortest); each filter is probed at most once per probe of
+        // its own, and filters hand out no references.
+        unsafe impl<'q, $($T: Joinable<'q>),+> Joinable<'q> for OrJoin<($($T,)+)> {
+            type Item = ();
+
+            #[inline]
+            fn len(&self) -> usize {
+                usize::MAX
+            }
+
+            fn entities(&self) -> Entities<'q> {
+                unreachable!("`Or` never drives")
+            }
+
+            #[inline]
+            unsafe fn get(&mut self, entity: Entity) -> Option<Self::Item> {
+                let ($($t,)+) = &mut self.0;
+                unsafe { ($($t.get(entity).is_some())||+).then_some(()) }
+            }
+        }
     };
 }
+
+/// [`Or`] as a join term: a tuple of filters' join terms, any of which
+/// matches.
+pub struct OrJoin<J>(J);
 
 impl_term!(T0 t0, T1 t1);
 impl_term!(T0 t0, T1 t1, T2 t2);
@@ -523,6 +803,8 @@ pub struct Query<'w, Q: Term> {
     views: Q::View<'w>,
     replicas: Option<Ref<'w, Replicas>>,
     cells: Option<Ref<'w, CellIndex>>,
+    /// The live entities, listed by `iter` when no term drives.
+    alive: Vec<Entity>,
 }
 
 impl<'w, Q: Term> Query<'w, Q> {
@@ -532,21 +814,52 @@ impl<'w, Q: Term> Query<'w, Q> {
             views: Q::fetch(world),
             replicas: Q::SKIPS_REPLICAS.then(|| world.entities().replicas()),
             cells: None,
+            alive: Vec::new(),
         }
     }
 
     /// Iterates the entities matching every term, yielding the data terms'
     /// components as a flat tuple - filters are stripped, and a lone data
     /// term yields its component bare.
+    ///
+    /// A query whose terms all never drive, such as `Option<C>`, `Has<C>`,
+    /// `Without<C>` or `Owned`, walks every entity alive when `iter` is
+    /// called. The entity allocator is not held, so the loop can spawn, and
+    /// the entities it spawns are not visited.
     pub fn iter<'q>(
         &'q mut self,
     ) -> impl Iterator<Item = (Entity, <Q::Item<'q, 'w, Nil> as Flatten>::Flat)>
     where
         Q::Item<'q, 'w, Nil>: Flatten,
     {
+        let terms = Q::join(&mut self.views);
+        let alive = (terms.len() == usize::MAX).then(|| {
+            self.world.entities().alive_into(&mut self.alive);
+            self.alive.as_slice()
+        });
         let replicas = OwnedIf(self.replicas.as_deref());
-        Join::new((Q::join(&mut self.views), replicas))
-            .map(|(entity, (item, ()))| (entity, Q::item(item, Nil).flatten()))
+        Join::new((terms, Alive(alive), replicas))
+            .map(|(entity, (item, (), ()))| (entity, Q::item(item, Nil).flatten()))
+    }
+
+    /// `entity`'s item, as [`iter`](Self::iter) would yield it, or `None`
+    /// when a term rejects it. When no term drives, a dead entity is
+    /// rejected.
+    ///
+    /// The item borrows the query, so it must be dropped before the next
+    /// call.
+    pub fn get<'q>(&'q mut self, entity: Entity) -> Option<<Q::Item<'q, 'w, Nil> as Flatten>::Flat>
+    where
+        Q::Item<'q, 'w, Nil>: Flatten,
+    {
+        let mut terms = (Q::join(&mut self.views), OwnedIf(self.replicas.as_deref()));
+        if terms.0.len() == usize::MAX && !self.world.is_alive(entity) {
+            return None;
+        }
+        // SAFETY: `terms` is built for this call and probed once; the item
+        // holds `self` borrowed mutably, so no other probe overlaps it.
+        let (item, ()) = unsafe { terms.get(entity) }?;
+        Some(Q::item(item, Nil).flatten())
     }
 
     /// Like [`iter`](Self::iter), over the entities in `cell` only. The
@@ -577,6 +890,7 @@ mod tests {
     use super::*;
     use crate::ecs::Component;
     use crate::ecs::entity::{EntityGeneration, EntityIndex};
+    use crate::ecs::storage::tracked::Tracked;
 
     #[derive(Component, Debug, PartialEq)]
     struct Position(i32);
@@ -876,20 +1190,212 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cannot drive iteration")]
-    fn query_owned_alone_panics() {
+    fn query_without_driver_walks_alive() {
         crate::ecs::init();
         let world = World::new();
+        let entities = (0..4).map(|_| world.spawn()).collect::<Vec<_>>();
+        world.despawn(entities[0]);
+        world.view_mut::<Frozen>().insert(entities[2], Frozen);
+        world.entities().set_replica(entities[3], true);
 
-        let _ = Query::<Owned>::new(&world).iter();
+        let mut query = Query::<Without<Frozen>>::new(&world);
+        let thawed = query.iter().map(|(e, ())| e).collect::<Vec<_>>();
+        assert_eq!(thawed, [entities[1], entities[3]]);
+        drop(query);
+
+        // spawning inside the loop is free, and the spawned are not visited
+        let mut query = Query::<Owned>::new(&world);
+        let mut owned = Vec::new();
+        for (e, ()) in query.iter() {
+            owned.push(e);
+            world.spawn();
+        }
+        assert_eq!(owned, [entities[1], entities[2]]);
+        assert_eq!(query.iter().count(), 4);
     }
 
     #[test]
-    #[should_panic(expected = "cannot drive iteration")]
-    fn query_without_alone_panics() {
+    fn query_option_has() {
         crate::ecs::init();
         let world = World::new();
+        let entities = (0..4).map(|_| world.spawn()).collect::<Vec<_>>();
+        for &entity in &entities[..3] {
+            world.view_mut::<Position>().insert(entity, Position(1));
+        }
+        world
+            .view_mut::<Velocity>()
+            .insert(entities[1], Velocity(5));
+        world
+            .view_mut::<Velocity>()
+            .insert(entities[3], Velocity(6));
+        world.view_mut::<Frozen>().insert(entities[2], Frozen);
 
-        let _ = Query::<Without<Frozen>>::new(&world).iter();
+        // `Position` drives; the optional terms never filter
+        let mut query = Query::<(Mut<Position>, Option<Velocity>, Has<Frozen>)>::new(&world);
+        for (_, (position, velocity, frozen)) in query.iter() {
+            if !frozen {
+                position.0 += velocity.map_or(0, |v| v.0);
+            }
+        }
+        drop(query);
+        let positions = world.view::<Position>();
+        let positions = entities[..3]
+            .iter()
+            .map(|&e| positions.get(e).unwrap().0)
+            .collect::<Vec<_>>();
+        assert_eq!(positions, [1, 6, 1]);
+
+        // optional terms alone walk every live entity
+        let mut query = Query::<(Option<Mut<Velocity>>, Has<Position>)>::new(&world);
+        for (_, (velocity, has_position)) in query.iter() {
+            if let Some(velocity) = velocity
+                && !has_position
+            {
+                velocity.0 = 0;
+            }
+        }
+        let matched = query
+            .iter()
+            .map(|(e, (velocity, has))| (e, velocity.map(|v| v.0), has))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matched,
+            [
+                (entities[0], None, true),
+                (entities[1], Some(5), true),
+                (entities[2], None, true),
+                (entities[3], Some(0), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn query_or() {
+        crate::ecs::init();
+        let world = World::new();
+        let entities = (0..5).map(|_| world.spawn()).collect::<Vec<_>>();
+        for &entity in &entities {
+            world.view_mut::<Position>().insert(entity, Position(0));
+        }
+        world
+            .view_mut::<Velocity>()
+            .insert(entities[1], Velocity(0));
+        world.view_mut::<Frozen>().insert(entities[2], Frozen);
+        world
+            .view_mut::<Velocity>()
+            .insert(entities[3], Velocity(0));
+        world.view_mut::<Frozen>().insert(entities[3], Frozen);
+        world.entities().set_replica(entities[4], true);
+
+        let mut query = Query::<(Position, Or<(With<Velocity>, With<Frozen>)>)>::new(&world);
+        let matched = query.iter().map(|(e, _)| e).collect::<Vec<_>>();
+        assert_eq!(matched, entities[1..4]);
+        drop(query);
+
+        // a nested tuple matches when all of its filters do
+        let mut query = Query::<Or<((With<Velocity>, With<Frozen>), Replica)>>::new(&world);
+        let matched = query.iter().map(|(e, ())| e).collect::<Vec<_>>();
+        assert_eq!(matched, [entities[3], entities[4]]);
+    }
+
+    #[test]
+    fn query_get() {
+        crate::ecs::init();
+        let world = World::new();
+        let entities = (0..3).map(|_| world.spawn()).collect::<Vec<_>>();
+        world
+            .view_mut::<Position>()
+            .insert(entities[0], Position(1));
+        world
+            .view_mut::<Position>()
+            .insert(entities[1], Position(2));
+        world.view_mut::<Frozen>().insert(entities[1], Frozen);
+
+        let mut query = Query::<(Mut<Position>, Without<Frozen>)>::new(&world);
+        query.get(entities[0]).unwrap().0 += 10;
+        query.get(entities[0]).unwrap().0 += 10;
+        assert!(query.get(entities[1]).is_none());
+        assert!(query.get(entities[2]).is_none());
+        drop(query);
+        assert_eq!(
+            world.view::<Position>().get(entities[0]),
+            Some(&Position(21))
+        );
+
+        // with no driving term, a dead entity is rejected
+        let mut query = Query::<Has<Position>>::new(&world);
+        assert_eq!(query.get(entities[2]), Some(false));
+        drop(query);
+        world.despawn(entities[2]);
+        assert_eq!(Query::<Has<Position>>::new(&world).get(entities[2]), None);
+    }
+
+    #[derive(Component, Debug, PartialEq)]
+    #[component(storage = Tracked<Self>)]
+    struct Hp(u32);
+
+    #[test]
+    fn query_added() {
+        crate::ecs::init();
+        let mut world = World::new();
+        let entities = (0..4).map(|_| world.spawn()).collect::<Vec<_>>();
+        for &entity in &entities[..2] {
+            world.view_mut::<Hp>().insert(entity, Hp(0));
+        }
+        world.end_tick();
+
+        world.view_mut::<Hp>().get_mut(entities[0]).unwrap().0 = 1;
+        world.view_mut::<Hp>().insert(entities[2], Hp(2));
+
+        let mut query = Query::<(Hp, Added<Hp>)>::new(&world);
+        let added = query.iter().map(|(e, _)| e).collect::<Vec<_>>();
+        assert_eq!(added, [entities[2]]);
+        drop(query);
+
+        // an added value is changed too
+        let mut query = Query::<(Hp, Changed<Hp>)>::new(&world);
+        let mut changed = query.iter().map(|(e, _)| e).collect::<Vec<_>>();
+        changed.sort();
+        assert_eq!(changed, [entities[0], entities[2]]);
+        drop(query);
+
+        let mut query = Query::<Or<(Added<Hp>, Without<Hp>)>>::new(&world);
+        let matched = query.iter().map(|(e, ())| e).collect::<Vec<_>>();
+        assert_eq!(matched, [entities[2], entities[3]]);
+    }
+
+    #[test]
+    fn world_removed() {
+        crate::ecs::init();
+        let mut world = World::new();
+        let entities = (0..5).map(|_| world.spawn()).collect::<Vec<_>>();
+        for &entity in &entities {
+            world.view_mut::<Hp>().insert(entity, Hp(0));
+        }
+        world.end_tick();
+
+        world.view_mut::<Hp>().remove(entities[3]);
+        world.view_mut::<Hp>().remove(entities[0]);
+        // removed, then held again
+        world.view_mut::<Hp>().remove(entities[1]);
+        world.view_mut::<Hp>().insert(entities[1], Hp(1));
+        // removed, then despawned
+        world.view_mut::<Hp>().remove(entities[2]);
+        world.despawn(entities[2]);
+        // a despawn alone is no removal
+        world.despawn(entities[4]);
+
+        let removed = world.removed::<Hp>().collect::<Vec<_>>();
+        assert_eq!(removed, [entities[3], entities[0]]);
+
+        // spawning inside the loop is free
+        for _ in world.removed::<Hp>() {
+            let spawned = world.spawn();
+            world.commands().insert(spawned, Hp(0));
+        }
+        world.flush();
+
+        world.end_tick();
+        assert_eq!(world.removed::<Hp>().count(), 0);
     }
 }

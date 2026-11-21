@@ -140,7 +140,7 @@ macro_rules! impl_joinable {
             #[allow(unused_mut, unused_assignments, unused_variables)]
             fn entities(&self) -> Entities<'a> {
                 let ($head_term, $($tail_term,)*) = self;
-                // a filter that cannot drive panics in `entities`, so only
+                // a term that never drives cannot list entities, so only
                 // the shortest term is asked
                 let mut len = $head_term.len();
                 let mut entities = None;

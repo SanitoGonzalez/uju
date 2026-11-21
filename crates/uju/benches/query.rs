@@ -371,6 +371,23 @@ fn bench(c: &mut Criterion) {
         })
     });
 
+    c.bench_function("query/option", |b| {
+        let mut query = Query::<(Mut<Position>, Option<Velocity>)>::new(&world);
+        b.iter(|| {
+            for (_, (position, velocity)) in query.iter() {
+                if let Some(velocity) = velocity {
+                    add(&mut position.0, &velocity.0);
+                }
+            }
+        })
+    });
+
+    // no term drives, so the query lists every live entity first
+    c.bench_function("query/alive", |b| {
+        let mut query = Query::<Without<Frozen>>::new(&world);
+        b.iter(|| black_box(query.iter().count()))
+    });
+
     c.bench_function("join/views_mut2", |b| {
         let mut positions = world.view_mut::<Position>();
         let velocities = world.view::<Velocity>();

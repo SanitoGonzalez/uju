@@ -3,7 +3,7 @@
 How a table records what changed during a tick, and how a replicated table
 turns that into the sections of a [cell frame](../protocol/frames.md#sections)
 and applies the sections it receives. Storages in general are in
-[Components](components.md#storage), the `Changed` filter in
+[Components](components.md#storage), query terms in
 [Queries](queries.md#terms), and the tracking of audience keys in
 [Audiences](audiences.md#tracking).
 
@@ -13,7 +13,7 @@ Five storages track changes:
 
 | Storage | For | Mutable item | Replicated |
 |---|---|---|---|
-| `Tracked<C>` | Any component, such as a hand-written one that a system wants `Changed<C>` on | `TrackedMut<C>` | No |
+| `Tracked<C>` | Any component, such as a hand-written one that a system wants [`Changed<C>`](#change-filters) on | `TrackedMut<C>` | No |
 | `ReplaceTable<C>` | A schema component sent as its whole value, `C: Replace` | `TrackedMut<C>` | Yes |
 | `PatchTable<C>` | A schema component sent as patches of its fields, `C: Patch` | `C::Mut` | Yes |
 | `TagTable<C>` | A [tag](#tags), `C: Replicated + Default` | `&C` | Yes |
@@ -70,6 +70,47 @@ Mutable iteration goes through a [query](queries.md) or
 A write that leaves the value as it was still marks it, and so does a
 value changed and changed back within the tick. Nothing is compared.
 
+## Change filters
+
+Systems read the tick's changes through two query filters and a `World`
+method:
+
+| Reads | Gives | From |
+|---|---|---|
+| `Changed<C>` | The entities whose `C` was added or marked dirty this tick | The dirty bits |
+| `Added<C>` | The entities that gained `C` this tick | The added bits |
+| `world.removed::<C>()` | The entities that lost `C` this tick and are still alive | The remove log |
+
+```rust
+let mut q = Query::<(Hp, Added<Hp>)>::new(&world);
+for (e, hp) in q.iter() { /* first tick with an Hp */ }
+
+for e in world.removed::<Hp>() {
+    world.commands().insert(e, Downed);
+}
+```
+
+- **Adds are changes.** An added value is marked dirty too, so it matches
+  both `Changed<C>` and `Added<C>`. Both combine with other
+  [filters](queries.md#terms), inside `Or` too, such as
+  `Or<(Added<Hp>, Changed<Armor>)>`.
+- **Tracked tables only.** All three need `C`'s storage to be one of the
+  [tracked tables](#tracked-tables). Over a `SparseSet`, they do not
+  compile. A hand-written component picks `Tracked<Self>` to get them.
+- **`removed` is not a query term**, since its entities no longer hold
+  `C`. It yields them in removal order and skips, from the
+  [remove log](#removals-and-despawns), an entity that is dead or holds `C`
+  again: a remove then an add shows as `Added<C>` only.
+- **Despawns do not show.** A despawn writes nothing to a table's log, so
+  neither `removed` nor any filter sees it.
+- **Borrows.** `removed` holds `C`'s table shared while its iterator
+  lives, and checks liveness per entity, so its loop can spawn and queue
+  [commands](commands.md), but not take `C`'s table mutably.
+- **Received state does not show.** Applying a received section marks
+  and logs nothing, and writes to a replicated table
+  [skip replicas](#replicas), so for such a table the filters and
+  `removed` cover the entities this world owns.
+
 ## Field masks
 
 A `PatchTable` tracks changes per field, so a change sends only the
@@ -111,8 +152,9 @@ holds unit structs, which take no memory, so it stores only membership.
   entities that gained the tag this tick.
 - **No writes.** The mutable item is `&C`, as there is nothing to write. A
   `Mut<C>` term reads, and skips replicas as for any replicated table.
-- **Queries.** A tag is a component, so `C`, `With<C>`, `Without<C>` and
-  `Changed<C>` terms match it.
+- **Queries.** A tag is a component, so `C`, `With<C>`, `Without<C>`,
+  `Changed<C>` and `Added<C>` terms match it, and `world.removed::<C>()`
+  lists the entities that lost it.
 - **Receiving.** The receiver builds the tag with `Default`.
 
 ## Ops

@@ -10,6 +10,7 @@ use crate::ecs::{
     event::{self, Event, Queue},
     message::{self, EntityMessage, InboxDrain, Mailbox},
     storage::{
+        Tracking,
         audience::{AudienceTable, KeyTable},
         ops::OpsTable,
         table::Table,
@@ -446,6 +447,26 @@ impl World {
             }),
             registry: &self.entities,
         }
+    }
+
+    /// The entities that lost `C` since the tick began, are alive and do not
+    /// hold `C` again, in removal order. A despawn is not a removal, so a
+    /// despawned entity never shows.
+    ///
+    /// Holds `C`'s table borrowed shared, and borrows the entity allocator
+    /// per entity, so the loop can spawn.
+    pub fn removed<C: Component<Storage: Tracking>>(&self) -> impl Iterator<Item = Entity> + '_ {
+        let table = self.view::<C>();
+        let mut at = 0;
+        std::iter::from_fn(move || {
+            loop {
+                let &entity = Tracking::removed(&*table).get(at)?;
+                at += 1;
+                if !Table::contains(&*table, entity) && self.is_alive(entity) {
+                    return Some(entity);
+                }
+            }
+        })
     }
 }
 

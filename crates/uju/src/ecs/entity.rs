@@ -219,6 +219,15 @@ impl Allocator {
             .get(entity.index_sparse())
             .is_some_and(|&g| g == entity.generation() && g.to_bits() & 1 == 1)
     }
+
+    /// The live entities, in index order.
+    pub fn iter(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.generations
+            .iter()
+            .enumerate()
+            .filter(|(_, generation)| generation.to_bits() & 1 == 1)
+            .map(|(index, &generation)| Entity::new(EntityIndex::new(index as u32), generation))
+    }
 }
 
 impl Default for Allocator {
@@ -516,6 +525,14 @@ impl Registry {
 
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.entries.borrow().is_alive(entity)
+    }
+
+    /// Replaces the contents of `out` with the live entities, in index
+    /// order. The allocator is borrowed only during the call, so a loop over
+    /// `out` can spawn.
+    pub(crate) fn alive_into(&self, out: &mut Vec<Entity>) {
+        out.clear();
+        out.extend(self.entries.borrow().local.iter());
     }
 
     /// Allocates a local entity. It has no [`Uid`] until promoted.
