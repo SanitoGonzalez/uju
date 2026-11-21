@@ -3,7 +3,9 @@ pub mod cell;
 pub mod commands;
 pub mod component;
 pub mod entity;
+pub mod event;
 mod hash;
+pub mod message;
 pub mod query;
 pub mod schedule;
 pub mod storage;
@@ -13,7 +15,7 @@ pub mod world;
 pub use uju_macros::*;
 
 pub mod prelude {
-    pub use uju_macros::{Component, Unique};
+    pub use uju_macros::{Component, Event, Unique};
 
     pub use super::cell::Cell;
     pub use super::entity::{Entity, Uid};
@@ -25,5 +27,7 @@ pub mod prelude {
 pub(crate) fn init() {
     audience::init();
     component::init();
+    event::init();
+    message::init();
     unique::init();
 }

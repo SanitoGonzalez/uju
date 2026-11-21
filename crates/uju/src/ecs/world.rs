@@ -6,7 +6,9 @@ use crate::ecs::{
     cell::Cell,
     commands::Commands,
     component::{self, Component, Ops},
-    entity::{Despawned, Entity, Registry, Uid, UidAllocator},
+    entity::{Despawned, Entity, IncarnationSwitched, Registry, Uid, UidAllocator},
+    event::{self, Event, Queue},
+    message::{self, EntityMessage, InboxDrain, Mailbox},
     storage::{
         audience::{AudienceTable, KeyTable},
         ops::OpsTable,
@@ -16,7 +18,8 @@ use crate::ecs::{
     unique::{self, Unique},
 };
 
-/// A shard's entities, component tables, audience tables and uniques.
+/// A shard's entities, component tables, audience tables, uniques, event
+/// queues and inboxes.
 ///
 /// A world is built on its shard's thread and never leaves it.
 pub struct World {
@@ -24,6 +27,8 @@ pub struct World {
     pub(crate) tables: Vec<RefCell<Box<dyn Table>>>,
     pub(crate) audiences: Vec<RefCell<Box<dyn KeyTable>>>,
     pub(crate) uniques: Vec<RefCell<Option<Box<dyn Any>>>>,
+    events: Vec<RefCell<Box<dyn Queue>>>,
+    mailboxes: Vec<RefCell<Box<dyn Any>>>,
     commands: RefCell<Commands>,
     despawns: RefCell<Vec<Despawned>>,
 }
@@ -43,6 +48,14 @@ impl World {
                 .map(|registration| RefCell::new((registration.new_table)()))
                 .collect(),
             uniques: (0..unique::count()).map(|_| RefCell::new(None)).collect(),
+            events: event::registrations()
+                .into_iter()
+                .map(|registration| RefCell::new((registration.new_queue)()))
+                .collect(),
+            mailboxes: message::registrations()
+                .into_iter()
+                .map(|registration| RefCell::new((registration.new_mailbox)()))
+                .collect(),
             commands: RefCell::new(Commands::default()),
             despawns: RefCell::default(),
         }
@@ -129,8 +142,7 @@ impl World {
         self.entities.install_uid_allocator(allocator)
     }
 
-    /// See [`Registry::uid_allocator_mut`]. The runtime sets the next spare and takes the
-    /// retired incarnations through it.
+    /// See [`Registry::uid_allocator_mut`]. The runtime sets the next spare through it.
     ///
     /// Panics if the entity allocator is borrowed at the time.
     pub fn uid_allocator_mut(&self) -> Option<RefMut<'_, UidAllocator>> {
@@ -142,9 +154,28 @@ impl World {
         self.entities.uid(entity)
     }
 
-    /// See [`Registry::promote`].
+    /// The [`Uid`] of `entity`, minting one on first use. `None` if `entity` is dead, or
+    /// if it has no uid and no allocator is installed.
+    ///
+    /// When minting switches the allocator to its spare, emits an
+    /// [`IncarnationSwitched`] naming the incarnation it switched from.
+    ///
+    /// Panics if the installed allocator's current incarnation has run out and it has no
+    /// spare (see [`UidAllocator::alloc`]), or if the entity allocator, or the
+    /// `IncarnationSwitched` queue on a switch, is borrowed at the time.
     pub fn promote(&self, entity: Entity) -> Option<Uid> {
-        self.entities.promote(entity)
+        let uid = self.entities.promote(entity)?;
+        // a switch mints the first serial of the spare
+        if uid.serial() == 0 {
+            let retired = self
+                .uid_allocator_mut()
+                .map(|mut allocator| allocator.take_retired())
+                .unwrap_or_default();
+            for from in retired {
+                self.emit(IncarnationSwitched { from });
+            }
+        }
+        Some(uid)
     }
 
     /// See [`Registry::resolve`].
@@ -175,18 +206,96 @@ impl World {
     }
 
     /// Ends the tick: rolls each entity's cell into its cell at the start of
-    /// the tick, and clears the despawn log and every table's changes,
-    /// audience tables included.
+    /// the tick, and clears the despawn log, every table's changes, audience
+    /// tables included, and every event queue. Inboxes keep what is unread.
     #[cfg_attr(not(test), expect(dead_code, reason = "called by the runtime's tick"))]
     pub(crate) fn end_tick(&mut self) {
         self.entities.end_tick();
         self.despawns.get_mut().clear();
+        for queue in &mut self.events {
+            queue.get_mut().clear();
+        }
         for table in &mut self.tables {
             table.get_mut().end_tick();
         }
         for table in &mut self.audiences {
             table.get_mut().end_tick();
         }
+    }
+
+    /// Pushes `event` onto `E`'s queue, at once.
+    ///
+    /// Panics if `E`'s queue is borrowed at the time, such as by a loop over
+    /// [`events`](Self::events) of `E`.
+    pub fn emit<E: Event>(&self, event: E) {
+        self.event_queue_mut::<E>().push(event);
+    }
+
+    /// The events of `E` emitted this tick, in order. Any number of readers
+    /// can hold the queue at once.
+    ///
+    /// Panics if `E`'s queue is borrowed mutably at the time.
+    pub fn events<E: Event>(&self) -> Ref<'_, [E]> {
+        Ref::map(self.events[E::id() as usize].borrow(), |queue| {
+            let queue: &dyn Any = &**queue;
+            queue.downcast_ref::<Vec<E>>().unwrap().as_slice()
+        })
+    }
+
+    fn event_queue_mut<E: Event>(&self) -> RefMut<'_, Vec<E>> {
+        RefMut::map(self.events[E::id() as usize].borrow_mut(), |queue| {
+            let queue: &mut dyn Any = &mut **queue;
+            queue.downcast_mut().unwrap()
+        })
+    }
+
+    /// Sends `message` to `target`, which this `World` holds owned or as a
+    /// replica. A message to an owned entity is pushed onto `M`'s inbox at
+    /// once. One to a replica is queued for the runtime, which routes it to
+    /// the shard that owns the entity. A message to a dead entity is
+    /// dropped.
+    ///
+    /// Panics if the entity allocator or the replica flags are borrowed
+    /// mutably at the time.
+    pub fn send<M: EntityMessage + Clone>(&self, target: Entity, message: &M) {
+        if !self.is_alive(target) {
+            return;
+        }
+        if !self.entities.replicas().contains(target) {
+            self.mailbox_mut::<M>()
+                .inbox
+                .push_back((target, message.clone()));
+        } else if let Some(uid) = self.uid(target) {
+            self.mailbox_mut::<M>().outbox.push((uid, message.clone()));
+        }
+    }
+
+    /// Drains `M`'s inbox: yields each message with its entity, oldest
+    /// first, skipping entities that are dead. A message of `M` sent while
+    /// the drain is alive stays queued for the next read, and so do the
+    /// messages left when the drain is dropped early.
+    pub fn inbox<M: EntityMessage>(&self) -> InboxDrain<'_, M> {
+        InboxDrain::new(self)
+    }
+
+    /// Pushes a message another shard sent onto `M`'s inbox, as the runtime
+    /// does when the tick begins.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by the runtime's tick"))]
+    pub(crate) fn deliver<M: EntityMessage>(&self, target: Entity, message: M) {
+        self.mailbox_mut::<M>().inbox.push_back((target, message));
+    }
+
+    /// Takes the messages sent to replicas, with the uid of each target,
+    /// oldest first, for the runtime to route.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by the runtime's tick"))]
+    pub(crate) fn take_outbox<M: EntityMessage>(&self) -> Vec<(Uid, M)> {
+        std::mem::take(&mut self.mailbox_mut::<M>().outbox)
+    }
+
+    pub(crate) fn mailbox_mut<M: EntityMessage>(&self) -> RefMut<'_, Mailbox<M>> {
+        RefMut::map(self.mailboxes[M::id() as usize].borrow_mut(), |mailbox| {
+            mailbox.downcast_mut().unwrap()
+        })
     }
 
     /// Applies `op` to `entity`'s `C` and records it, as
@@ -479,9 +588,8 @@ mod tests {
         assert_eq!(world.uid(e0), Some(u0));
         assert_eq!(world.resolve(u0), Some(e0));
 
-        let mut allocator = world.uid_allocator_mut().unwrap();
-        assert_eq!(allocator.spare(), Some(spare));
-        assert!(allocator.take_retired().is_empty());
+        assert_eq!(world.uid_allocator_mut().unwrap().spare(), Some(spare));
+        assert!(world.events::<IncarnationSwitched>().is_empty());
     }
 
     #[test]

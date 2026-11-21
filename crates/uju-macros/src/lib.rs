@@ -1,4 +1,5 @@
 mod component;
+mod event;
 mod unique;
 
 use proc_macro::TokenStream;
@@ -8,6 +9,14 @@ use syn::{DeriveInput, parse_macro_input};
 pub fn derive_component(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
     component::expand(ast)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+#[proc_macro_derive(Event)]
+pub fn derive_event(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    event::expand(ast)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

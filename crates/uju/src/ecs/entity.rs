@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 
+use crate::ecs::Event;
 use crate::ecs::cell::{Cell, CellIndex};
 use crate::ecs::hash::FoldBuildHasher;
 
@@ -282,9 +283,10 @@ impl fmt::Display for Uid {
 /// Mints [`Uid`]s for a shard from two incarnations: the current one, counting serials
 /// from `0`, and a spare it switches to when the current one runs out.
 ///
-/// It never asks for incarnations itself. Whoever installed it reads the incarnations it
-/// switched away from with [`take_retired`](Self::take_retired), and hands it the next
-/// spare with [`set_spare`](Self::set_spare).
+/// It never asks for incarnations itself. Installed in a [`World`](crate::ecs::world::World),
+/// each switch it makes while [promoting](crate::ecs::world::World::promote) shows as an
+/// [`IncarnationSwitched`] event, and whoever installed it hands it the next spare with
+/// [`set_spare`](Self::set_spare).
 pub struct UidAllocator {
     current: NonZeroU32,
     next: u64,
@@ -326,7 +328,7 @@ impl UidAllocator {
     }
 
     /// The incarnations it switched away from since the last call, oldest first.
-    pub fn take_retired(&mut self) -> Vec<NonZeroU32> {
+    pub(crate) fn take_retired(&mut self) -> Vec<NonZeroU32> {
         std::mem::take(&mut self.retired)
     }
 
@@ -348,6 +350,14 @@ impl UidAllocator {
         self.next += 1;
         Some(Uid::new(self.current, serial))
     }
+}
+
+/// The event a [`World`](crate::ecs::world::World) emits when its [`UidAllocator`]
+/// switches to the spare: the spare is in use, and the allocator needs a new one.
+#[derive(Event, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IncarnationSwitched {
+    /// The incarnation it switched away from, whose serials ran out.
+    pub from: NonZeroU32,
 }
 
 /// Which entities are replicas: a bit per entity index, set by the runtime for
@@ -444,7 +454,8 @@ impl Entries {
 /// are replicas, and the cell index.
 ///
 /// A local [`Entity`] never leaves its world. A [`Uid`] is minted lazily, only once the
-/// entity has to be named from outside (see [`promote`](Self::promote)), or adopted
+/// entity has to be named from outside (see
+/// [`World::promote`](crate::ecs::world::World::promote)), or adopted
 /// from another world (see [`adopt`](Self::adopt)).
 ///
 /// The entity allocator, the replica flags and the cell index are each a borrow of
@@ -482,12 +493,14 @@ impl Registry {
         self.entries.borrow()
     }
 
-    /// The allocator [`promote`](Self::promote) mints from, if one is installed.
+    /// The allocator [`promote`](crate::ecs::world::World::promote) mints from, if one
+    /// is installed.
     pub fn uid_allocator(&self) -> Option<Ref<'_, UidAllocator>> {
         Ref::filter_map(self.entries.borrow(), |entries| entries.allocator.as_ref()).ok()
     }
 
-    /// The allocator [`promote`](Self::promote) mints from, if one is installed.
+    /// The allocator [`promote`](crate::ecs::world::World::promote) mints from, if one
+    /// is installed.
     pub fn uid_allocator_mut(&self) -> Option<RefMut<'_, UidAllocator>> {
         RefMut::filter_map(self.entries.borrow_mut(), |entries| {
             entries.allocator.as_mut()
@@ -495,8 +508,8 @@ impl Registry {
         .ok()
     }
 
-    /// Installs the allocator [`promote`](Self::promote) mints from, returning the
-    /// previous one.
+    /// Installs the allocator [`promote`](crate::ecs::world::World::promote) mints from,
+    /// returning the previous one.
     pub fn install_uid_allocator(&self, allocator: UidAllocator) -> Option<UidAllocator> {
         self.entries.borrow_mut().allocator.replace(allocator)
     }
@@ -554,8 +567,9 @@ impl Registry {
     /// if it has no uid and no allocator is installed.
     ///
     /// Panics if the installed allocator's current incarnation has run out and it has no
-    /// spare (see [`UidAllocator::alloc`]).
-    pub fn promote(&self, entity: Entity) -> Option<Uid> {
+    /// spare (see [`UidAllocator::alloc`]). A switch to the spare is left in the
+    /// allocator for [`World::promote`](crate::ecs::world::World::promote) to emit.
+    pub(crate) fn promote(&self, entity: Entity) -> Option<Uid> {
         let mut entries = self.entries.borrow_mut();
         if !entries.is_alive(entity) {
             return None;
@@ -674,6 +688,7 @@ impl Default for Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecs::world::World;
 
     #[test]
     fn entity_option_niche() {
@@ -997,6 +1012,37 @@ mod tests {
         let mut allocator = registry.uid_allocator_mut().unwrap();
         assert_eq!(allocator.take_retired(), [incarnation(3)]);
         assert_eq!(allocator.set_spare(incarnation(5)), None);
+    }
+
+    #[test]
+    fn world_promote_emits_switches() {
+        crate::ecs::init();
+        let mut world = World::new();
+        world.install_uid_allocator(allocator());
+        let e0 = world.spawn();
+        assert_eq!(world.promote(e0), Some(uid(3, 0)));
+        assert!(world.events::<IncarnationSwitched>().is_empty());
+
+        // outside any schedule, as while applying a migration
+        world.uid_allocator_mut().unwrap().next = UidAllocator::SERIALS;
+        let e1 = world.spawn();
+        assert_eq!(world.promote(e1), Some(uid(4, 0)));
+        assert_eq!(world.promote(e1), Some(uid(4, 0)));
+        let switched = IncarnationSwitched {
+            from: incarnation(3),
+        };
+        assert_eq!(*world.events::<IncarnationSwitched>(), [switched]);
+
+        // read before the end of the tick clears it
+        world.end_tick();
+        assert!(world.events::<IncarnationSwitched>().is_empty());
+        world.uid_allocator_mut().unwrap().set_spare(incarnation(5));
+        world.uid_allocator_mut().unwrap().next = UidAllocator::SERIALS;
+        assert_eq!(world.promote(world.spawn()), Some(uid(5, 0)));
+        let switched = IncarnationSwitched {
+            from: incarnation(4),
+        };
+        assert_eq!(*world.events::<IncarnationSwitched>(), [switched]);
     }
 
     #[test]

@@ -117,14 +117,17 @@ counting serials from `0`, and a **spare**. Each incarnation holds
   `world.install_uid_allocator(UidAllocator::new(current, spare))` installs
   one and returns the previous one.
 - **Switching.** When the current incarnation has no serial left, the next
-  mint switches to the spare, counts from `0` again, and records the
-  incarnation it switched from. `remaining()` counts the serials left in
-  the current incarnation.
+  mint switches to the spare and counts from `0` again. `remaining()`
+  counts the serials left in the current incarnation.
+- **The switch is an event.** When `world.promote` switches the installed
+  allocator, the `World` emits an [event](events.md#events),
+  `IncarnationSwitched { from }`, naming the incarnation it switched from,
+  whether the promote ran in a system or outside the schedule. Like every
+  event, it is cleared at the end of the tick, so its reader runs before.
 - **Refilling.** The allocator never asks for incarnations itself. Its
-  owner takes the incarnations it switched from with `take_retired()`, and
-  hands it the next spare with `set_spare(incarnation)`, which returns the
-  spare it replaces, if any. `world.uid_allocator_mut()` borrows the
-  installed allocator for both.
+  owner hands it the next spare with `set_spare(incarnation)`, which
+  returns the spare it replaces, if any. `world.uid_allocator_mut()`
+  borrows the installed allocator.
 - **Exhaustion.** `promote` panics when the current incarnation has run out
   and no spare is set. `try_alloc` on the allocator itself returns `None`
   instead.
@@ -138,7 +141,6 @@ counting serials from `0`, and a **spare**. Each incarnation holds
 | `spare()` | The spare, or `None` once switched to and not yet replaced |
 | `set_spare(incarnation)` | Sets the spare, returning the previous one |
 | `remaining()` | Serials left in the current incarnation |
-| `take_retired()` | The incarnations switched from since the last call, oldest first |
 | `alloc()`, `try_alloc()` | The next uid. `alloc` panics where `try_alloc` returns `None` |
 
 ```rust
@@ -149,8 +151,10 @@ let e = world.spawn();
 let uid = world.promote(e).unwrap();
 assert_eq!(world.resolve(uid), Some(e));
 
-// each retired incarnation means the spare is in use: get a new one
-let retired = world.uid_allocator_mut().map(|mut uids| uids.take_retired());
+// each switch means the spare is in use: get a new one
+for switched in world.events::<IncarnationSwitched>().iter() {
+    // switched.from ran out: ask for a new spare
+}
 
 // later, with the new incarnation
 world.uid_allocator_mut().unwrap().set_spare(incarnation(5));
@@ -273,7 +277,8 @@ with a `swap_remove`, in O(1).
 ## Registry
 
 The `Registry` owns a `World`'s entities. `world.entities()` returns it, and
-the `World`'s methods above forward to it.
+the `World`'s methods above forward to it, except `promote`, which only the
+`World` has, since it emits the [switch event](#uidallocator).
 
 It holds three parts, each a borrow of its own:
 

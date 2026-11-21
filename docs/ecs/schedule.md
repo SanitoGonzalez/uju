@@ -41,7 +41,7 @@ fn movement(world: &World) {
 | Stage | Holds |
 |---|---|
 | `Update` | Gameplay |
-| `Inbox` | The systems that read inboxes, after `Update` |
+| `Inbox` | The systems that read [inboxes](events.md#inboxes), after `Update` |
 
 `Stage` is an enum, and `Update` and `Inbox` are re-exported beside it and
 in the prelude. A schedule that needs a single stage, such as an edge's,
@@ -63,7 +63,8 @@ the stages, such as applying what arrived before `Update`, or
   declared dependencies, so reading the registrations gives the order.
 - **Each run, every system once.** A stage runs each of its systems at
   most once per `run_stage`, so a system that reads what a later one
-  writes sees it on the next run.
+  writes sees it on the next run. An [event](events.md#events) emitted
+  after its last reader ran is never read.
 
 ## Run conditions
 

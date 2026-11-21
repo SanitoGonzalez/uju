@@ -104,7 +104,7 @@ fn ground(position: Vector) -> (f32, f32) {
 /// changed this tick, from the world's [`Grid`]. An entity seen for the
 /// first time, one with no cell or whose `Transform` was added this tick,
 /// takes the cell holding its position and is
-/// [promoted](crate::ecs::entity::Registry::promote). Any other keeps its
+/// [promoted](World::promote). Any other keeps its
 /// cell while within the grid's margin.
 ///
 /// Replicas are skipped: the runtime sets their cell. Does nothing when no
@@ -132,7 +132,7 @@ pub(crate) fn set_cells(world: &World) {
         let cell = match registry.cell(entity) {
             Some(current) if !transforms.is_added_at(position) => grid.cell_from(current, at),
             _ => {
-                registry.promote(entity);
+                world.promote(entity);
                 grid.cell(at)
             }
         };
