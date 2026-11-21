@@ -1,8 +1,9 @@
+use std::any::{Any, TypeId};
 use std::ops::Range;
 
-use crate::ecs::component::{Component, Id};
+use crate::ecs::bundle::Bundle;
+use crate::ecs::component::{Component, Id, Required};
 use crate::ecs::entity::Entity;
-use crate::ecs::storage::{Storage, table::Table};
 use crate::ecs::world::World;
 
 /// Changes deferred until the [`World`] applies them, for code that holds
@@ -18,14 +19,47 @@ pub struct Commands {
     entities: Vec<Entity>,
 }
 
-/// Inserts a captured value into its component's table.
-type Insert = Box<dyn FnOnce(&mut dyn Table, Entity)>;
-
 enum Command {
     Despawn(Range<usize>),
     Remove(Id, Range<usize>),
-    Insert(Id, Entity, Insert),
+    /// A run of inserts of one bundle type.
+    Insert(TypeId, Box<dyn InsertRun>),
     Run(Box<dyn FnOnce(&World)>),
+}
+
+/// A run of inserts of bundle `B`, its values kept a column per component.
+struct Inserts<B: Bundle> {
+    entities: Vec<Option<Entity>>,
+    columns: B::Columns,
+}
+
+trait InsertRun {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    fn apply(self: Box<Self>, world: &World);
+}
+
+impl<B: Bundle> InsertRun for Inserts<B> {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn apply(self: Box<Self>, world: &World) {
+        let Inserts {
+            mut entities,
+            columns,
+        } = *self;
+        {
+            let registry = world.entities.entries();
+            for entity in &mut entities {
+                *entity = entity.filter(|&entity| registry.is_alive(entity));
+            }
+        }
+        B::insert_columns(columns, world, &entities);
+        for &entity in entities.iter().flatten() {
+            Required::add_to::<B>(world, entity);
+        }
+    }
 }
 
 impl Commands {
@@ -43,17 +77,26 @@ impl Commands {
         }
     }
 
-    /// Inserts or replaces `entity`'s `C`. Skipped if `entity` is dead when
+    /// Inserts `bundle` into `entity`, replacing the components it already
+    /// holds, then adds the components they
+    /// [require](Component::required). Skipped if `entity` is dead when
     /// applied.
-    pub fn insert<C: Component>(&mut self, entity: Entity, component: C) {
-        self.queue.push(Command::Insert(
-            C::id(),
-            entity,
-            Box::new(move |table, entity| {
-                let storage = table.as_any_mut().downcast_mut::<C::Storage>().unwrap();
-                storage.insert(entity, component);
-            }),
-        ));
+    pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) {
+        let id = TypeId::of::<B>();
+        if let Some(Command::Insert(run_id, run)) = self.queue.last_mut()
+            && *run_id == id
+        {
+            let run = run.as_any_mut().downcast_mut::<Inserts<B>>().unwrap();
+            run.entities.push(Some(entity));
+            bundle.push(&mut run.columns);
+            return;
+        }
+        let mut run = Inserts::<B> {
+            entities: vec![Some(entity)],
+            columns: B::Columns::default(),
+        };
+        bundle.push(&mut run.columns);
+        self.queue.push(Command::Insert(id, Box::new(run)));
     }
 
     /// Removes `entity`'s `C`, if it holds one when applied.
@@ -74,11 +117,10 @@ impl Commands {
     }
 
     /// Applies and clears the queue. Runs of despawns, of removes of one
-    /// component and of inserts of one component each borrow what they
-    /// touch once.
+    /// component and of inserts of one bundle type each borrow what they
+    /// touch once, but for the components the inserts require.
     pub(crate) fn apply(&mut self, world: &World) {
-        let mut queue = self.queue.drain(..).peekable();
-        while let Some(command) = queue.next() {
+        for command in self.queue.drain(..) {
             match command {
                 Command::Despawn(run) => {
                     world.despawn_batch(&self.entities[run]);
@@ -88,20 +130,7 @@ impl Commands {
                         .borrow_mut()
                         .remove_batch(&self.entities[run]);
                 }
-                Command::Insert(id, entity, insert) => {
-                    let registry = world.entities.entries();
-                    let mut table = world.tables[id as usize].borrow_mut();
-                    if registry.is_alive(entity) {
-                        insert(&mut **table, entity);
-                    }
-                    while let Some(Command::Insert(_, entity, insert)) = queue.next_if(
-                        |command| matches!(command, Command::Insert(next, ..) if *next == id),
-                    ) {
-                        if registry.is_alive(entity) {
-                            insert(&mut **table, entity);
-                        }
-                    }
-                }
+                Command::Insert(_, run) => run.apply(world),
                 Command::Run(f) => f(world),
             }
         }
@@ -241,6 +270,37 @@ mod tests {
         let mut held = loots.entities().to_vec();
         held.sort();
         assert_eq!(held, [entities[2], entities[5]]);
+    }
+
+    #[test]
+    fn commands_merge_insert_runs() {
+        crate::ecs::init();
+        let world = World::new();
+        let entities = (0..4).map(|_| world.spawn()).collect::<Vec<_>>();
+
+        let mut commands = world.commands();
+        commands.insert(entities[0], (Hp(1), Loot(1)));
+        commands.insert(entities[1], (Hp(1), Loot(1)));
+        commands.insert(entities[2], Hp(1));
+        commands.insert(entities[3], Hp(1));
+        commands.insert(entities[0], (Loot(1), Hp(1)));
+        commands.insert(entities[1], (Loot(1), Hp(1)));
+        let runs = commands
+            .queue
+            .iter()
+            .map(|command| match command {
+                Command::Insert(id, _) => *id,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            runs,
+            [
+                TypeId::of::<(Hp, Loot)>(),
+                TypeId::of::<Hp>(),
+                TypeId::of::<(Loot, Hp)>()
+            ]
+        );
     }
 
     #[test]

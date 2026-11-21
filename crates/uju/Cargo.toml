@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "despawn"
 harness = false
+
+[[bench]]
+name = "spawn"
+harness = false

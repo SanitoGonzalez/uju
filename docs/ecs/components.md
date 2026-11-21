@@ -1,7 +1,7 @@
 # Components
 
-How a type becomes a component or a unique of a `World`, and how its values
-are stored. Entities are in [Entities](entities.md), iterating several
+How a type becomes a component or a unique of a `World`, how its values
+are stored, and how components are inserted together. Entities are in [Entities](entities.md), iterating several
 components together in [Queries](queries.md), and audience keys, which are
 not components, in [Audiences](audiences.md).
 
@@ -50,7 +50,8 @@ A component's table is its **storage**, the associated type
 access hands out.
 
 - **Derived.** `#[derive(Component)]` picks `SparseSet<C>`, unless the
-  type names another with `#[component(storage = Tracked<Self>)]`.
+  type names another with `#[component(storage = Tracked<Self>)]`. The
+  same attribute takes [`require(...)`](#required-components).
 - **Shared access** yields `&C`, whatever the storage.
 - **Mutable access** yields the storage's `Mut<'a>` item. For a `SparseSet`
   it is `&'a mut C`. A storage that must see every write, such as one that
@@ -138,7 +139,9 @@ impl Component for Score {
 }
 ```
 
-`name` must be unique among components, since ids follow it.
+`name` must be unique among components, since ids follow it. A
+hand-written `impl` declares its [required
+components](#required-components) by overriding `required`.
 
 ## Views
 
@@ -180,4 +183,76 @@ plus their [changes](change-tracking.md#tracked-tables). An `OpsTable` adds
 - **Replicas.** When the storage is replicated, `view_mut.get_mut(entity)`
   returns `None` for a [replica](entities.md#replicas), and the
   `&mut view_mut` join term skips replicas. `insert` and `remove` do not.
+- **One table.** A view's `insert` holds only its own table, so it adds no
+  [required components](#required-components).
+
+## Bundles
+
+A **bundle** is components inserted together: a component, or a tuple of
+up to 12 bundles.
+
+```rust
+let e = world.spawn_with((Position(pos), Hp(100), Hostile));
+world.commands().insert(bag, (Position(pos), loot));
+```
+
+| Method | Does |
+|---|---|
+| `world.spawn_with(bundle)` | Spawns an entity holding the bundle, at once, and returns it |
+| `world.commands().insert(entity, bundle)` | Inserts the bundle at the next [flush](commands.md#flush), replacing what the entity holds |
+
+- **Each table once.** `spawn_with` borrows each table of the bundle once,
+  so it panics when a query or a view holds one of them. Inside a query's
+  loop, `spawn` then [`commands().insert`](commands.md) does the same,
+  deferred.
+- **Nesting.** A tuple's items may be tuples, so a function returning a
+  bundle composes: `(enemy(), Loot(3))`.
+- **Repeats.** A component that appears twice in a bundle is inserted
+  twice, in order, so the last value wins: `(enemy(), Hp(50))` overrides
+  the `Hp` that `enemy()` holds.
+- **Required components** are added after the bundle, as below.
+
+## Required components
+
+A component may require others: an entity holding it must hold them too.
+Each requirement names a component and its constructor.
+
+```rust
+#[derive(Component)]
+#[component(require(Body = Body::new(), Mass))]
+struct Collider(Shape);
+```
+
+- **Derived.** `require(Type = expr)` builds the value with `expr`, and
+  `require(Type)` with `Default::default()`. The expression is evaluated
+  only when the component is added.
+- **Hand-written.** `Component::required` is empty by default. An `impl`
+  overrides it:
+
+  ```rust
+  fn required(required: &mut Required<'_>) {
+      required.add(Body::new);
+      required.add(|| Mass(1.0));
+  }
+  ```
+
+- **Missing only.** After a bundle insert, `spawn_with` or
+  `commands().insert`, each requirement of each component of the bundle is
+  added unless the entity holds that component, from the bundle or from
+  before. Nothing is overwritten.
+- **Transitive.** A component added as a requirement has its own
+  requirements added in turn. They are added by depth, so the nearest
+  requirement wins: when `Collider` requires `Mass` and `Body`, and `Body`
+  requires another `Mass`, `Collider`'s is used. At equal depth, the first
+  in bundle order, then in declaration order, wins.
+- **Cycles** end by themselves: a component already held is not added
+  again, so its requirements are not visited again.
+- **View inserts** add none, since a view holds one table.
+- **Replicas** get none, whatever inserts into them. Their schema
+  components come from their owner, and the state the runtime receives
+  never adds requirements.
+- **Rust only.** Requirements are not a schema attribute, and nothing on
+  the wire carries them.
+- **Cost.** A component with no requirements costs nothing on the insert
+  path. Each requirement borrows its table once per entity.
 

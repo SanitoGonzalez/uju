@@ -34,12 +34,16 @@ assert!(!world.is_alive(e));
 | Method | Does |
 |---|---|
 | `world.spawn()` | Allocates an entity with no components, at once |
+| `world.spawn_with(bundle)` | Spawns an entity holding a [bundle](components.md#bundles), at once. Panics when a query or a view holds one of its tables |
 | `world.despawn(entity)` | Frees the entity and drops its components. `false` if it was dead |
 | `world.despawn_batch(&entities)` | Despawns every live entity of the slice, and returns how many |
 | `world.commands().despawn(entity)` | Despawns at the next [flush](commands.md) |
 
 - **Spawning is always immediate.** The entity allocator is a borrow of
   its own, so a query's loop can spawn and hold the new entity at once.
+  `spawn_with` also borrows the bundle's tables, so inside a query's loop,
+  `spawn` then [`commands().insert`](commands.md) gives the entity its
+  components at the next flush.
 - **Despawning touches everything.** `despawn` and `despawn_batch` drop the
   entity from every table, [audience tables](audiences.md) included, its
   cell and the replica flags, so they panic

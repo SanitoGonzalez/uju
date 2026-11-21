@@ -1,4 +1,5 @@
 pub mod audience;
+pub mod bundle;
 pub mod cell;
 pub mod commands;
 pub mod component;

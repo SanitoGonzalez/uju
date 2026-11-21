@@ -3,9 +3,10 @@ use std::cell::{Ref, RefCell, RefMut};
 
 use crate::ecs::{
     audience::{self, Audience},
+    bundle::Bundle,
     cell::Cell,
     commands::Commands,
-    component::{self, Component, Ops},
+    component::{self, Component, Ops, Required},
     entity::{Despawned, Entity, IncarnationSwitched, Registry, Uid, UidAllocator},
     event::{self, Event, Queue},
     message::{self, EntityMessage, InboxDrain, Mailbox},
@@ -68,6 +69,19 @@ impl World {
 
     pub fn spawn(&self) -> Entity {
         self.entities.spawn()
+    }
+
+    /// Spawns an entity holding `bundle`, at once, then adds the components
+    /// they [require](Component::required). Borrows each table once.
+    ///
+    /// Panics if one of the tables is borrowed at the time, such as by a
+    /// query. Inside a query's loop, `spawn` then
+    /// [`commands().insert`](Commands::insert) defers the inserts.
+    pub fn spawn_with<B: Bundle>(&self, bundle: B) -> Entity {
+        let entity = self.spawn();
+        bundle.insert(self, entity);
+        Required::add_to::<B>(self, entity);
+        entity
     }
 
     /// Frees `entity` and drops its components, audience keys and observer

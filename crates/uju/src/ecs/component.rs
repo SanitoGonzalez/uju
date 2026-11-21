@@ -2,8 +2,12 @@ use std::cell::UnsafeCell;
 use std::sync::Once;
 
 use linkme::distributed_slice;
+use smallvec::SmallVec;
 
+use crate::ecs::bundle::Bundle;
+use crate::ecs::entity::Entity;
 use crate::ecs::storage::{Storage, patch::FieldMask, table::Table};
+use crate::ecs::world::World;
 use crate::net::wire::{Decode, Encode, EncodeError};
 
 pub type Id = u16;
@@ -15,6 +19,67 @@ pub trait Component: 'static {
     type Storage: Storage<Component = Self>;
 
     fn id() -> Id;
+
+    /// Adds the components an entity must hold beside this one, each with
+    /// its constructor, as `required.add(Body::new)`. Empty by default.
+    ///
+    /// A [`Bundle`] insert, such as [`World::spawn_with`] or
+    /// [`Commands::insert`](crate::ecs::commands::Commands::insert), calls
+    /// it once the bundle is in, and [`Required::add`] inserts only what the
+    /// entity does not hold yet.
+    #[inline]
+    fn required(_: &mut Required<'_>) {}
+}
+
+/// The entity a bundle was inserted on, which [`Component::required`] adds
+/// the missing components to.
+pub struct Required<'w> {
+    world: &'w World,
+    entity: Entity,
+    /// Whether the entity is a replica, read on the first `add`.
+    replica: Option<bool>,
+    /// The `required` of each component added, still to run.
+    pending: SmallVec<[fn(&mut Required<'_>); 8]>,
+}
+
+impl<'w> Required<'w> {
+    /// Adds to `entity` what the components of `B` require, then what
+    /// those require, and so on, nearest first.
+    #[inline]
+    pub(crate) fn add_to<B: Bundle>(world: &'w World, entity: Entity) {
+        let mut required = Self {
+            world,
+            entity,
+            replica: None,
+            pending: SmallVec::new(),
+        };
+        B::required(&mut required);
+        let mut next = 0;
+        while let Some(&required_by) = required.pending.get(next) {
+            next += 1;
+            required_by(&mut required);
+        }
+    }
+
+    /// Inserts `new()` unless the entity holds an `R`. What `R` requires in
+    /// turn is added once every component of this depth has been, so the
+    /// nearest requirement wins. A replica gets nothing, since its schema
+    /// components come from its owner.
+    ///
+    /// Panics if `R`'s table is borrowed at the time, such as by a query.
+    pub fn add<R: Component>(&mut self, new: impl FnOnce() -> R) {
+        let replica = *self
+            .replica
+            .get_or_insert_with(|| self.world.is_replica(self.entity));
+        if replica {
+            return;
+        }
+        let mut table = self.world.view_mut::<R>();
+        if !Table::contains(&*table, self.entity) {
+            Storage::insert(&mut *table, self.entity, new());
+            self.pending.push(R::required);
+        }
+    }
 }
 
 /// Who receives a replicated component's changes, besides the halo stream.

@@ -27,7 +27,7 @@ own, so it is available inside any query's loop or while views are held.
 | Method | Applies as |
 |---|---|
 | `despawn(entity)` | `world.despawn(entity)`. Skipped if the entity is dead |
-| `insert(entity, value)` | Inserts or replaces the entity's `C`. Skipped if the entity is dead |
+| `insert(entity, bundle)` | Inserts or replaces the [bundle](components.md#bundles)'s components, then adds their [required components](components.md#required-components). Skipped if the entity is dead |
 | `remove::<C>(entity)` | Removes the entity's `C`, if it holds one |
 | `run(f)` | Calls `f(&World)` |
 | `is_empty()` | Whether anything is queued |
@@ -71,11 +71,16 @@ it touches once rather than once per command:
 |---|---|
 | Consecutive despawns | The registry once, then each table once, as one [`despawn_batch`](entities.md#spawning-and-despawning) |
 | Consecutive removes of one component | That component's table once |
-| Consecutive inserts of one component | That component's table and the entity allocator once |
+| Consecutive inserts of one bundle type | The entity allocator once, then each table of the bundle once |
 
 A despawn of a run costs a probe per table, not a `RefCell` borrow per table
-per entity. A command of another kind ends the run, so batching never
-reorders commands.
+per entity. A command of another kind, or an insert of another bundle type,
+ends the run, so batching never reorders commands. `insert(e, Hp(1))` and
+`insert(e, (Hp(1),))` are different bundle types.
+
+A run of inserts keeps its values a column per component, and inserts one
+column at a time. [Required components](components.md#required-components)
+are added after the whole run, borrowing their tables once per entity.
 
 ## Immediate changes
 
@@ -84,5 +89,9 @@ The `World`'s own methods stay, for code that holds no conflicting borrow:
 | Immediate | Deferred |
 |---|---|
 | `world.despawn(entity)`, `world.despawn_batch(&entities)` | `world.commands().despawn(entity)` |
+| `world.spawn_with(bundle)` | `world.spawn()`, then `world.commands().insert(entity, bundle)` |
 | `world.view_mut::<C>().insert(entity, value)` | `world.commands().insert(entity, value)` |
 | `world.view_mut::<C>().remove(entity)` | `world.commands().remove::<C>(entity)` |
+
+A view's `insert` holds only its own table, so unlike the command it adds
+no [required components](components.md#required-components).
