@@ -6,6 +6,7 @@ pub mod component;
 pub mod entity;
 pub mod event;
 mod hash;
+pub mod hook;
 pub mod message;
 pub mod query;
 pub mod schedule;

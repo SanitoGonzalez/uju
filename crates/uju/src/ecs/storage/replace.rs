@@ -2,6 +2,7 @@ use std::any::Any;
 
 use crate::ecs::component::{Replace, Replication};
 use crate::ecs::entity::{Entity, Uid};
+use crate::ecs::hook::HookLog;
 use crate::ecs::storage::{
     Storage, Tracking,
     section::{self, REMOVED, VALUES},
@@ -167,7 +168,7 @@ impl<T: Replace> Table for ReplaceTable<T> {
     }
 
     fn remove(&mut self, entity: Entity) -> bool {
-        self.remove(entity).is_some()
+        Table::remove(&mut self.0, entity)
     }
 
     fn despawn_batch(&mut self, entities: &[Entity]) {
@@ -246,6 +247,11 @@ impl<T: Replace> Storage for ReplaceTable<T> {
 
     fn remove(&mut self, entity: Entity) -> Option<T> {
         self.remove(entity)
+    }
+
+    #[inline]
+    fn hook_log(&mut self) -> &mut HookLog<T> {
+        self.0.hook_log()
     }
 
     #[inline]
@@ -492,6 +498,63 @@ mod tests {
         alive.push(entities[3]);
         apply::<Health>(&snapshot, &encode_changes::<Health>(&sim, &alive));
         assert_eq!(values::<Health>(&snapshot), values::<Health>(&sim));
+    }
+
+    #[derive(Component, Debug, PartialEq)]
+    struct Shape(u32);
+
+    #[test]
+    fn replace_hooks_on_replicas() {
+        crate::ecs::init();
+        let sim = sim();
+        let mut edge = World::new();
+        // a replica's health gets a shape of its own, outside the schema
+        edge.on_insert::<Health>(|world: &World, added: &[Entity]| {
+            for &entity in added {
+                let hp = world.view::<Health>().get(entity).unwrap().hp;
+                world.view_mut::<Shape>().insert(entity, Shape(hp));
+            }
+        });
+        let freed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let freed = freed.clone();
+            edge.on_remove::<Health>(move |world: &World, values: &mut Vec<(Entity, Health)>| {
+                for (entity, health) in values.drain(..) {
+                    freed.borrow_mut().push(health.hp);
+                    world.view_mut::<Shape>().remove(entity);
+                }
+            });
+        }
+        let entities = (0..3).map(|_| sim.spawn()).collect::<Vec<_>>();
+        for (index, &entity) in entities.iter().enumerate() {
+            sim.promote(entity);
+            sim.view_mut::<Health>()
+                .insert(entity, health(index as u32));
+        }
+
+        // entering replicas
+        apply::<Health>(&edge, &encode_changes::<Health>(&sim, &[]));
+        edge.flush();
+        let shapes = |edge: &World| {
+            let mut query = Query::<(Shape, Replica)>::new(edge);
+            let mut shapes = query.iter().map(|(_, body)| body.0).collect::<Vec<_>>();
+            shapes.sort();
+            shapes
+        };
+        assert_eq!(shapes(&edge), [0, 1, 2]);
+
+        // a changed value is a write, not an insert; a removal hands the
+        // value over, and so does a replica's despawn
+        let mut sim = sim;
+        sim.end_tick();
+        sim.view_mut::<Health>().get_mut(entities[0]).unwrap().hp = 10;
+        sim.view_mut::<Health>().remove(entities[1]);
+        apply::<Health>(&edge, &encode_changes::<Health>(&sim, &[]));
+        let replica = edge.resolve(sim.uid(entities[2]).unwrap()).unwrap();
+        edge.despawn(replica);
+        edge.flush();
+        assert_eq!(shapes(&edge), [0]);
+        assert_eq!(*freed.borrow(), [1, 2]);
     }
 
     #[test]

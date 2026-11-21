@@ -102,7 +102,8 @@ for e in world.removed::<Hp>() {
   [remove log](#removals-and-despawns), an entity that is dead or holds `C`
   again: a remove then an add shows as `Added<C>` only.
 - **Despawns do not show.** A despawn writes nothing to a table's log, so
-  neither `removed` nor any filter sees it.
+  neither `removed` nor any filter sees it. [Component
+  hooks](components.md#hooks) see despawns.
 - **Borrows.** `removed` holds `C`'s table shared while its iterator
   lives, and checks liveness per entity, so its loop can spawn and queue
   [commands](commands.md), but not take `C`'s table mutably.
@@ -396,7 +397,7 @@ apply one.
 | `encode_section(full, changed, removed, &mut out)` | Appends one section, and returns whether it wrote one |
 | `apply_section(buf, resolve)` | Applies one section, and returns its length |
 | `end_tick()` | Clears the bits and the log |
-| `despawn_batch(entities)` | Drops despawned entities' values without logging them |
+| `despawn_batch(entities)` | Drops despawned entities' values without logging them in the remove log. [`on_remove` hooks](components.md#hooks) still get them |
 
 ### Sections
 

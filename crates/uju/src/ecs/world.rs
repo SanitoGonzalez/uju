@@ -9,9 +9,10 @@ use crate::ecs::{
     component::{self, Component, Ops, Required},
     entity::{Despawned, Entity, IncarnationSwitched, Registry, Uid, UidAllocator},
     event::{self, Event, Queue},
+    hook::{ComponentHooks, Hooks, Pending},
     message::{self, EntityMessage, InboxDrain, Mailbox},
     storage::{
-        Tracking,
+        Storage, Tracking,
         audience::{AudienceTable, KeyTable},
         ops::OpsTable,
         table::Table,
@@ -21,7 +22,7 @@ use crate::ecs::{
 };
 
 /// A shard's entities, component tables, audience tables, uniques, event
-/// queues and inboxes.
+/// queues, inboxes and component hooks.
 ///
 /// A world is built on its shard's thread and never leaves it.
 pub struct World {
@@ -33,6 +34,10 @@ pub struct World {
     mailboxes: Vec<RefCell<Box<dyn Any>>>,
     commands: RefCell<Commands>,
     despawns: RefCell<Vec<Despawned>>,
+    /// The hooked components, by id.
+    hooks: Vec<(component::Id, RefCell<Box<dyn Hooks>>)>,
+    hooks_pending: Pending,
+    flushing: std::cell::Cell<bool>,
 }
 
 impl World {
@@ -60,6 +65,9 @@ impl World {
                 .collect(),
             commands: RefCell::new(Commands::default()),
             despawns: RefCell::default(),
+            hooks: Vec::new(),
+            hooks_pending: Pending::default(),
+            flushing: std::cell::Cell::new(false),
         }
     }
 
@@ -127,16 +135,39 @@ impl World {
         self.commands.borrow_mut()
     }
 
-    /// Applies the queued [`commands`](Self::commands), in order. Commands
-    /// queued while applying, such as by a closure, apply in the same flush.
+    /// Applies the queued [`commands`](Self::commands), in order, then runs
+    /// the [hooks](Self::on_insert) of what changed since the last flush,
+    /// and repeats until nothing is queued and no hook has work left.
+    /// Commands queued while applying, such as by a closure, apply in the
+    /// same flush.
+    ///
+    /// Called inside a hook or a command, it only applies the queue: the
+    /// flush already running runs the hooks.
     ///
     /// Panics if a command conflicts with a live borrow, such as a view of a
-    /// table it changes, or if the queue is borrowed at the time.
+    /// table it changes, if a hooked table with work for its hooks is
+    /// borrowed, or if the queue is borrowed at the time.
     pub fn flush(&self) {
-        if self.commands.borrow().is_empty() {
+        if self.flushing.get() {
+            self.apply_commands();
+            return;
+        }
+        if self.commands.borrow().is_empty() && !self.hooks_pending.get() {
             return;
         }
 
+        self.flushing.set(true);
+        let _flushing = Flushing(&self.flushing);
+        loop {
+            self.apply_commands();
+            if !self.hooks_pending.take() {
+                break;
+            }
+            self.run_hooks();
+        }
+    }
+
+    fn apply_commands(&self) {
         // keep the queue unborrowed while applying, so commands can queue more
         let mut commands = Commands::default();
         loop {
@@ -146,6 +177,88 @@ impl World {
             }
             commands.apply(self);
         }
+    }
+
+    /// Runs one round of hooks: takes every hooked table's log, then runs
+    /// the `on_remove` hooks, then the `on_insert` ones, each in component
+    /// order. What they change is logged for the next round.
+    fn run_hooks(&self) {
+        for (id, hooks) in &self.hooks {
+            hooks
+                .borrow_mut()
+                .take(&mut **self.tables[*id as usize].borrow_mut());
+        }
+        for (_, hooks) in &self.hooks {
+            hooks.borrow_mut().run_on_remove(self);
+        }
+        for (_, hooks) in &self.hooks {
+            hooks.borrow_mut().run_on_insert(self);
+        }
+    }
+
+    /// Runs `hook` at every flush with the entities that gained a `C` since
+    /// the last one, whatever the cause: a view, a command, a bundle, or
+    /// state received for a replica. An entity that lost its `C` again
+    /// before the flush is skipped, and each comes once, in the order they
+    /// gained it. An insert over a value counts, as a removal then an
+    /// insert.
+    ///
+    /// Hooks of one component run in order of registration. Only changes
+    /// made after the registration are seen.
+    pub fn on_insert<C: Component>(
+        &mut self,
+        hook: impl FnMut(&World, &[Entity]) + 'static,
+    ) -> &mut Self {
+        self.component_hooks::<C>().on_insert.push(Box::new(hook));
+        self.enable_hook_log::<C>();
+        self
+    }
+
+    /// Runs `hook` at every flush with the values of `C` removed since the
+    /// last one, with their entities, in removal order, whatever the cause:
+    /// a view, a command, a despawn, or state received for a replica. An
+    /// insert over a value removes it. A despawned entity's values come
+    /// too, with the entity dead by then.
+    ///
+    /// `C`'s table keeps the values until the flush, so its `remove` and
+    /// `insert` hand none back. Each hook may take values out of the `Vec`.
+    /// The next hook of `C` gets what is left, and the rest is dropped after
+    /// the last. Hooks of one component run in order of registration. Only
+    /// changes made after the registration are seen.
+    pub fn on_remove<C: Component>(
+        &mut self,
+        hook: impl FnMut(&World, &mut Vec<(Entity, C)>) + 'static,
+    ) -> &mut Self {
+        self.component_hooks::<C>().on_remove.push(Box::new(hook));
+        self.enable_hook_log::<C>();
+        self
+    }
+
+    fn component_hooks<C: Component>(&mut self) -> &mut ComponentHooks<C> {
+        let at = match self.hooks.binary_search_by_key(&C::id(), |(id, _)| *id) {
+            Ok(at) => at,
+            Err(at) => {
+                let hooks: Box<dyn Hooks> = Box::new(ComponentHooks::<C>::new());
+                self.hooks.insert(at, (C::id(), RefCell::new(hooks)));
+                at
+            }
+        };
+        self.hooks[at]
+            .1
+            .get_mut()
+            .as_any_mut()
+            .downcast_mut()
+            .unwrap()
+    }
+
+    fn enable_hook_log<C: Component>(&mut self) {
+        let hooks = self.component_hooks::<C>();
+        let (inserts, removes) = (!hooks.on_insert.is_empty(), !hooks.on_remove.is_empty());
+        let table = self.tables[C::id() as usize].get_mut();
+        let table = table.as_any_mut().downcast_mut::<C::Storage>().unwrap();
+        table
+            .hook_log()
+            .enable(inserts, removes, &self.hooks_pending);
     }
 
     pub fn is_alive(&self, entity: Entity) -> bool {
@@ -487,6 +600,15 @@ impl World {
 impl Default for World {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Clears the world's flushing flag when the flush ends, or unwinds.
+struct Flushing<'w>(&'w std::cell::Cell<bool>);
+
+impl Drop for Flushing<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
     }
 }
 

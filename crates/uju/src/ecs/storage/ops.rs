@@ -4,6 +4,7 @@ use std::ops::Deref;
 
 use crate::ecs::component::{Ops, Replication};
 use crate::ecs::entity::{Entity, Uid};
+use crate::ecs::hook::HookLog;
 use crate::ecs::storage::{
     Storage, Tracking,
     bits::Marker,
@@ -153,14 +154,14 @@ impl<T: Ops> OpsTable<T> {
         self.tracked.components()
     }
 
-    /// Inserts or replaces `entity`'s value, returning the previous one. A
-    /// replaced value is resynced, and a new one added. Either is sent
+    /// Inserts or replaces `entity`'s value, returning the previous one
+    /// unless an `on_remove` hook keeps it. A replaced value is resynced, and a new one added. Either is sent
     /// whole.
     pub fn insert(&mut self, entity: Entity, component: T) -> Option<T> {
-        let previous = self.tracked.insert(entity, component);
-        match previous {
-            None => self.spans.push(Span::FULL),
-            Some(_) => {
+        let (replaced, previous) = self.tracked.insert_replacing(entity, component);
+        match replaced {
+            false => self.spans.push(Span::FULL),
+            true => {
                 let position = self.tracked.index_of(entity).unwrap();
                 self.spans[position] = Span::FULL;
             }
@@ -170,7 +171,7 @@ impl<T: Ops> OpsTable<T> {
 
     /// See [`Tracked::remove`]. The entry's ops of the tick are dropped.
     pub fn remove(&mut self, entity: Entity) -> Option<T> {
-        self.remove_with(entity, Tracked::remove)
+        self.remove_with(entity, Tracked::remove).flatten()
     }
 
     #[inline]
@@ -223,15 +224,16 @@ impl<T: Ops> OpsTable<T> {
     }
 
     /// Removes `entity`'s value with `remove`, and moves the last entry's
-    /// span into the hole, as the value moves.
+    /// span into the hole, as the value moves. `None` when `entity` holds
+    /// no value, else what `remove` returned.
     fn remove_with(
         &mut self,
         entity: Entity,
         remove: fn(&mut Tracked<T>, Entity) -> Option<T>,
-    ) -> Option<T> {
+    ) -> Option<Option<T>> {
         let position = self.tracked.index_of(entity)?;
         self.spans.swap_remove(position);
-        remove(&mut self.tracked, entity)
+        Some(remove(&mut self.tracked, entity))
     }
 
     fn end_tick(&mut self) {
@@ -469,7 +471,7 @@ impl<T: Ops> Table for OpsTable<T> {
     }
 
     fn remove(&mut self, entity: Entity) -> bool {
-        self.remove(entity).is_some()
+        self.remove_with(entity, Tracked::remove).is_some()
     }
 
     fn despawn_batch(&mut self, entities: &[Entity]) {
@@ -550,6 +552,11 @@ impl<T: Ops> Storage for OpsTable<T> {
 
     fn remove(&mut self, entity: Entity) -> Option<T> {
         self.remove(entity)
+    }
+
+    #[inline]
+    fn hook_log(&mut self) -> &mut HookLog<T> {
+        self.tracked.hook_log()
     }
 
     #[inline]
@@ -803,6 +810,46 @@ mod tests {
         let replication = table.replication().unwrap();
         assert_eq!(replication.wire_id, 7);
         assert_eq!(replication.visibility, Visibility::Owner);
+    }
+
+    #[test]
+    fn ops_hooked_insert() {
+        crate::ecs::init();
+        let mut world = World::new();
+        let removed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let removed = removed.clone();
+            world.on_remove::<Inventory>(
+                move |_: &World, values: &mut Vec<(Entity, Inventory)>| {
+                    removed.borrow_mut().extend(values.drain(..));
+                },
+            );
+        }
+        let (a, b) = (world.spawn(), world.spawn());
+        world
+            .view_mut::<Inventory>()
+            .insert(a, Inventory::default());
+        world
+            .view_mut::<Inventory>()
+            .insert(b, Inventory::default());
+        world.end_tick();
+        world.apply_op::<Inventory>(a, Add { item: 7, slot: 0 });
+
+        // the hook keeps the replaced value, and the entry is sent whole
+        let full = Inventory {
+            items: [(1, 1)].into(),
+        };
+        assert_eq!(world.view_mut::<Inventory>().insert(a, full.clone()), None);
+        assert!(ops(&world, a).is_empty());
+        assert!(world.view::<Inventory>().is_changed(a));
+        world.apply_op::<Inventory>(b, Clear);
+        assert_eq!(world.view_mut::<Inventory>().remove(a), None);
+        assert_eq!(ops(&world, b), [Clear]);
+        world.flush();
+        let added = Inventory {
+            items: [(0, 7)].into(),
+        };
+        assert_eq!(*removed.borrow(), [(a, added), (a, full)]);
     }
 
     #[test]

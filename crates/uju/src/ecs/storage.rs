@@ -15,6 +15,7 @@ pub mod view;
 
 use crate::ecs::component::Component;
 use crate::ecs::entity::Entity;
+use crate::ecs::hook::HookLog;
 use crate::ecs::storage::join::Joinable;
 use crate::ecs::storage::table::Table;
 
@@ -50,11 +51,18 @@ pub trait Storage: Table + Default + 'static {
 
     fn get_mut(&mut self, entity: Entity) -> Option<Self::Mut<'_>>;
 
-    /// Inserts or replaces `entity`'s value, returning the previous one.
+    /// Inserts or replaces `entity`'s value, returning the previous one
+    /// unless the component's `on_remove` hooks keep it.
     fn insert(&mut self, entity: Entity, component: Self::Component) -> Option<Self::Component>;
 
-    /// Removes `entity`'s value, returning it.
+    /// Removes `entity`'s value, returning it unless the component's
+    /// `on_remove` hooks keep it.
     fn remove(&mut self, entity: Entity) -> Option<Self::Component>;
+
+    /// The log the table keeps for the component's
+    /// [hooks](crate::ecs::world::World::on_insert). Every insert and
+    /// removal, received state's included, goes through it.
+    fn hook_log(&mut self) -> &mut HookLog<Self::Component>;
 
     fn join_mut(&mut self) -> Self::JoinMut<'_>;
 }
@@ -168,7 +176,7 @@ mod tests {
         }
 
         fn remove(&mut self, entity: Entity) -> bool {
-            self.set.remove(entity).is_some()
+            Table::remove(&mut self.set, entity)
         }
 
         fn contains(&self, entity: Entity) -> bool {
@@ -206,6 +214,10 @@ mod tests {
 
         fn remove(&mut self, entity: Entity) -> Option<T> {
             self.set.remove(entity)
+        }
+
+        fn hook_log(&mut self) -> &mut HookLog<T> {
+            self.set.hook_log()
         }
 
         fn join_mut(&mut self) -> CountedJoin<'_, T> {

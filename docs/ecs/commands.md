@@ -44,7 +44,8 @@ own, so it is available inside any query's loop or while views are held.
 ## Flush
 
 `world.flush()` applies the queue in the order commands were queued, then
-leaves it empty.
+runs the [component hooks](components.md#hooks) of what changed since the
+last flush, and repeats until nothing is queued and no hook has work left.
 
 - **Deferred means unseen.** A queued change shows only once applied. A
   queued despawn leaves the entity alive and readable until then, and a
@@ -52,12 +53,19 @@ leaves it empty.
 - **Order.** Commands apply in the order they were queued. A despawn
   followed by an insert to the same entity inserts nothing, and an insert
   followed by a despawn drops the inserted value.
-- **Commands queued while flushing**, such as by a closure, apply in the
-  same flush, after every command queued before them. A flush returns once
-  the queue is empty.
+- **Commands queued while flushing**, such as by a closure or a hook,
+  apply in the same flush, after every command queued before them.
+- **Changes without commands** count too. A view's insert or a despawn of
+  a hooked component leaves work for its hooks, so a flush with nothing
+  queued still runs them.
+- **A flush inside a flush**, called from a command's closure or a hook,
+  applies the queue and returns, and leaves the hooks to the flush already
+  running.
 - **Borrows.** A flush borrows the tables its commands touch, so it panics
   inside a query's loop that holds one of them, or while a view of one is
-  held. An empty queue costs one check.
+  held. Running hooks borrows each hooked table with work once. With
+  nothing queued and nothing logged for a hook, a flush costs a few
+  checks.
 - **When.** A [schedule](schedule.md#flush) applies the queue after every
   system it runs. Code outside a schedule calls `flush` once its borrows
   are dropped.

@@ -22,8 +22,8 @@ impl Stage {
 
 /// Systems in stages, each stage in order of registration.
 ///
-/// A stage applies the [command queue](World::commands) when it starts and
-/// after every system it runs.
+/// A stage [flushes](World::flush) the world when it starts and after every
+/// system it runs: it applies the command queue and runs component hooks.
 pub struct Schedule {
     stages: [Vec<Node>; Stage::ALL.len()],
 }
@@ -48,8 +48,8 @@ impl Schedule {
         self
     }
 
-    /// Applies the command queue, then runs the systems of `stage` in order,
-    /// each whose conditions hold, applying the queue after each.
+    /// Flushes the world, then runs the systems of `stage` in order, each
+    /// whose conditions hold, flushing after each.
     ///
     /// A panic in a system or a flush is not caught.
     pub fn run_stage(&mut self, stage: Stage, world: &World) {

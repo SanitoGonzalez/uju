@@ -1,7 +1,8 @@
 # Components
 
 How a type becomes a component or a unique of a `World`, how its values
-are stored, and how components are inserted together. Entities are in [Entities](entities.md), iterating several
+are stored, how components are inserted together, and the hooks that run
+when they are inserted and removed. Entities are in [Entities](entities.md), iterating several
 components together in [Queries](queries.md), and audience keys, which are
 not components, in [Audiences](audiences.md).
 
@@ -99,8 +100,9 @@ tick and [replicate](change-tracking.md#the-table-interface), and
 | `entities()` | The entities holding a value, in dense order |
 | `get(entity)` | `Option<&C>` |
 | `get_mut(entity)` | `Option<Mut<'_>>` |
-| `insert(entity, value)` | Inserts or replaces, returning the previous value |
-| `remove(entity)` | Removes, returning the value |
+| `insert(entity, value)` | Inserts or replaces, returning the previous value unless [`on_remove` hooks](#hooks) keep it |
+| `remove(entity)` | Removes, returning the value unless `on_remove` hooks keep it |
+| `hook_log()` | The [`HookLog`](#the-hook-log) every insert and removal goes through |
 | `join_mut()` | The `JoinMut` |
 
 `JoinMut` implements `Joinable`, an `unsafe` trait. Its `entities()` must
@@ -163,15 +165,15 @@ plus their [changes](change-tracking.md#tracked-tables). An `OpsTable` adds
 
 | Method | Does |
 |---|---|
-| `insert(entity, value)` | Inserts or replaces, returning the previous value |
-| `remove(entity)` | Removes, returning the value |
+| `insert(entity, value)` | Inserts or replaces, returning the previous value unless [`on_remove` hooks](#hooks) keep it |
+| `remove(entity)` | Removes, returning the value unless `on_remove` hooks keep it |
 | `get(entity)`, `get_mut(entity)` | The value, or `None` |
 | `contains(entity)` | Whether the entity holds a value |
 | `len()`, `is_empty()` | The number of values |
 | `entities()` | The entities, in dense order |
 | `iter()`, `iter_mut()` | `(Entity, &C)` or `(Entity, &mut C)`, in dense order |
 | `components()`, `components_mut()` | The values alone, in dense order |
-| `clear()` | Removes every value |
+| `clear()` | Removes every value, handing them to `on_remove` hooks |
 
 - **Dynamic borrows.** Each table sits in its own `RefCell`. Views of
   different components coexist, and checking out a view that conflicts with
@@ -256,3 +258,102 @@ struct Collider(Shape);
 - **Cost.** A component with no requirements costs nothing on the insert
   path. Each requirement borrows its table once per entity.
 
+## Hooks
+
+A hook runs for one component whenever an entity gains or loses it,
+whatever the cause. Hooks free what a component holds outside the
+`World`, such as a body in a physics world, and build what a replica needs
+beside its schema components.
+
+```rust
+world
+    .on_insert::<Collider>(|world: &World, added: &[Entity]| {
+        let mut physics = world.unique_mut::<Physics>();
+        let colliders = world.view::<Collider>();
+        for &e in added {
+            let body = physics.add(&colliders.get(e).unwrap().shape);
+            world.commands().insert(e, Body(body));
+        }
+    })
+    .on_remove::<Body>(|world: &World, removed: &mut Vec<(Entity, Body)>| {
+        let mut physics = world.unique_mut::<Physics>();
+        for (_, body) in removed.drain(..) {
+            physics.remove(body.0);
+        }
+    });
+```
+
+| Method | Runs the hook with |
+|---|---|
+| `world.on_insert::<C>(hook)` | `&[Entity]`: the entities that gained a `C` since the last flush |
+| `world.on_remove::<C>(hook)` | `&mut Vec<(Entity, C)>`: the values of `C` removed since the last flush, with their entities |
+
+- **Any cause.** A view's `insert` and `remove`, a command, a bundle, a
+  required component, a despawn, and the state the runtime receives for a
+  replica, its entering and leaving included, all count. Hooks run for
+  replicas as for owned entities.
+- **Deferred to the flush.** A hook takes the `World`, so it cannot run
+  inside the change, while a view or a query holds the table. The table
+  logs instead, and the next [flush](commands.md#flush) runs the hooks.
+- **Batches.** A hook gets every entity of the flush at once, in the order
+  of the changes.
+- **`on_insert` skips the lost.** An entity that lost `C` again before the
+  flush, or was despawned, is skipped, and an entity comes at most once.
+- **`on_remove` gets every value.** Each removed value is handed over,
+  even one added since the last flush. A despawned entity's values come
+  too, with the entity already dead. Removals come in the order they were
+  made.
+- **Replacing is a removal then an insert.** An insert over a value hands
+  the old value to `on_remove` and the entity to `on_insert`. Received
+  state that changes a replica's value is a write, not an insert, and runs
+  no hook. Inserting a [tag](change-tracking.md#tags) the entity holds
+  changes nothing and runs no hook either.
+- **The table keeps the values.** A component with an `on_remove` hook
+  keeps its removed values until the flush, so its `remove` and `insert`
+  return `None` where they would hand a value back. A component without
+  one keeps nothing.
+- **Several hooks** on one component run in the order they were
+  registered. An `on_remove` hook may take values out of the `Vec`. The
+  next hook gets what is left, and the rest is dropped after the last.
+- **Not retroactive.** A hook sees only the changes made after it is
+  registered.
+- **Registration** takes `&mut World`, so hooks are registered while
+  building the world, not from a system. Each returns the `World`, so
+  calls chain. A hook is any `FnMut + 'static`, and may hold state.
+
+### Hooks in a flush
+
+A flush applies the command queue, then runs the hooks, and repeats until
+nothing is queued and no hook has work left.
+
+1. Every hooked table hands over its log.
+2. Every `on_remove` hook runs, then every `on_insert` hook. Between
+   components, hooks run in order of [component id](#component-and-unique).
+3. What the hooks changed, directly or through commands, is applied and
+   logged for the next round.
+
+- **Hooks change the world.** A hook can insert, remove, despawn and queue
+  [commands](commands.md), and the same flush applies them and runs the
+  hooks they call for. A hook that always changes what calls it again
+  never lets the flush return.
+- **A flush inside a hook**, or inside a command's closure, applies the
+  queue and returns. The flush already running runs the hooks.
+- **Borrows.** The hooks of a round borrow each hooked table once to take
+  its log, and a hook's own borrows are its own. A flush panics if a
+  hooked table with work is borrowed at the time.
+
+### The hook log
+
+Each storage keeps a `HookLog`, which a table built on a `SparseSet` holds
+inside the set. It holds nothing until a hook is registered on the
+component, and then only what the hooks need: the entities inserted, for
+`on_insert` hooks, and the values removed, for `on_remove` ones.
+
+- **Cost.** A component without hooks pays one check per insert and per
+  removal, and keeps nothing. A flush with nothing queued and nothing
+  logged costs a few checks.
+- **Hand-written storages** return their log from `Storage::hook_log`. One
+  built on a `SparseSet` returns the set's. Another calls the log's
+  `inserted(entity)`, `removed(entity, value)` and
+  `replaced(entity, previous)` on each change, and hands back what they
+  return.

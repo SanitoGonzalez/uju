@@ -1,7 +1,8 @@
 # Schedule
 
 How a `World`'s systems run: stages, their order, run conditions, sets, and
-when [commands](commands.md) are applied. A `Schedule` runs on the
+when [commands](commands.md) are applied and
+[component hooks](components.md#hooks) run. A `Schedule` runs on the
 `World`'s thread, one system at a time.
 
 ```rust
@@ -115,13 +116,17 @@ takes a set or a single system.
 
 ## Flush
 
-The schedule applies the [command queue](commands.md#flush) for its systems:
+The schedule [flushes](commands.md#flush) for its systems: it applies the
+command queue and runs the [component hooks](components.md#hooks).
 
 - **After every system** that runs, so the next system sees what it
-  queued. A system's queries and views are dropped by then. An empty queue
-  costs one check.
+  queued, and the hooks of what it changed have run. A system's queries
+  and views are dropped by then. A flush with nothing to do costs a few
+  checks.
 - **When a stage starts**, so commands queued outside any system, such as
-  by the runtime before `Update`, show to the stage's first system.
+  by the runtime before `Update`, show to the stage's first system, and the
+  hooks of what was changed outside it, such as replicas the runtime
+  received, have run.
 
 So commands are applied on both sides of `Inbox`: its systems see what
 `Update` spawned and despawned, and what they defer is applied before

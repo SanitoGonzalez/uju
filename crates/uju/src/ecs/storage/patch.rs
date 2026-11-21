@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 
 use crate::ecs::component::{Patch, Replication};
 use crate::ecs::entity::{Entity, Uid};
+use crate::ecs::hook::HookLog;
 use crate::ecs::storage::{
     Storage, Tracking,
     bits::Marker,
@@ -91,13 +92,14 @@ impl<T: Patch> PatchTable<T> {
         self.tracked.components()
     }
 
-    /// Inserts or replaces `entity`'s value, returning the previous one. A
-    /// replaced value has every field marked, and a new one is added.
+    /// Inserts or replaces `entity`'s value, returning the previous one
+    /// unless an `on_remove` hook keeps it. A replaced value has every field
+    /// marked, and a new one is added.
     pub fn insert(&mut self, entity: Entity, component: T) -> Option<T> {
-        let previous = self.tracked.insert(entity, component);
-        match previous {
-            None => self.masks.resize(self.len() * Self::MASK, 0),
-            Some(_) => {
+        let (replaced, previous) = self.tracked.insert_replacing(entity, component);
+        match replaced {
+            false => self.masks.resize(self.len() * Self::MASK, 0),
+            true => {
                 let position = self.tracked.index_of(entity).unwrap();
                 for (index, byte) in self.mask_at_mut(position).iter_mut().enumerate() {
                     *byte = full::<T>(index);
@@ -109,7 +111,7 @@ impl<T: Patch> PatchTable<T> {
 
     /// See [`Tracked::remove`].
     pub fn remove(&mut self, entity: Entity) -> Option<T> {
-        self.remove_with(entity, Tracked::remove)
+        self.remove_with(entity, Tracked::remove).flatten()
     }
 
     #[inline]
@@ -158,12 +160,13 @@ impl<T: Patch> PatchTable<T> {
     }
 
     /// Removes `entity`'s value with `remove`, and moves the last entry's
-    /// mask into the hole, as the value moves.
+    /// mask into the hole, as the value moves. `None` when `entity` holds
+    /// no value, else what `remove` returned.
     fn remove_with(
         &mut self,
         entity: Entity,
         remove: fn(&mut Tracked<T>, Entity) -> Option<T>,
-    ) -> Option<T> {
+    ) -> Option<Option<T>> {
         let position = self.tracked.index_of(entity)?;
         let last = self.len() - 1;
         let value = remove(&mut self.tracked, entity);
@@ -172,7 +175,7 @@ impl<T: Patch> PatchTable<T> {
             position * Self::MASK,
         );
         self.masks.truncate(last * Self::MASK);
-        value
+        Some(value)
     }
 
     fn end_tick(&mut self) {
@@ -373,7 +376,7 @@ impl<T: Patch> Table for PatchTable<T> {
     }
 
     fn remove(&mut self, entity: Entity) -> bool {
-        self.remove(entity).is_some()
+        self.remove_with(entity, Tracked::remove).is_some()
     }
 
     fn despawn_batch(&mut self, entities: &[Entity]) {
@@ -454,6 +457,11 @@ impl<T: Patch> Storage for PatchTable<T> {
 
     fn remove(&mut self, entity: Entity) -> Option<T> {
         self.remove(entity)
+    }
+
+    #[inline]
+    fn hook_log(&mut self) -> &mut HookLog<T> {
+        self.tracked.hook_log()
     }
 
     #[inline]
@@ -980,6 +988,32 @@ mod tests {
         assert_eq!(section[3..7], (8 + 1 + size as u32).to_le_bytes());
         assert_eq!(section[15], size as u8);
         assert_eq!(section[16..], full[..size]);
+    }
+
+    #[test]
+    fn patch_hooked_insert() {
+        crate::ecs::init();
+        let mut world = World::new();
+        let removed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let removed = removed.clone();
+            world.on_remove::<Stats>(move |_: &World, values: &mut Vec<(Entity, Stats)>| {
+                removed.borrow_mut().extend(values.drain(..));
+            });
+        }
+        let (a, b) = (world.spawn(), world.spawn());
+        world.view_mut::<Stats>().insert(a, sample(1));
+        world.view_mut::<Stats>().insert(b, sample(2));
+        world.end_tick();
+
+        // the hook keeps the replaced value, and the entry is still marked
+        assert_eq!(world.view_mut::<Stats>().insert(a, sample(3)), None);
+        assert_eq!(mask::<Stats>(&world, a), [0b11111]);
+        assert!(!world.view::<Stats>().is_added(a));
+        assert_eq!(world.view_mut::<Stats>().remove(a), None);
+        assert_eq!(mask::<Stats>(&world, b), [0]);
+        world.flush();
+        assert_eq!(*removed.borrow(), [(a, sample(1)), (a, sample(3))]);
     }
 
     #[test]

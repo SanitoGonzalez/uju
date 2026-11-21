@@ -2,6 +2,7 @@ use std::any::Any;
 
 use crate::ecs::component::Component;
 use crate::ecs::entity::Entity;
+use crate::ecs::hook::HookLog;
 use crate::ecs::storage::{
     Storage,
     join::{Entities, Joinable},
@@ -13,6 +14,7 @@ pub struct SparseSet<T> {
     sparse: SparseArray<1024>,
     dense: Vec<Entity>,
     data: Vec<T>,
+    hooks: HookLog<T>,
 }
 
 impl<T> SparseSet<T> {
@@ -21,13 +23,16 @@ impl<T> SparseSet<T> {
             sparse: SparseArray::new(),
             dense: Vec::new(),
             data: Vec::new(),
+            hooks: HookLog::new(),
         }
     }
 
+    /// Removes every value. An `on_remove` hook gets them all.
     pub fn clear(&mut self) {
         self.sparse.clear();
-        self.dense.clear();
-        self.data.clear();
+        for (entity, value) in self.dense.drain(..).zip(self.data.drain(..)) {
+            self.hooks.removed(entity, value);
+        }
     }
 
     #[inline]
@@ -40,7 +45,31 @@ impl<T> SparseSet<T> {
         self.dense.is_empty()
     }
 
+    /// Inserts or replaces `entity`'s value, returning the previous one
+    /// unless an `on_remove` hook keeps it.
+    #[inline]
     pub fn insert(&mut self, entity: Entity, component: T) -> Option<T> {
+        let previous = self.insert_unhooked(entity, component);
+        self.hooks.replaced(entity, previous)
+    }
+
+    /// Removes `entity`'s value, returning it unless an `on_remove` hook
+    /// keeps it.
+    #[inline]
+    pub fn remove(&mut self, entity: Entity) -> Option<T> {
+        let value = self.remove_unhooked(entity)?;
+        self.hooks.removed(entity, value)
+    }
+
+    /// The log kept for the component's hooks.
+    #[inline]
+    pub fn hook_log(&mut self) -> &mut HookLog<T> {
+        &mut self.hooks
+    }
+
+    /// Inserts or replaces a value, logging nothing for the hooks.
+    #[inline]
+    pub(crate) fn insert_unhooked(&mut self, entity: Entity, component: T) -> Option<T> {
         match self.sparse.get(entity.index_sparse()) {
             Some(index) => {
                 self.dense[index] = entity;
@@ -55,7 +84,8 @@ impl<T> SparseSet<T> {
         }
     }
 
-    pub fn remove(&mut self, entity: Entity) -> Option<T> {
+    /// Removes a value, logging nothing for the hooks.
+    pub(crate) fn remove_unhooked(&mut self, entity: Entity) -> Option<T> {
         let index = self.index_of(entity)?;
 
         self.sparse.remove(entity.index_sparse());
@@ -194,7 +224,11 @@ impl<T: Component> Table for SparseSet<T> {
     }
 
     fn remove(&mut self, entity: Entity) -> bool {
-        self.remove(entity).is_some()
+        let Some(value) = self.remove_unhooked(entity) else {
+            return false;
+        };
+        self.hooks.removed(entity, value);
+        true
     }
 
     #[inline]
@@ -233,6 +267,11 @@ impl<T: Component> Storage for SparseSet<T> {
 
     fn remove(&mut self, entity: Entity) -> Option<T> {
         self.remove(entity)
+    }
+
+    #[inline]
+    fn hook_log(&mut self) -> &mut HookLog<T> {
+        &mut self.hooks
     }
 
     #[inline]

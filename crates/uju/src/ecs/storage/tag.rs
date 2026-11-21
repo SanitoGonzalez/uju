@@ -2,6 +2,7 @@ use std::any::Any;
 
 use crate::ecs::component::{Replicated, Replication};
 use crate::ecs::entity::{Entity, Uid};
+use crate::ecs::hook::HookLog;
 use crate::ecs::storage::{
     Storage, Tracking,
     section::{self, REMOVED, VALUES},
@@ -156,7 +157,7 @@ impl<T: Replicated + Default> Table for TagTable<T> {
     }
 
     fn remove(&mut self, entity: Entity) -> bool {
-        self.remove(entity).is_some()
+        Table::remove(&mut self.0, entity)
     }
 
     fn despawn_batch(&mut self, entities: &[Entity]) {
@@ -235,6 +236,11 @@ impl<T: Replicated + Default> Storage for TagTable<T> {
 
     fn remove(&mut self, entity: Entity) -> Option<T> {
         self.remove(entity)
+    }
+
+    #[inline]
+    fn hook_log(&mut self) -> &mut HookLog<T> {
+        self.0.hook_log()
     }
 
     #[inline]

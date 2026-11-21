@@ -26,7 +26,8 @@ pub trait Table {
     }
 
     /// Drops the values of despawned entities. Unlike a removal, a despawn
-    /// is not logged, since the frame's `gone` covers it.
+    /// is not in the remove log, since the frame's `gone` covers it. The
+    /// component's `on_remove` hooks still get the values.
     fn despawn_batch(&mut self, entities: &[Entity]) {
         self.remove_batch(entities);
     }
@@ -74,7 +75,8 @@ pub trait Table {
     /// entity it lands on, or to `None` to skip the item.
     ///
     /// Received state is not a change of this world: it marks no bit and
-    /// logs nothing.
+    /// logs nothing in the tick's changes. The component's hooks still see
+    /// the values gained and removed, but not a value overwritten.
     fn apply_section(
         &mut self,
         _buf: &[u8],

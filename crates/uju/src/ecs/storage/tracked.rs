@@ -3,6 +3,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::ecs::component::Component;
 use crate::ecs::entity::Entity;
+use crate::ecs::hook::HookLog;
 use crate::ecs::storage::{
     Storage, Tracking,
     bits::{Bits, Marker},
@@ -83,26 +84,31 @@ impl<T> Tracked<T> {
         self.set.components()
     }
 
-    /// Inserts or replaces `entity`'s value, returning the previous one. A
-    /// replaced value is marked dirty, and a new one added and dirty.
+    /// Inserts or replaces `entity`'s value, returning the previous one
+    /// unless an `on_remove` hook keeps it. A replaced value is marked
+    /// dirty, and a new one added and dirty.
     pub fn insert(&mut self, entity: Entity, component: T) -> Option<T> {
-        let previous = self.insert_untracked(entity, component);
-        let position = self.set.index_of(entity).unwrap();
-        self.dirty.set(position);
-        if previous.is_none() {
-            self.added.set(position);
-        }
-        previous
+        self.insert_replacing(entity, component).1
     }
 
-    /// Removes `entity`'s value, returning it. Logs the removal, unless the
-    /// value was added this tick.
+    /// [`insert`](Self::insert), also returning whether it replaced a
+    /// value, which the value returned does not tell when a hook keeps it.
+    pub(crate) fn insert_replacing(&mut self, entity: Entity, component: T) -> (bool, Option<T>) {
+        let previous = self.put(entity, component);
+        let position = self.set.index_of(entity).unwrap();
+        self.dirty.set(position);
+        let replaced = previous.is_some();
+        if !replaced {
+            self.added.set(position);
+        }
+        (replaced, self.set.hook_log().replaced(entity, previous))
+    }
+
+    /// Removes `entity`'s value, returning it unless an `on_remove` hook
+    /// keeps it. Logs the removal, unless the value was added this tick.
     pub fn remove(&mut self, entity: Entity) -> Option<T> {
         let position = self.set.index_of(entity)?;
-        if !self.added.get(position) {
-            self.removed.push(entity);
-        }
-        self.remove_at(entity, position)
+        self.remove_at(entity, position, true)
     }
 
     /// Whether `entity`'s value was added or marked dirty this tick.
@@ -134,7 +140,8 @@ impl<T> Tracked<T> {
         self.dirty.ones().map(|position| entities[position])
     }
 
-    /// Removes every value, and the tick's changes with them.
+    /// Removes every value, and the tick's changes with them. An
+    /// `on_remove` hook gets the values.
     pub fn clear(&mut self) {
         self.set.clear();
         self.dirty = Bits::default();
@@ -178,26 +185,46 @@ impl<T> Tracked<T> {
         self.set.get_mut(entity)
     }
 
+    /// The log kept for the component's hooks.
+    #[inline]
+    pub fn hook_log(&mut self) -> &mut HookLog<T> {
+        self.set.hook_log()
+    }
+
     /// Inserts or replaces a value without marking it, for state received
-    /// from another world.
+    /// from another world. A replaced value is overwritten, so only a new
+    /// one is logged for the hooks.
     pub(crate) fn insert_untracked(&mut self, entity: Entity, component: T) -> Option<T> {
-        let previous = self.set.insert(entity, component);
+        let previous = self.put(entity, component);
+        if previous.is_none() {
+            self.set.hook_log().inserted(entity);
+        }
+        previous
+    }
+
+    /// Removes a value without logging it in the tick's changes. An
+    /// `on_remove` hook still gets it.
+    pub(crate) fn remove_untracked(&mut self, entity: Entity) -> Option<T> {
+        let position = self.set.index_of(entity)?;
+        self.remove_at(entity, position, false)
+    }
+
+    fn put(&mut self, entity: Entity, component: T) -> Option<T> {
+        let previous = self.set.insert_unhooked(entity, component);
         self.dirty.cover(self.set.len());
         self.added.cover(self.set.len());
         previous
     }
 
-    /// Removes a value without logging it.
-    pub(crate) fn remove_untracked(&mut self, entity: Entity) -> Option<T> {
-        let position = self.set.index_of(entity)?;
-        self.remove_at(entity, position)
-    }
-
-    fn remove_at(&mut self, entity: Entity, position: usize) -> Option<T> {
+    fn remove_at(&mut self, entity: Entity, position: usize, tracked: bool) -> Option<T> {
+        if tracked && !self.added.get(position) {
+            self.removed.push(entity);
+        }
         let last = self.set.len() - 1;
         self.dirty.swap_remove(position, last);
         self.added.swap_remove(position, last);
-        self.set.remove(entity)
+        let value = self.set.remove_unhooked(entity)?;
+        self.set.hook_log().removed(entity, value)
     }
 
     pub(crate) fn end_tick(&mut self) {
@@ -292,7 +319,11 @@ impl<T: Component> Table for Tracked<T> {
     }
 
     fn remove(&mut self, entity: Entity) -> bool {
-        self.remove(entity).is_some()
+        let Some(position) = self.set.index_of(entity) else {
+            return false;
+        };
+        self.remove_at(entity, position, true);
+        true
     }
 
     fn despawn_batch(&mut self, entities: &[Entity]) {
@@ -341,6 +372,11 @@ impl<T: Component> Storage for Tracked<T> {
 
     fn remove(&mut self, entity: Entity) -> Option<T> {
         self.remove(entity)
+    }
+
+    #[inline]
+    fn hook_log(&mut self) -> &mut HookLog<T> {
+        self.hook_log()
     }
 
     #[inline]
