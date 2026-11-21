@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
+use std::fmt;
 
 use crate::ecs::{
     audience::{self, Audience},
@@ -11,6 +12,7 @@ use crate::ecs::{
     event::{self, Event, Queue},
     hook::{ComponentHooks, Hooks, Pending},
     message::{self, EntityMessage, InboxDrain, Mailbox},
+    name::Name,
     storage::{
         Storage, Tracking,
         audience::{AudienceTable, KeyTable},
@@ -326,6 +328,30 @@ impl World {
         self.entities.is_replica(entity)
     }
 
+    /// Formats `entity` for debugging: its uid, cell and replica flag on
+    /// the first line, then one line per component it holds, its
+    /// [`Name`] first, then one per audience key. Components show through
+    /// [`Component::inspect`], audience keys through `Debug`. A dead entity
+    /// shows as `dead`.
+    ///
+    /// ```text
+    /// 3v1: uid 7:0, cell 12, owned
+    ///   Name("orc")
+    ///   Hp(10)
+    ///   audience Faction: 2
+    /// ```
+    ///
+    /// The value reads the world when formatted, borrowing one table at a
+    /// time. A table borrowed mutably at that point, such as by the query
+    /// being iterated, shows as `Hp: borrowed`, whether the entity holds a
+    /// value or not.
+    pub fn inspect(&self, entity: Entity) -> Inspect<'_> {
+        Inspect {
+            world: self,
+            entity,
+        }
+    }
+
     /// The owned entities despawned this tick that had a uid and a cell at
     /// the start of it, in despawn order.
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the encoder"))]
@@ -603,6 +629,75 @@ impl Default for World {
     }
 }
 
+/// [`World::inspect`]'s output, which reads the world when it is formatted.
+#[derive(Clone, Copy)]
+pub struct Inspect<'w> {
+    world: &'w World,
+    entity: Entity,
+}
+
+impl fmt::Display for Inspect<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { world, entity } = *self;
+        write!(f, "{entity}: ")?;
+        if !world.is_alive(entity) {
+            return f.write_str("dead");
+        }
+        match world.uid(entity) {
+            Some(uid) => write!(f, "uid {uid}")?,
+            None => f.write_str("uid none")?,
+        }
+        match world.cell(entity) {
+            Some(cell) => write!(f, ", cell {cell}")?,
+            None => f.write_str(", cell none")?,
+        }
+        f.write_str(if world.is_replica(entity) {
+            ", replica"
+        } else {
+            ", owned"
+        })?;
+
+        let names = component::registrations();
+        let first = Name::id() as usize;
+        let ids = std::iter::once(first).chain((0..world.tables.len()).filter(|&id| id != first));
+        for id in ids {
+            match world.tables[id].try_borrow() {
+                Ok(table) if table.contains(entity) => {
+                    f.write_str("\n  ")?;
+                    table.inspect(entity, f)?;
+                }
+                Ok(_) => {}
+                Err(_) => write!(f, "\n  {}: borrowed", short_name(names[id].name))?,
+            }
+        }
+
+        let names = audience::registrations();
+        for (table, registration) in world.audiences.iter().zip(names) {
+            let name = short_name(registration.name);
+            match table.try_borrow() {
+                Ok(table) if table.has_key(entity) => {
+                    write!(f, "\n  audience {name}: ")?;
+                    table.inspect(entity, f)?;
+                }
+                Ok(_) => {}
+                Err(_) => write!(f, "\n  audience {name}: borrowed")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Inspect<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// A registered name without its module path.
+fn short_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
 /// Clears the world's flushing flag when the flush ends, or unwinds.
 struct Flushing<'w>(&'w std::cell::Cell<bool>);
 
@@ -792,6 +887,45 @@ mod tests {
         assert!(world.despawns().is_empty());
         world.despawn(entities[3]);
         assert_eq!(*world.despawns(), [logged(uids[3], a)]);
+    }
+
+    #[test]
+    fn world_inspect() {
+        crate::ecs::init();
+        let world = World::new();
+        let entity = world.spawn();
+        world
+            .view_mut::<Shared>()
+            .insert(entity, Shared(Rc::new(1)));
+        world.view_mut::<Beta>().insert(entity, Beta(-2));
+        world.view_mut::<Alpha>().insert(entity, Alpha(1));
+        world.view_mut::<Name>().insert(entity, Name::new("orc"));
+
+        // the name first, then by component id, and the type's name alone
+        // without `Debug`
+        assert_eq!(
+            world.inspect(entity).to_string(),
+            format!(
+                "{entity}: uid none, cell none, owned\n  \
+                 Name(\"orc\")\n  Alpha(1)\n  Beta(-2)\n  Shared {{ .. }}"
+            )
+        );
+
+        // a table borrowed mutably cannot be read
+        let replica = world
+            .adopt(Uid::new(NonZeroU32::new(9).unwrap(), 4))
+            .unwrap();
+        world.entities().set_replica(replica, true);
+        world.entities().set_cell(replica, Cell::new(12));
+        let beta = world.view_mut::<Beta>();
+        assert_eq!(
+            format!("{:?}", world.inspect(replica)),
+            format!("{replica}: uid 9:4, cell 12, replica\n  Beta: borrowed")
+        );
+        drop(beta);
+
+        world.despawn(entity);
+        assert_eq!(world.inspect(entity).to_string(), format!("{entity}: dead"));
     }
 
     #[test]

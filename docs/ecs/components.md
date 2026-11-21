@@ -1,10 +1,11 @@
 # Components
 
 How a type becomes a component or a unique of a `World`, how its values
-are stored, how components are inserted together, and the hooks that run
-when they are inserted and removed. Entities are in [Entities](entities.md), iterating several
-components together in [Queries](queries.md), and audience keys, which are
-not components, in [Audiences](audiences.md).
+are stored, how components are inserted together, the hooks that run when
+they are inserted and removed, and the [`Name`](#name) component. Entities
+are in [Entities](entities.md), iterating several components together in
+[Queries](queries.md), and audience keys, which are not components, in
+[Audiences](audiences.md).
 
 ## Component and Unique
 
@@ -28,6 +29,11 @@ struct Time { ticks: u64 }
   a `World` is built on its shard's thread and never leaves it, so a
   component or a unique can hold an `Rc` or another handle that is not
   `Send`.
+- **`Debug` is optional.** [`world.inspect`](entities.md#inspecting) shows
+  a component through `Component::inspect`. The derive uses the type's
+  `Debug` when it implements it, and its name, as `Handle { .. }`, when it
+  does not. A hand-written `impl` shows the name unless it overrides
+  `inspect`.
 
 ## Access
 
@@ -88,8 +94,9 @@ paged sparse array.
 
 A storage implements `Storage`, plus `Table`, the untyped interface the
 `World` and the runtime use to drop a despawned entity's values, end the
-tick and [replicate](change-tracking.md#the-table-interface), and
-`Default`, which builds the empty table.
+tick, [replicate](change-tracking.md#the-table-interface) and format a
+value for [`world.inspect`](entities.md#inspecting), and `Default`, which
+builds the empty table.
 
 | Item | Meaning |
 |---|---|
@@ -357,3 +364,20 @@ component, and then only what the hooks need: the entities inserted, for
   `inserted(entity)`, `removed(entity, value)` and
   `replaced(entity, previous)` on each change, and hands back what they
   return.
+
+## Name
+
+`Name` is a component of `uju::ecs`, in the prelude, holding a `String`
+for debugging. [`world.inspect`](entities.md#inspecting) shows it first.
+
+```rust
+let orc = world.spawn_with(Name::new("orc"));
+assert_eq!(world.view::<Name>().get(orc).unwrap().as_str(), "orc");
+```
+
+- **Local.** It is not in the schema and never travels. A replica has no
+  name unless its `World` gives it one, and stays writable as any
+  component outside the schema.
+- **Storage.** A `SparseSet<Name>`.
+- **API.** `Name::new(impl Into<String>)`, `as_str()`, the public field
+  `.0`, and `Display`, which writes the string.

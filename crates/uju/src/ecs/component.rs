@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::fmt;
 use std::sync::Once;
 
 use linkme::distributed_slice;
@@ -29,6 +30,53 @@ pub trait Component: 'static {
     /// entity does not hold yet.
     #[inline]
     fn required(_: &mut Required<'_>) {}
+
+    /// Formats the value for [`World::inspect`]. `#[derive(Component)]`
+    /// uses the type's `Debug` when it implements it. Without one, and by
+    /// default, it writes the type's name, as `Handle { .. }`.
+    fn inspect(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        inspect::type_name::<Self>(f)
+    }
+}
+
+/// What `#[derive(Component)]` expands [`Component::inspect`] to:
+/// `(&&Value(self)).inspect(f)` picks [`ViaDebug`](inspect::ViaDebug) when
+/// the type implements `Debug`, since method lookup tries `&&Value` before
+/// `&Value`, and [`ViaName`](inspect::ViaName) otherwise. It works only on
+/// a concrete type, which a derived component is.
+#[doc(hidden)]
+pub mod inspect {
+    use std::fmt;
+
+    pub struct Value<'a, T: ?Sized>(pub &'a T);
+
+    pub trait ViaDebug {
+        fn inspect(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+    }
+
+    impl<T: fmt::Debug + ?Sized> ViaDebug for &Value<'_, T> {
+        fn inspect(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Debug::fmt(self.0, f)
+        }
+    }
+
+    pub trait ViaName {
+        fn inspect(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+    }
+
+    impl<T: ?Sized> ViaName for Value<'_, T> {
+        fn inspect(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            type_name::<T>(f)
+        }
+    }
+
+    /// Writes `T`'s name without its path, as `Handle { .. }`.
+    pub fn type_name<T: ?Sized>(f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = std::any::type_name::<T>();
+        let (path, args) = name.split_at(name.find('<').unwrap_or(name.len()));
+        let short = path.rsplit("::").next().unwrap_or(path);
+        write!(f, "{short}{args} {{ .. }}")
+    }
 }
 
 /// The entity a bundle was inserted on, which [`Component::required`] adds

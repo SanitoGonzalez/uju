@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::fmt;
 use std::ops::{Deref, DerefMut};
 
 use crate::ecs::component::Component;
@@ -9,7 +10,7 @@ use crate::ecs::storage::{
     bits::{Bits, Marker},
     join::{Entities, Joinable},
     sparse_set::SparseSet,
-    table::Table,
+    table::{self, Table},
 };
 
 /// A dense table that tracks the tick's changes: a dirty bit and an added
@@ -339,6 +340,10 @@ impl<T: Component> Table for Tracked<T> {
 
     fn clear(&mut self) {
         self.clear();
+    }
+
+    fn inspect(&self, entity: Entity, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        table::inspect(self, entity, f)
     }
 
     fn end_tick(&mut self) {

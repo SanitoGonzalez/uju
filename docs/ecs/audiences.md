@@ -13,7 +13,7 @@ An audience is a marker type implementing `Audience`, one per
 
 ```rust
 pub trait Audience: 'static {
-    type Key: Copy + Eq + Hash + 'static;
+    type Key: Copy + Eq + Hash + Debug + 'static;
     const WIRE_ID: u16;
     const KEY_SIZE: usize;
 
@@ -25,7 +25,7 @@ pub trait Audience: 'static {
 
 | Item | Meaning |
 |---|---|
-| `Key` | The key type. Fixed-size, with no floats |
+| `Key` | The key type. Fixed-size, with no floats. `Debug` shows it in [`world.inspect`](entities.md#inspecting) |
 | `WIRE_ID` | The [audience id](../protocol/wire-format.md#audience-ids) |
 | `KEY_SIZE` | The size of every key's encoding |
 | `id()` | The index of its table in a `World` |

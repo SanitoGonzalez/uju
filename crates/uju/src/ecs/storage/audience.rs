@@ -1,5 +1,6 @@
 use std::any::{Any, type_name};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use crate::ecs::audience::Audience;
 use crate::ecs::entity::{Entity, Uid};
@@ -31,6 +32,14 @@ pub trait KeyTable {
     /// The entities whose key was cleared this tick, in order. Some may be
     /// dead, or hold a key again.
     fn cleared(&self) -> &[Entity];
+
+    /// Whether `entity` holds a key.
+    fn has_key(&self, entity: Entity) -> bool;
+
+    /// Formats `entity`'s key with `Debug`, for
+    /// [`World::inspect`](crate::ecs::world::World::inspect). Writes nothing
+    /// when it holds none.
+    fn inspect(&self, entity: Entity, f: &mut fmt::Formatter<'_>) -> fmt::Result;
 
     /// Appends the encoding of `entity`'s key, and returns whether it holds
     /// one.
@@ -382,6 +391,17 @@ impl<A: Audience> KeyTable for AudienceTable<A> {
         self.keys.removed()
     }
 
+    fn has_key(&self, entity: Entity) -> bool {
+        self.keys.contains(entity)
+    }
+
+    fn inspect(&self, entity: Entity, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.keys.get(entity) {
+            Some(key) => fmt::Debug::fmt(key, f),
+            None => Ok(()),
+        }
+    }
+
     fn encode_key(&self, entity: Entity, out: &mut Vec<u8>) -> Result<bool, EncodeError> {
         let Some(key) = self.key(entity) else {
             return Ok(false);
@@ -516,6 +536,30 @@ mod tests {
             .borrow()
             .cleared()
             .to_vec()
+    }
+
+    #[test]
+    fn audience_keys_inspected() {
+        crate::ecs::init();
+        let world = World::new();
+        let e = world.spawn();
+        world.set_audience_key::<Faction>(e, Some(2));
+        world.set_audience_key::<Stealth>(e, Some(7));
+        assert_eq!(
+            world.inspect(e).to_string(),
+            format!(
+                "{e}: uid none, cell none, owned\n  \
+                 audience Faction: 2\n  audience Stealth: 7"
+            )
+        );
+
+        world.set_audience_key::<Faction>(e, None);
+        let stealth = world.audiences[Stealth::id() as usize].borrow_mut();
+        assert_eq!(
+            world.inspect(e).to_string(),
+            format!("{e}: uid none, cell none, owned\n  audience Stealth: borrowed")
+        );
+        drop(stealth);
     }
 
     #[test]

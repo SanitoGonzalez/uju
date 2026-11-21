@@ -1,7 +1,9 @@
 use std::any::Any;
+use std::fmt;
 
-use crate::ecs::component::Replication;
+use crate::ecs::component::{Component, Replication};
 use crate::ecs::entity::{Entity, Uid};
+use crate::ecs::storage::Storage;
 use crate::net::wire::{DecodeError, EncodeError};
 
 /// A component's table without its type, as the `World` and the runtime
@@ -34,6 +36,11 @@ pub trait Table {
 
     fn contains(&self, entity: Entity) -> bool;
     fn clear(&mut self);
+
+    /// Formats `entity`'s value with [`Component::inspect`], for
+    /// [`World::inspect`](crate::ecs::world::World::inspect). Writes nothing
+    /// when it holds none.
+    fn inspect(&self, entity: Entity, f: &mut fmt::Formatter<'_>) -> fmt::Result;
 
     /// Clears the tick's changes: dirty and added bits, and the remove log.
     fn end_tick(&mut self) {}
@@ -83,5 +90,17 @@ pub trait Table {
         _resolve: &mut dyn FnMut(Uid) -> Option<Entity>,
     ) -> Result<usize, DecodeError> {
         panic!("this component is not replicated")
+    }
+}
+
+/// [`Table::inspect`] for a storage.
+pub(crate) fn inspect<S: Storage>(
+    storage: &S,
+    entity: Entity,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    match storage.get(entity) {
+        Some(value) => Component::inspect(value, f),
+        None => Ok(()),
     }
 }

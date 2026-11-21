@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::fmt;
 
 use crate::ecs::component::Component;
 use crate::ecs::entity::Entity;
@@ -7,7 +8,7 @@ use crate::ecs::storage::{
     Storage,
     join::{Entities, Joinable},
     sparse_array::SparseArray,
-    table::Table,
+    table::{self, Table},
 };
 
 pub struct SparseSet<T> {
@@ -238,6 +239,10 @@ impl<T: Component> Table for SparseSet<T> {
 
     fn clear(&mut self) {
         self.clear();
+    }
+
+    fn inspect(&self, entity: Entity, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        table::inspect(self, entity, f)
     }
 }
 

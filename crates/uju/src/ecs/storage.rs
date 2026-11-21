@@ -186,6 +186,10 @@ mod tests {
         fn clear(&mut self) {
             self.set.clear();
         }
+
+        fn inspect(&self, entity: Entity, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Table::inspect(&self.set, entity, f)
+        }
     }
 
     impl<T: Component> Storage for Counted<T> {
@@ -286,6 +290,15 @@ mod tests {
             }
             scores.get_mut(entities[0]).unwrap().0 = 7;
         }
+
+        // a hand-written impl, and a type without `Debug`, show the name
+        assert_eq!(
+            world.inspect(entities[1]).to_string(),
+            format!(
+                "{}: uid none, cell none, owned\n  Bonus {{ .. }}\n  Score {{ .. }}",
+                entities[1]
+            )
+        );
 
         let scores = world.view::<Score>();
         assert_eq!(scores.writes, 5);

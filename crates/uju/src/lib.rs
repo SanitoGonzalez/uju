@@ -17,7 +17,7 @@ pub use linkme;
 pub mod prelude {
     pub use crate::ecs::prelude::*;
     pub use crate::physics::Velocity;
-    pub use crate::time::Time;
+    pub use crate::time::{Time, Timer};
     pub use crate::transform::Transform;
 }
 

@@ -56,6 +56,8 @@ pub fn expand(ast: DeriveInput) -> Result<TokenStream> {
         }
     });
 
+    // `inspect` uses the type's `Debug` when it has one, by autoref: see
+    // `uju::ecs::component::inspect`
     Ok(quote! {
         const _: () = {
             #[::uju::linkme::distributed_slice(::uju::ecs::component::COMPONENTS)]
@@ -76,6 +78,11 @@ pub fn expand(ast: DeriveInput) -> Result<TokenStream> {
                 }
 
                 #required
+
+                fn inspect(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                    use ::uju::ecs::component::inspect::{ViaDebug as _, ViaName as _};
+                    (&&::uju::ecs::component::inspect::Value(self)).inspect(f)
+                }
             }
         };
     })

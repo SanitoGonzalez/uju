@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::fmt;
 
 use crate::ecs::component::{Replicated, Replication};
 use crate::ecs::entity::{Entity, Uid};
@@ -6,7 +7,7 @@ use crate::ecs::hook::HookLog;
 use crate::ecs::storage::{
     Storage, Tracking,
     section::{self, REMOVED, VALUES},
-    table::Table,
+    table::{self, Table},
     tracked::Tracked,
 };
 use crate::net::wire::{DecodeError, EncodeError};
@@ -171,6 +172,10 @@ impl<T: Replicated + Default> Table for TagTable<T> {
 
     fn clear(&mut self) {
         self.clear();
+    }
+
+    fn inspect(&self, entity: Entity, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        table::inspect(self, entity, f)
     }
 
     fn end_tick(&mut self) {

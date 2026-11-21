@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::fmt;
 
 use crate::ecs::component::{Replace, Replication};
 use crate::ecs::entity::{Entity, Uid};
@@ -6,7 +7,7 @@ use crate::ecs::hook::HookLog;
 use crate::ecs::storage::{
     Storage, Tracking,
     section::{self, REMOVED, VALUES},
-    table::Table,
+    table::{self, Table},
     tracked::{Tracked, TrackedJoin, TrackedMut},
 };
 use crate::net::wire::{DecodeError, EncodeError};
@@ -182,6 +183,10 @@ impl<T: Replace> Table for ReplaceTable<T> {
 
     fn clear(&mut self) {
         self.clear();
+    }
+
+    fn inspect(&self, entity: Entity, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        table::inspect(self, entity, f)
     }
 
     fn end_tick(&mut self) {

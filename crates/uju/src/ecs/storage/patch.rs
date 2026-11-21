@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::cell::Cell;
+use std::fmt;
 use std::marker::PhantomData;
 
 use crate::ecs::component::{Patch, Replication};
@@ -11,7 +12,7 @@ use crate::ecs::storage::{
     join::{Entities, Joinable},
     section::{self, CHANGES, REMOVED, VALUES},
     sparse_set::SparseSet,
-    table::Table,
+    table::{self, Table},
     tracked::Tracked,
 };
 use crate::net::wire::{Decode, DecodeError, EncodeError};
@@ -392,6 +393,10 @@ impl<T: Patch> Table for PatchTable<T> {
 
     fn clear(&mut self) {
         self.clear();
+    }
+
+    fn inspect(&self, entity: Entity, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        table::inspect(self, entity, f)
     }
 
     fn end_tick(&mut self) {

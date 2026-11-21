@@ -1,5 +1,6 @@
 use std::any::{Any, type_name};
 use std::cell::Cell;
+use std::fmt;
 use std::ops::Deref;
 
 use crate::ecs::component::{Ops, Replication};
@@ -11,7 +12,7 @@ use crate::ecs::storage::{
     join::{Entities, Joinable},
     section::{self, CHANGES, REMOVED, VALUES},
     sparse_set::SparseSet,
-    table::Table,
+    table::{self, Table},
     tracked::Tracked,
 };
 use crate::net::wire::{Decode, DecodeError, Encode, EncodeError, de, en};
@@ -487,6 +488,10 @@ impl<T: Ops> Table for OpsTable<T> {
 
     fn clear(&mut self) {
         self.clear();
+    }
+
+    fn inspect(&self, entity: Entity, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        table::inspect(self, entity, f)
     }
 
     fn end_tick(&mut self) {

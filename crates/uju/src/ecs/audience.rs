@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Once;
 
@@ -18,8 +19,9 @@ pub type Id = u16;
 /// [`set_audience_key`](crate::ecs::world::World::set_audience_key) writes.
 /// Audiences are not components, so they get no query term.
 pub trait Audience: 'static {
-    /// The key: fixed-size, with no floats.
-    type Key: Copy + Eq + Hash + 'static;
+    /// The key: fixed-size, with no floats. `Debug` formats it for
+    /// [`World::inspect`](crate::ecs::world::World::inspect).
+    type Key: Copy + Eq + Hash + Debug + 'static;
 
     /// The audience id, dense from `1` over every audience by qualified
     /// name, which names it on the wire.

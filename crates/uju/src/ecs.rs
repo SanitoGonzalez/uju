@@ -8,6 +8,7 @@ pub mod event;
 mod hash;
 pub mod hook;
 pub mod message;
+pub mod name;
 pub mod query;
 pub mod schedule;
 pub mod storage;
@@ -21,6 +22,7 @@ pub mod prelude {
 
     pub use super::cell::Cell;
     pub use super::entity::{Entity, Uid};
+    pub use super::name::Name;
     pub use super::query::{Added, Changed, Has, Mut, Or, Owned, Query, Replica, With, Without};
     pub use super::schedule::{Inbox, IntoSystems, Schedule, Update, every};
     pub use super::world::World;

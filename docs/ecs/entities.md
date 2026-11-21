@@ -4,7 +4,8 @@ How a `World` names its entities. An entity has a local handle, its
 [`Entity`](#entity), and may have a cluster-wide name, its [`Uid`](#uid),
 and a [`Cell`](#cells). It is owned by its `World` or is a
 [replica](#replicas) of one another shard owns. The [`Registry`](#registry)
-keeps all of it.
+keeps all of it, and [`world.inspect`](#inspecting) formats it for
+debugging.
 
 ## Entity
 
@@ -302,3 +303,41 @@ promote inside its loop.
   hasher does not resist flooding: uids come from uju's own servers.
 - **Despawn** frees the entity and forgets its uid. `resolve` on that uid
   returns `None` from then on.
+
+## Inspecting
+
+`world.inspect(entity)` formats an entity for debugging: its uid, cell and
+replica flag, then one line per component it holds and one per audience
+key.
+
+```rust
+let orc = world.spawn_with((Name::new("orc"), Hp(10)));
+// once uju has placed it in a cell
+println!("{}", world.inspect(orc));
+```
+
+```text
+3v1: uid 7:0, cell 12, owned
+  Name("orc")
+  Hp(10)
+  audience Faction: FactionId(2)
+```
+
+- **First line.** The `Entity`, its `uid` and `cell`, each `none` when it
+  has none, then `owned` or `replica`.
+- **Components.** Its [`Name`](components.md#name) first, then the others
+  in [component id](components.md#component-and-unique) order, each on a
+  line of its own, indented by two spaces. Each shows through
+  `Component::inspect`: the type's `Debug` when it has one, as every
+  generated component does, and its name, as `Handle { .. }`, otherwise.
+- **Audience keys** follow, in audience id order, as
+  `audience Faction: key`, through the key's `Debug`.
+- **Dead.** A dead entity shows as `3v1: dead`.
+- **No trailing newline.** Formatting flags reach the values, so `{:#}`
+  pretty-prints them over several lines.
+
+`inspect` returns an `Inspect`, which implements `Display` and `Debug` and
+reads the world only when it is formatted, borrowing one table at a time,
+shared. A table borrowed mutably then, such as by the query being
+iterated, shows as `Hp: borrowed` instead of panicking, whether the entity
+holds a value or not.
