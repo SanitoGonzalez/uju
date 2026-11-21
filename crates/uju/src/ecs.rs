@@ -5,6 +5,7 @@ pub mod component;
 pub mod entity;
 mod hash;
 pub mod query;
+pub mod schedule;
 pub mod storage;
 pub mod unique;
 pub mod world;
@@ -17,6 +18,7 @@ pub mod prelude {
     pub use super::cell::Cell;
     pub use super::entity::{Entity, Uid};
     pub use super::query::{Changed, Mut, Owned, Query, Replica, With, Without};
+    pub use super::schedule::{Inbox, IntoSystems, Schedule, Update, every};
     pub use super::world::World;
 }
 

@@ -20,4 +20,11 @@ impl Time {
     pub fn delta(&self) -> Duration {
         self.delta
     }
+
+    /// Counts one more tick, which took `delta`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by the runtime's tick"))]
+    pub(crate) fn advance(&mut self, delta: Duration) {
+        self.ticks += 1;
+        self.delta = delta;
+    }
 }

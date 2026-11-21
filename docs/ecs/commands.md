@@ -58,8 +58,9 @@ leaves it empty.
 - **Borrows.** A flush borrows the tables its commands touch, so it panics
   inside a query's loop that holds one of them, or while a view of one is
   held. An empty queue costs one check.
-- **No implicit flush.** Nothing applies the queue on its own: code that
-  queues commands calls `flush` once its borrows are dropped.
+- **When.** A [schedule](schedule.md#flush) applies the queue after every
+  system it runs. Code outside a schedule calls `flush` once its borrows
+  are dropped.
 
 ## Batches
 
